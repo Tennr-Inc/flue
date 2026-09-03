@@ -4,7 +4,7 @@ description: The Flue Agent SDK (@flue/sdk) — installation, a minimal round tr
 lastReviewedAt: 2026-07-21
 ---
 
-The **Flue Agent SDK** (`@flue/sdk`) is the TypeScript client for one agent conversation of a deployed Flue application. A client wraps a single **conversation URL** — the path where the agent's router (`createAgentRouter(...)`) is [mounted](/docs/guide/routing/#mounting-an-agent) plus a caller-chosen conversation id — and exposes typed methods over the HTTP routes that URL serves: admit a message, await its settlement, read or observe the materialized conversation, abort in-flight work, and resolve attachment bytes.
+The **Flue Agent SDK** (`@flue/sdk`) is the TypeScript client for one agent conversation of a deployed Flue application. A client wraps a single **conversation URL** — the path where the agent's router (`createAgentRouter(...)`) is [mounted](/docs/guide/routing/#mounting-an-agent) plus a caller-chosen conversation id — and exposes typed methods over the HTTP routes that URL serves: admit a message, await its settlement, read or observe the materialized conversation, observe durable tool approvals, resolve an approval, abort in-flight work, and resolve attachment bytes.
 
 The package is ESM-only, runs anywhere `fetch` is available (browsers, Node.js, edge runtimes), and has one dependency, `@durable-streams/client`, which provides the reconnecting stream transport under `wait()` and `observe()`.
 
@@ -52,11 +52,33 @@ Every client method is a typed wrapper over one route of the conversation URL (s
 - `read()` — `wait()`'s stream follow, then one `history()` read to return the submission's reply.
 - `wait()` — reads the `GET <url>?view=updates` stream from the admission's offset until the submission's `submission-settled` chunk arrives.
 - `history()` — `GET <url>?view=history`; one materialized snapshot.
-- `observe()` — `history()` to hydrate, then the `updates` stream to stay live, with reconnection, rehydration, and duplicate-chunk suppression handled internally.
+- `observe()` — `history()` to hydrate, then the `updates` stream to stay live, with reconnection, rehydration, and duplicate-chunk suppression handled internally. Its snapshot includes `conversation.toolApprovals`.
 - `abort()` — `POST <url>/abort`.
+- `resolveToolApproval()` — `POST <url>/tool-approvals/<proposalId>` with `{ status, reason? }`; returns the durable approval row.
 - `attachmentUrl()` — resolves `<url>/attachments/<attachmentId>` for one `file` part's bytes.
 
 Any HTTP client can call these routes directly — the wire protocol is documented in the [Streaming Protocol](/docs/reference/streaming-protocol/) reference. What the SDK adds is the typed contract plus the stream mechanics you would otherwise reimplement: offset-based resume, reconnection backoff, per-request header resolution, and at-least-once redelivery dedup.
+
+## Tool approvals
+
+Approval-gated tools are currently supported only by the Cloudflare target, where each agent instance is backed by Durable Object SQLite. `history()` returns the durable `toolApprovals` rows, and `observe()` keeps that list current as proposals are requested and decided. When an approval is pending, resolve it through the same client that observed the conversation:
+
+```ts
+const observation = conversation.observe();
+const unsubscribe = observation.subscribe(async () => {
+  const pending = observation
+    .getSnapshot()
+    .conversation?.toolApprovals.find((approval) => approval.status === 'pending');
+  if (!pending) return;
+
+  await conversation.resolveToolApproval(pending.proposalId, {
+    status: 'approved',
+    reason: 'Operator confirmed the action.',
+  });
+});
+```
+
+`resolveToolApproval(proposalId, { status, reason? })` uses the native route mounted by `createAgentRouter(...)`; no extra ToT route or approval runtime is needed. The agent mount's host middleware protects the decision request like every other conversation route. `ToolApprovalProvider` remains an optional server-side notification hook for delivering proposals to an approval UI or queue — it is not required when the SDK observes and resolves them.
 
 ## Relationship to `@flue/react` and `@flue/runtime`
 
@@ -66,6 +88,6 @@ Any HTTP client can call these routes directly — the wire protocol is document
 ## Pages in this section
 
 - [createFlueClient(...)](/docs/sdk/create-flue-client/) — constructing a client (`CreateFlueClientOptions`: `url`, `fetch`, `headers`, `token`), URL resolution, and custom transports.
-- [FlueClient](/docs/sdk/flue-client/) — the conversation methods — `send()`, `wait()`, `abort()`, `history()`, `observe()`, and `attachmentUrl()` — with their option, result, and materialized conversation state types.
+- [FlueClient](/docs/sdk/flue-client/) — the conversation methods — `send()`, `wait()`, `abort()`, `resolveToolApproval()`, `history()`, `observe()`, and `attachmentUrl()` — with their option, result, and materialized conversation state types.
 - [Events and records](/docs/sdk/events/) — the `updates` wire union (`ConversationStreamChunk`), the `FlueEventStream` iteration surface, and offset/redelivery semantics.
 - [Errors](/docs/sdk/errors/) — `FlueApiError` (failed HTTP requests), `FlueExecutionError` (failed or aborted settlements), the documented server error envelope, and the re-exported `@durable-streams/client` stream errors.

@@ -21,6 +21,16 @@ import type { McpConnectionDefinition } from './mcp-types.ts';
 import type { ToolDefinition } from './tool-types.ts';
 
 export type {
+	ToolApproval,
+	ToolApprovalDecision,
+	ToolApprovalDecisionStatus,
+	ToolApprovalPolicy,
+	ToolApprovalPresentation,
+	ToolApprovalProposal,
+	ToolApprovalProvider,
+	ToolApprovalStatus,
+} from './tool-approval.ts';
+export type {
 	ToolContext,
 	ToolDefinition,
 	ToolInput,
@@ -407,15 +417,17 @@ export interface DurabilityConfig {
 	/**
 	 * Maximum total attempts before the submission is terminalized as
 	 * failed. The initial run counts as the first attempt; each DO reset or
-	 * deploy that interrupts a running submission consumes another.
+	 * deploy that interrupts running work consumes another. Waiting for a
+	 * durable tool approval does not consume an attempt.
 	 * Defaults to 10.
 	 */
 	maxAttempts?: number;
 	/**
-	 * Maximum wall-clock milliseconds for a single submission. Submissions
-	 * that exceed this limit are aborted and settled as failed. Defaults to
-	 * 3,600,000 (one hour). Set higher for long-running agents (e.g.
-	 * 21,600,000 for a 6-hour agent).
+	 * Maximum active-execution milliseconds for a single submission.
+	 * Submissions that exceed this limit are aborted and settled as failed.
+	 * Durable tool-approval waiting pauses the budget and resumes with its
+	 * remaining time. Defaults to 3,600,000 (one hour). Set higher for
+	 * long-running agents (e.g. 21,600,000 for a 6-hour agent).
 	 */
 	timeoutMs?: number;
 }
@@ -1217,6 +1229,36 @@ type FlueEventVariant =
 			isError: boolean;
 			result?: unknown;
 			durationMs: number;
+	  }
+	| {
+			type: 'tool_approval_requested';
+			proposalId: string;
+			toolName: string;
+			toolCallId: string;
+			toolVersion: string;
+			args: unknown;
+			expiresAt?: number;
+	  }
+	| {
+			type: 'tool_approval_waiting';
+			proposalId: string;
+			toolName: string;
+			toolCallId: string;
+			expiresAt?: number;
+	  }
+	| {
+			type: 'tool_approval_decided';
+			proposalId: string;
+			toolName: string;
+			toolCallId: string;
+			status: 'approved' | 'rejected' | 'expired' | 'canceled' | 'aborted';
+			reason?: string;
+	  }
+	| {
+			type: 'tool_approval_resumed';
+			proposalId: string;
+			toolName: string;
+			toolCallId: string;
 	  }
 	| {
 			type: 'turn';

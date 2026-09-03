@@ -1,6 +1,11 @@
 import type { AssistantMessage, ToolResultMessage } from '@earendil-works/pi-ai';
 import type { ResourceSnapshot } from './resources.ts';
 import { generateEntryId, generateRecordId } from './runtime/ids.ts';
+import type {
+	ToolApproval,
+	ToolApprovalDecisionStatus,
+	ToolApprovalPresentation,
+} from './tool-approval.ts';
 import type { PromptUsage } from './types.ts';
 
 interface ConversationRecordEnvelope {
@@ -269,6 +274,97 @@ interface ToolResultsCommittedRecord extends ConversationRecordEnvelope {
 	outcomeIds: string[];
 }
 
+export interface ToolApprovalRequestedRecord extends ConversationRecordEnvelope {
+	type: 'tool_approval_requested';
+	proposalId: string;
+	submissionId: string;
+	assistantMessageId: string;
+	toolCallId: string;
+	toolName: string;
+	toolVersion: string;
+	arguments: Record<string, unknown>;
+	/** Exact durable approval-row creation time. Older records fall back to the envelope timestamp. */
+	requestedAt?: number;
+	expiresAt?: number;
+	/** Frozen definition-level UI hints for durable public reconstruction. */
+	presentation?: ToolApprovalPresentation;
+}
+
+export interface ToolApprovalDecidedRecord extends ConversationRecordEnvelope {
+	type: 'tool_approval_decided';
+	proposalId: string;
+	/**
+	 * Present when an active submission attempt records the decision while
+	 * resuming. Decisions made while the submission is durably parked are
+	 * coordinator-owned and intentionally omit attempt ownership.
+	 */
+	submissionId?: string;
+	status: ToolApprovalDecisionStatus;
+	/** Exact durable approval-row decision time. Older records fall back to the envelope timestamp. */
+	decidedAt?: number;
+	reason?: string;
+}
+
+/**
+ * Canonical approval records are built from the immutable SQLite row rather
+ * than an active attempt's clock or envelope. The coordinator and a resumed
+ * session can race to repair the same record, so byte-identical construction
+ * is required for the stream writer's idempotency check.
+ */
+export function toolApprovalRequestedRecord(approval: ToolApproval): ToolApprovalRequestedRecord {
+	return {
+		v: 1,
+		id: `record_tool_approval_requested_${encodeCanonicalId(approval.proposalId)}`,
+		type: 'tool_approval_requested',
+		conversationId: approval.conversationId,
+		harness: approval.harness,
+		session: approval.session,
+		timestamp: new Date(approval.requestedAt).toISOString(),
+		proposalId: approval.proposalId,
+		submissionId: approval.submissionId,
+		assistantMessageId: approval.assistantMessageId,
+		toolCallId: approval.toolCallId,
+		toolName: approval.toolName,
+		toolVersion: approval.toolVersion,
+		arguments: approval.arguments,
+		requestedAt: approval.requestedAt,
+		...(approval.expiresAt !== undefined ? { expiresAt: approval.expiresAt } : {}),
+		...(approval.presentation !== undefined ? { presentation: approval.presentation } : {}),
+	};
+}
+
+export function toolApprovalDecisionRecord(approval: ToolApproval): ToolApprovalDecidedRecord {
+	if (approval.status === 'pending' || approval.decidedAt === undefined) {
+		throw new Error('[flue] A pending tool approval has no decision record.');
+	}
+	return {
+		v: 1,
+		id: `record_tool_approval_decided_${encodeCanonicalId(approval.proposalId)}`,
+		type: 'tool_approval_decided',
+		conversationId: approval.conversationId,
+		harness: approval.harness,
+		session: approval.session,
+		timestamp: new Date(approval.decidedAt).toISOString(),
+		proposalId: approval.proposalId,
+		status: approval.status,
+		decidedAt: approval.decidedAt,
+		...(approval.reason !== undefined ? { reason: approval.reason } : {}),
+	};
+}
+
+/**
+ * A durable invocation fence for an approved tool. If a process fails after
+ * this record but before its tool outcome commits, recovery must not invoke
+ * the tool a second time because its side effects may already have happened.
+ */
+export interface ToolApprovalExecutionStartedRecord extends ConversationRecordEnvelope {
+	type: 'tool_approval_execution_started';
+	proposalId: string;
+	submissionId: string;
+	assistantMessageId: string;
+	toolCallId: string;
+}
+
 export interface CompactionRecord extends ConversationRecordEnvelope {
 	type: 'compaction';
 	entryId: string;
@@ -454,6 +550,9 @@ export type ConversationRecord =
 	| AssistantMessageCompletedRecord
 	| ToolOutcomeRecord
 	| ToolResultsCommittedRecord
+	| ToolApprovalRequestedRecord
+	| ToolApprovalDecidedRecord
+	| ToolApprovalExecutionStartedRecord
 	| CompactionRecord
 	| ChildSessionRetainedRecord
 	| SubmissionSettledRecord

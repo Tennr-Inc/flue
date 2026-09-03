@@ -227,6 +227,9 @@ export function createConversationStreamState(
 		conversationId: snapshot.conversationId,
 		messages: snapshot.messages,
 		settlements: snapshot.settlements,
+		// Additive compatibility for a rolling upgrade: an older runtime can
+		// emit a conversation-reset snapshot without this newer field.
+		toolApprovals: snapshot.toolApprovals ?? [],
 	};
 }
 

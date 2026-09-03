@@ -65,9 +65,9 @@ export function createSqlAgentExecutionStore(
 		);
 	}
 	try {
-		ensureSqlAgentExecutionTables(sql);
+		ensureSqlAgentExecutionTables(sql, { toolApprovals: true });
 		const runTransaction = <T>(closure: () => T): T => transactionSync.call(storage, closure) as T;
-		return createSqlAgentExecutionStoreFromSql(sql, runTransaction);
+		return createSqlAgentExecutionStoreFromSql(sql, runTransaction, { toolApprovals: true });
 	} catch (cause) {
 		throw initFailure(className, 'SQLite execution store', cause);
 	}

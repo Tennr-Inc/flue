@@ -14,7 +14,9 @@ Every input that reaches an agent — a direct HTTP prompt, a [`dispatch(...)`](
 
 The outcome is written as a `submission_settled` record in the conversation's canonical stream, so anything waiting on the work observes it even across its own reconnects: the Flue Agent SDK's [`wait()`](/docs/sdk/flue-client/#wait) resolves or rejects from that record, and an awaited `init().read(...)` resolves with the settled reply or rejects with the settled error.
 
-Submissions for one conversation form a durable queue processed in admission order: one submission runs at a time, messages that arrive while the agent is busy either join the live response at a turn boundary or wait their turn, and a queued message is never lost — a delivery that misses the live response runs as its own submission. Processing happens in **attempts**: a coordinator claims the submission, runs it, and settles it. An interruption consumes the attempt; recovery claims a new one, up to the [retry budget](#retry-budget-and-timeout).
+Durable tool approvals are currently supported only by the Cloudflare target's SQLite-backed Durable Objects. The approval timing and recovery rules below apply to that environment; other persistence adapters do not implement the optional approval-store capability.
+
+Submissions for one conversation form a durable queue processed in admission order: one submission runs at a time, messages that arrive while the agent is busy either join the live response at a turn boundary or wait their turn, and a queued message is never lost — a delivery that misses the live response runs as its own submission. Processing happens in **attempts**: a coordinator claims the submission, runs it, and settles it. An interruption consumes the attempt; recovery claims a new one, up to the [retry budget](#retry-budget-and-timeout). A durable tool-approval wait releases ownership but does not consume an attempt.
 
 Aborts follow the same discipline. `POST /:id/abort` (or the SDK's `abort()`) records a durable abort intent on every unsettled submission for the conversation; each one then settles with the distinct `aborted` outcome through the normal attempt machinery — even when the process that was running the work is already gone. Work that already completed is unaffected: an abort that arrives after a finished response settles `completed`.
 
@@ -42,7 +44,7 @@ A recovered conversation always comes to rest in a state where the next message 
 
 ## Retry budget and timeout
 
-Each interruption consumes one attempt. When a submission exhausts its attempts, or exceeds its wall-clock timeout, retrying stops: the conversation is settled to a rest state, a `submission_interrupted` advisory lands in the timeline, and the submission settles `failed` — waiters reject with the structured error, including which tool calls were left with unknown outcomes.
+Each interruption consumes one attempt. When a submission exhausts its attempts, or exceeds its active-execution timeout, retrying stops: the conversation is settled to a rest state, a `submission_interrupted` advisory lands in the timeline, and the submission settles `failed` — waiters reject with the structured error, including which tool calls were left with unknown outcomes. Time spent durably waiting for a tool approval pauses both counters: it consumes neither an attempt nor the execution timeout.
 
 The timeout is enforced preemptively, not just between attempts. The coordinator supervises running attempts on its wake cadence: at the deadline it fires the attempt's abort signal, so work suspended on a signal-aware await (a provider call, a sandbox command, any tool — a `run` that ignores its signal is abandoned rather than awaited) unwinds and settles through the normal paths — and an attempt hung below the abandonable layer is settled `failed` over the hung fiber after a short grace, its late writes fenced off. A hang delays settlement by at most the deadline plus that grace; it can never strand the submission. Most stalls never reach the deadline at all: a model stream that goes silent past its [idle timeout](/docs/reference/provider-api/#cloudflarebindingprovider) fails as a transient provider error and the turn retries under the [error budget](#recovery-after-an-interruption).
 
@@ -60,7 +62,7 @@ export function IssueTriage() {
 IssueTriage.durability = { maxAttempts: 5, timeoutMs: 7_200_000 };
 ```
 
-The static is applied by the platform while the agent function is _not_ running, so it stays in force after a crash — including a crash in the agent's own render. The timeout is the total wall-clock budget from the first attempt's start; turn-boundary joins and response continuations do not extend it. Full field reference: [`DurabilityConfig`](/docs/reference/agent-api/#durabilityconfig).
+The static is applied by the platform while the agent function is _not_ running, so it stays in force after a crash — including a crash in the agent's own render. The timeout is the total active-execution budget from the first attempt's start; turn-boundary joins and response continuations do not extend it. Durable tool-approval waiting pauses the budget, which is restarted with its saved remaining time when the released submission is next claimed. Full field reference: [`DurabilityConfig`](/docs/reference/agent-api/#durabilityconfig).
 
 ## Durable tools and `step.do`
 

@@ -1,5 +1,6 @@
 import type { ConversationRecord } from '../conversation-records.ts';
 import { configureErrorRendering, InvalidRequestError } from '../errors.ts';
+import type { ToolApproval, ToolApprovalDecisionStatus } from '../tool-approval.ts';
 import type {
 	Agent,
 	AgentDispatchRequest,
@@ -44,9 +45,51 @@ export interface CloudflareRuntime extends RuntimeBase {
 	) => Promise<Response | null>;
 	/** Instance lookup for `getAgentInstance()`, served by the agent's Durable Object. */
 	instanceInfo: (agentName: string, instanceId: string) => Promise<AgentInstanceInfo | null>;
+	resolveToolApproval: (input: ToolApprovalResolutionInput) => Promise<ToolApproval>;
 }
 
 export type FlueRuntime = NodeRuntime | CloudflareRuntime;
+
+/** Target and decision used by a host approval UI or webhook. */
+export interface ToolApprovalResolutionInput {
+	readonly agent: string;
+	readonly id: string;
+	readonly proposalId: string;
+	readonly status: ToolApprovalDecisionStatus;
+	readonly reason?: string;
+}
+
+/** Deliver one idempotent approval decision to a durable agent tool call. */
+export async function resolveToolApproval(
+	input: ToolApprovalResolutionInput,
+): Promise<ToolApproval> {
+	const rt = runtimeConfig;
+	if (!rt) throw new Error('[flue] resolveToolApproval() called before runtime was configured.');
+	if (!input || typeof input !== 'object' || !input.agent || !input.id || !input.proposalId) {
+		throw new InvalidRequestError({
+			reason: 'A tool approval decision requires agent, id, and proposalId.',
+		});
+	}
+	if (
+		input.status !== 'approved' &&
+		input.status !== 'rejected' &&
+		input.status !== 'expired' &&
+		input.status !== 'canceled' &&
+		input.status !== 'aborted'
+	) {
+		throw new InvalidRequestError({
+			reason:
+				'A tool approval decision status must be approved, rejected, expired, canceled, or aborted.',
+		});
+	}
+	if (input.reason !== undefined && typeof input.reason !== 'string') {
+		throw new InvalidRequestError({ reason: 'A tool approval decision reason must be a string.' });
+	}
+	if (!('resolveToolApproval' in rt)) {
+		throw new Error('[flue] The configured runtime does not support tool approvals.');
+	}
+	return rt.resolveToolApproval(input);
+}
 
 /**
  * Accepts input for asynchronous delivery to a continuing agent session —

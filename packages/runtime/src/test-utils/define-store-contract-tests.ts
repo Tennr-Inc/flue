@@ -17,11 +17,12 @@
  * ```
  */
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { AgentSubmissionStore } from '../agent-execution-store.ts';
 import { PersistedFormatVersionError } from '../errors.ts';
 import type { AgentSubmissionInput } from '../runtime/agent-submissions.ts';
 import type { DispatchInput } from '../runtime/dispatch-queue.ts';
+import type { ToolApprovalProposal } from '../tool-approval.ts';
 
 export { defineAttachmentStoreContractTests } from './define-attachment-store-contract-tests.ts';
 export { defineConversationStreamStoreContractTests } from './define-conversation-stream-store-contract-tests.ts';
@@ -59,6 +60,82 @@ function claim(submissionId: string, attemptId: string, ownerId = 'test-owner') 
 	return { submissionId, attemptId, ownerId, leaseExpiresAt: Date.now() + 30_000 };
 }
 
+function approvalProposal(
+	submissionId: string,
+	toolCallId: string,
+	overrides: Partial<ToolApprovalProposal> = {},
+): ToolApprovalProposal {
+	return {
+		proposalId: `approval_${submissionId}_${toolCallId}`,
+		submissionId,
+		agentName: 'assistant',
+		instanceId: 'agent-1',
+		conversationId: 'conversation-1',
+		harness: 'default',
+		session: 'default',
+		assistantMessageId: 'message-1',
+		toolCallId,
+		toolName: 'deploy',
+		toolVersion: '1',
+		arguments: { environment: 'production' },
+		requestedAt: 1,
+		...overrides,
+	};
+}
+
+function approvalStore(
+	store: AgentSubmissionStore,
+): AgentSubmissionStore &
+	Required<
+		Pick<
+			AgentSubmissionStore,
+			| 'parkSubmissionForApproval'
+			| 'createToolApproval'
+			| 'getToolApproval'
+			| 'listToolApprovals'
+			| 'listToolApprovalProjectionWork'
+			| 'markToolApprovalProjected'
+			| 'claimToolApprovalNotification'
+			| 'completeToolApprovalNotification'
+			| 'decideToolApproval'
+			| 'expireToolApprovals'
+			| 'listWaitingForApprovalSubmissions'
+		>
+	> {
+	if (
+		!store.parkSubmissionForApproval ||
+		!store.createToolApproval ||
+		!store.getToolApproval ||
+		!store.listToolApprovals ||
+		!store.listToolApprovalProjectionWork ||
+		!store.markToolApprovalProjected ||
+		!store.claimToolApprovalNotification ||
+		!store.completeToolApprovalNotification ||
+		!store.decideToolApproval ||
+		!store.expireToolApprovals ||
+		!store.listWaitingForApprovalSubmissions
+	) {
+		throw new Error('[flue] This backend does not implement durable tool approvals.');
+	}
+	return store as AgentSubmissionStore &
+		Required<
+			Pick<
+				AgentSubmissionStore,
+				| 'parkSubmissionForApproval'
+				| 'createToolApproval'
+				| 'getToolApproval'
+				| 'listToolApprovals'
+				| 'listToolApprovalProjectionWork'
+				| 'markToolApprovalProjected'
+				| 'claimToolApprovalNotification'
+				| 'completeToolApprovalNotification'
+				| 'decideToolApproval'
+				| 'expireToolApprovals'
+				| 'listWaitingForApprovalSubmissions'
+			>
+		>;
+}
+
 async function admitDispatchReady(store: AgentSubmissionStore, input: DispatchInput) {
 	const admission = await store.admitDispatch(input);
 	if (admission.kind !== 'submission') return admission;
@@ -78,6 +155,8 @@ export interface StoreContractTestBackend {
 	create(): AgentSubmissionStore | Promise<AgentSubmissionStore>;
 	/** Optional cleanup after each test (e.g. close connections, delete temp files). */
 	cleanup?(): void | Promise<void>;
+	/** Run the optional durable tool-approval contract against this backend. */
+	durableToolApprovals?: boolean;
 	/**
 	 * Raw access to the backend's persisted format-version stamp. When
 	 * provided, the suite additionally verifies the stamping and adoption
@@ -473,6 +552,302 @@ export function defineStoreContractTests(label: string, backend: StoreContractTe
 				});
 			});
 		});
+
+		if (backend.durableToolApprovals)
+			describe('durable tool approvals', () => {
+				it('tracks canonical projection repair independently of submission status', async () => {
+					const store = approvalStore(await create());
+					await admitDispatchReady(store, dispatchInput());
+					const proposal = approvalProposal('dispatch-1', 'projection-call');
+					await store.createToolApproval(proposal);
+
+					expect(await store.listToolApprovalProjectionWork()).toEqual([
+						{
+							approval: expect.objectContaining({ proposalId: proposal.proposalId }),
+							requestProjected: false,
+							decisionProjected: false,
+						},
+					]);
+					expect(await store.markToolApprovalProjected(proposal.proposalId, 'requested')).toBe(
+						true,
+					);
+					expect(await store.listToolApprovalProjectionWork()).toEqual([]);
+
+					await store.decideToolApproval({ proposalId: proposal.proposalId, status: 'rejected' });
+					expect(await store.listToolApprovalProjectionWork()).toEqual([
+						expect.objectContaining({
+							requestProjected: true,
+							decisionProjected: false,
+						}),
+					]);
+					expect(await store.markToolApprovalProjected(proposal.proposalId, 'decided')).toBe(true);
+					expect(await store.listToolApprovalProjectionWork()).toEqual([]);
+				});
+
+				it('coalesces notification attempts and retries them with durable backoff', async () => {
+					const store = approvalStore(await create());
+					await admitDispatchReady(store, dispatchInput());
+					const proposal = approvalProposal('dispatch-1', 'notification-call');
+					await store.createToolApproval(proposal);
+
+					expect(await store.claimToolApprovalNotification(proposal.proposalId, 1_000)).toBe(true);
+					expect(await store.claimToolApprovalNotification(proposal.proposalId, 1_000)).toBe(false);
+					expect(await store.claimToolApprovalNotification(proposal.proposalId, 30_999)).toBe(
+						false,
+					);
+					expect(await store.claimToolApprovalNotification(proposal.proposalId, 31_000)).toBe(true);
+					expect(await store.completeToolApprovalNotification(proposal.proposalId, 31_001)).toBe(
+						true,
+					);
+					expect(await store.claimToolApprovalNotification(proposal.proposalId, 10_000_000)).toBe(
+						false,
+					);
+				});
+
+				it('parks a submission until every proposal is decided, then resumes once', async () => {
+					const store = approvalStore(await create());
+					const admitted = await admitDispatchReady(store, dispatchInput());
+					await store.claimSubmission(claim('dispatch-1', 'attempt-1'));
+					await store.markSubmissionInputApplied(attempt('dispatch-1', 'attempt-1'), {
+						maxAttempts: 3,
+						timeoutAt: Date.now() + 60_000,
+					});
+					const first = approvalProposal('dispatch-1', 'call-1');
+					const second = approvalProposal('dispatch-1', 'call-2');
+
+					expect(await store.createToolApproval(first)).toMatchObject({ status: 'pending' });
+					expect(await store.createToolApproval(second)).toMatchObject({ status: 'pending' });
+					await expect(
+						store.createToolApproval({ ...first, arguments: { environment: 'staging' } }),
+					).rejects.toThrow('conflicts with its persisted input snapshot');
+					await expect(
+						store.createToolApproval({ ...first, requestedAt: first.requestedAt + 1 }),
+					).rejects.toThrow('conflicts with its persisted input snapshot');
+					expect(
+						await store.parkSubmissionForApproval(attempt('dispatch-1', 'attempt-1'), [
+							first.proposalId,
+							second.proposalId,
+						]),
+					).toBe(true);
+					expect(await store.listWaitingForApprovalSubmissions()).toEqual([
+						expect.objectContaining({
+							submissionId: 'dispatch-1',
+							status: 'waiting_for_approval',
+						}),
+					]);
+					expect(await store.listRunnableSubmissions()).toEqual([]);
+
+					expect(
+						await store.decideToolApproval({
+							proposalId: first.proposalId,
+							status: 'approved',
+						}),
+					).toMatchObject({
+						approval: { status: 'approved' },
+						decisionApplied: true,
+						resumed: false,
+					});
+					expect(
+						await store.decideToolApproval({
+							proposalId: first.proposalId,
+							status: 'rejected',
+							reason: 'A replay cannot override approval.',
+						}),
+					).toMatchObject({
+						approval: { status: 'approved' },
+						decisionApplied: false,
+						resumed: false,
+					});
+					expect(
+						await store.decideToolApproval({
+							proposalId: second.proposalId,
+							status: 'rejected',
+							reason: 'Deployment denied.',
+						}),
+					).toMatchObject({
+						approval: { status: 'rejected' },
+						decisionApplied: true,
+						resumed: true,
+					});
+					expect(await store.getSubmission('dispatch-1')).toMatchObject({
+						status: 'queued',
+						inputAppliedAt: expect.any(Number),
+						maxAttempts: 3,
+						timeoutAt: 0,
+					});
+					expect(await store.listRunnableSubmissions()).toEqual([
+						expect.objectContaining({ submissionId: 'dispatch-1' }),
+					]);
+					expect(await store.claimSubmission(claim('dispatch-1', 'attempt-2'))).toMatchObject({
+						attemptCount: 1,
+						maxAttempts: 3,
+					});
+					expect(admitted.kind).toBe('submission');
+				});
+
+				it('expires a parked proposal and resumes its submission with a terminal decision', async () => {
+					const store = approvalStore(await create());
+					await admitDispatchReady(store, dispatchInput());
+					await store.claimSubmission(claim('dispatch-1', 'attempt-1'));
+					await store.markSubmissionInputApplied(attempt('dispatch-1', 'attempt-1'));
+					const proposal = approvalProposal('dispatch-1', 'expired-call', { expiresAt: 2 });
+					await store.createToolApproval(proposal);
+					await store.parkSubmissionForApproval(attempt('dispatch-1', 'attempt-1'), [
+						proposal.proposalId,
+					]);
+
+					expect(await store.expireToolApprovals(2)).toEqual([
+						{
+							approval: expect.objectContaining({
+								proposalId: proposal.proposalId,
+								status: 'expired',
+							}),
+							resumed: true,
+						},
+					]);
+					expect(await store.getSubmission('dispatch-1')).toMatchObject({ status: 'queued' });
+				});
+
+				it('restarts the paused timeout when resumed work is claimed, not when decided', async () => {
+					vi.useFakeTimers();
+					try {
+						const startedAt = Date.parse('2026-09-03T12:00:00.000Z');
+						vi.setSystemTime(startedAt);
+						const store = approvalStore(await create());
+						await admitDispatchReady(store, dispatchInput());
+						await store.claimSubmission(claim('dispatch-1', 'attempt-1'));
+						await store.markSubmissionInputApplied(attempt('dispatch-1', 'attempt-1'), {
+							maxAttempts: 3,
+							timeoutAt: startedAt + 5_000,
+						});
+						const proposal = approvalProposal('dispatch-1', 'slow-decision');
+						await store.createToolApproval(proposal);
+						await store.parkSubmissionForApproval(attempt('dispatch-1', 'attempt-1'), [
+							proposal.proposalId,
+						]);
+
+						vi.advanceTimersByTime(7 * 24 * 60 * 60_000);
+						expect(
+							await store.decideToolApproval({
+								proposalId: proposal.proposalId,
+								status: 'approved',
+							}),
+						).toMatchObject({ resumed: true });
+						expect(await store.getSubmission('dispatch-1')).toMatchObject({
+							status: 'queued',
+							timeoutAt: 0,
+						});
+
+						vi.advanceTimersByTime(7 * 24 * 60 * 60_000);
+						const claimedAt = Date.now();
+						expect(await store.claimSubmission(claim('dispatch-1', 'attempt-2'))).toMatchObject({
+							attemptCount: 1,
+							timeoutAt: claimedAt + 5_000,
+						});
+					} finally {
+						vi.useRealTimers();
+					}
+				});
+
+				it('refuses to park when the execution budget expires at the park boundary', async () => {
+					vi.useFakeTimers();
+					try {
+						const startedAt = Date.parse('2026-09-03T12:00:00.000Z');
+						vi.setSystemTime(startedAt);
+						const store = approvalStore(await create());
+						await admitDispatchReady(store, dispatchInput());
+						await store.claimSubmission(claim('dispatch-1', 'attempt-1'));
+						await store.markSubmissionInputApplied(attempt('dispatch-1', 'attempt-1'), {
+							maxAttempts: 3,
+							timeoutAt: startedAt + 1,
+						});
+						const proposal = approvalProposal('dispatch-1', 'deadline-race');
+						await store.createToolApproval(proposal);
+
+						vi.setSystemTime(startedAt + 1);
+						expect(
+							await store.parkSubmissionForApproval(attempt('dispatch-1', 'attempt-1'), [
+								proposal.proposalId,
+							]),
+						).toBe(false);
+						expect(await store.getSubmission('dispatch-1')).toMatchObject({
+							status: 'running',
+							attemptId: 'attempt-1',
+						});
+					} finally {
+						vi.useRealTimers();
+					}
+				});
+
+				it('aborts pending proposals before releasing a parked submission for terminalization', async () => {
+					const store = approvalStore(await create());
+					const admitted = await admitDispatchReady(store, dispatchInput());
+					await store.claimSubmission(claim('dispatch-1', 'attempt-1'));
+					await store.markSubmissionInputApplied(attempt('dispatch-1', 'attempt-1'));
+					const proposal = approvalProposal('dispatch-1', 'aborted-call');
+					await store.createToolApproval(proposal);
+					await store.parkSubmissionForApproval(attempt('dispatch-1', 'attempt-1'), [
+						proposal.proposalId,
+					]);
+					if (admitted.kind !== 'submission') throw new Error('Expected a submission.');
+
+					expect(await store.requestSessionAbort(admitted.submission.sessionKey)).toEqual([
+						'dispatch-1',
+					]);
+					expect(await store.getToolApproval(proposal.proposalId)).toMatchObject({
+						status: 'aborted',
+						reason: 'Approval canceled because the session was aborted.',
+					});
+					expect(await store.getSubmission('dispatch-1')).toMatchObject({
+						status: 'queued',
+						abortRequestedAt: expect.any(Number),
+					});
+				});
+
+				it('refuses to park a proposal after its running submission was aborted', async () => {
+					const store = approvalStore(await create());
+					const admitted = await admitDispatchReady(store, dispatchInput());
+					await store.claimSubmission(claim('dispatch-1', 'attempt-1'));
+					await store.markSubmissionInputApplied(attempt('dispatch-1', 'attempt-1'));
+					const proposal = approvalProposal('dispatch-1', 'racing-call');
+					await store.createToolApproval(proposal);
+					if (admitted.kind !== 'submission') throw new Error('Expected a submission.');
+
+					await store.requestSessionAbort(admitted.submission.sessionKey);
+					expect(
+						await store.parkSubmissionForApproval(attempt('dispatch-1', 'attempt-1'), [
+							proposal.proposalId,
+						]),
+					).toBe(false);
+					expect(await store.getSubmission('dispatch-1')).toMatchObject({
+						status: 'running',
+						abortRequestedAt: expect.any(Number),
+					});
+					// The terminal path owns this decision because the proposal was made
+					// while the submission was still running. Parking must never hide it
+					// in a waiting state where it could outlive the abort.
+					expect(await store.getToolApproval(proposal.proposalId)).toMatchObject({
+						status: 'pending',
+					});
+				});
+
+				it('does not park after the final proposal was decided while the attempt was running', async () => {
+					const store = approvalStore(await create());
+					await admitDispatchReady(store, dispatchInput());
+					await store.claimSubmission(claim('dispatch-1', 'attempt-1'));
+					await store.markSubmissionInputApplied(attempt('dispatch-1', 'attempt-1'));
+					const proposal = approvalProposal('dispatch-1', 'decision-race');
+					await store.createToolApproval(proposal);
+					await store.decideToolApproval({ proposalId: proposal.proposalId, status: 'approved' });
+
+					expect(
+						await store.parkSubmissionForApproval(attempt('dispatch-1', 'attempt-1'), [
+							proposal.proposalId,
+						]),
+					).toBe(false);
+					expect(await store.getSubmission('dispatch-1')).toMatchObject({ status: 'running' });
+				});
+			});
 
 		describe('session abort requests', () => {
 			it('stamps an abort intent on a queued submission without changing its status', async () => {

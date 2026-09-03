@@ -60,6 +60,19 @@ export type CanonicalSubmissionEntry =
 	  }
 	| { id: string; type: 'compaction' };
 
+/** Render updates describe the current context without requesting another turn. */
+export function isRenderNarration(entry: CanonicalSubmissionEntry): boolean {
+	// These types are reserved: dispatch and lifecycle appends cannot author
+	// them. Recovery and terminal-advisory signals retain their own semantics.
+	return (
+		entry.type === 'message' &&
+		entry.message.role === 'signal' &&
+		(entry.message.type === 'resources' ||
+			entry.message.type === 'instructions' ||
+			entry.message.type === 'environment')
+	);
+}
+
 /**
  * How a `resume` state continues the interrupted submission:
  *
@@ -328,11 +341,11 @@ function hasAdjacentStreamContinuation(
  * result carries the terminate flag — the exact unanimity predicate of
  * pi-agent-core's `shouldTerminateToolBatch`, evaluated over persisted
  * outcomes instead of in-memory results. Deliberately strict about the tail
- * shape: every entry after the assistant must be one of its own tool results,
- * so anything appended past the batch (a would-stop continuation signal, a
- * joined input) means the response durably moved on and the model resumes as
- * before. A thrown or interrupted call's outcome never carries the flag, so
- * unanimity fails and the batch resumes — matching live semantics.
+ * shape: the assistant must be followed by its own tool results. Render
+ * narration may follow that completed batch without canceling termination;
+ * intentional continuation signals and joined inputs still resume the model.
+ * A thrown or interrupted call's outcome never carries the flag, so unanimity
+ * fails and the batch resumes.
  */
 function isTerminalTrailingToolBatch(
 	following: readonly CanonicalSubmissionEntry[],
@@ -344,9 +357,15 @@ function isTerminalTrailingToolBatch(
 	);
 	if (toolCallIds.length === 0) return false;
 	const trailing = following.slice(assistantIndex + 1);
-	if (trailing.length !== toolCallIds.length) return false;
+	const results = trailing.slice(0, toolCallIds.length);
+	if (
+		results.length !== toolCallIds.length ||
+		!trailing.slice(toolCallIds.length).every(isRenderNarration)
+	) {
+		return false;
+	}
 	const terminated = new Set<string>();
-	for (const entry of trailing) {
+	for (const entry of results) {
 		if (entry.type !== 'message' || entry.message.role !== 'toolResult') return false;
 		if (entry.toolTerminate !== true) return false;
 		terminated.add(entry.message.toolCallId);

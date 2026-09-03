@@ -40,12 +40,22 @@ export type {
 	SubmissionDurability,
 	SubmissionSettlementObligation,
 } from './agent-execution-store.ts';
-
 export {
 	DURABILITY_DEFAULT_MAX_ATTEMPTS,
 	DURABILITY_DEFAULT_TIMEOUT_MS,
 	LEASE_DURATION_MS,
 } from './agent-execution-store.ts';
+export type {
+	ToolApproval,
+	ToolApprovalDecision,
+	ToolApprovalDecisionStatus,
+	ToolApprovalPolicy,
+	ToolApprovalPresentation,
+	ToolApprovalProposal,
+	ToolApprovalProvider,
+	ToolApprovalStatus,
+} from './tool-approval.ts';
+export { toolApprovalProposalId } from './tool-approval.ts';
 
 // ─── Submission input types ─────────────────────────────────────────────────
 
