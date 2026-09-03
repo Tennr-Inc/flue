@@ -17,6 +17,9 @@
 		"check:lint": "biome lint . && knip",
 		"check:knip": "knip",
 		"check:types": "turbo run check:types --filter=!apps-www",
+		"release:internal:prepare": "node scripts/prepare-internal-packages.mjs",
+		"release:internal:publish": "node scripts/publish-internal-packages.mjs",
+		"release:internal:test": "node --test scripts/prepare-internal-packages.test.mjs",
 		"format": "turbo run format:lint format:style",
 		"format:lint": "biome check . --write",
 		"format:style": "prettier . --cache --write --list-different"
