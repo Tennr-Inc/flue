@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { type HookStateStore, isRendering, requireRenderFrame } from './frame.ts';
 import { normalizeJsonValue } from './json-value.ts';
 
@@ -31,13 +32,15 @@ import { normalizeJsonValue } from './json-value.ts';
  *   throw on non-serializable input. There is no unset — a name, once
  *   written, always has a value (`defaultValue` fills in before the first
  *   write and is never persisted itself).
- * - The updater form is the read-modify-write path: `previous` resolves at
- *   CALL time through the write buffer (this attempt's writes over the
- *   snapshot; `defaultValue` before the first write ever). The render value
- *   is a snapshot — two callbacks in one turn each spreading it would drop
- *   each other's writes; updaters compose instead. Any function argument is
- *   treated as an updater (a function was never a legal value — values are
- *   JSON).
+ * - The updater form is the read-modify-write path: `previous` resolves in
+ *   setter call order through the write buffer (this attempt's writes over
+ *   the snapshot; `defaultValue` before the first write ever). An updater
+ *   whose input still depends on another active parallel tool is evaluated
+ *   once that tool commits or discards, so rollback can rebase it without
+ *   invoking user code twice. The render value is a snapshot — two callbacks
+ *   in one turn each spreading it would drop each other's writes; updaters
+ *   compose instead. Any function argument is treated as an updater (a
+ *   function was never a legal value — values are JSON).
  * - Writing the current value again is a no-op: no record is appended.
  * - Writes made by tools become durable atomically with the tool batch that
  *   made them — if the batch settles, the write is durable; if recovery
@@ -93,13 +96,9 @@ export function usePersistentState(
 				`[flue] State "${name}" has no durable runtime behind this render, so writes are unavailable.`,
 			);
 		}
-		// An updater's `previous` resolves through the buffer at call time —
-		// read-your-writes within the attempt — not the render snapshot the
-		// closure was born with. The boxed `current` keeps persisted null/false
-		// from falling back to the default.
 		if (typeof next === 'function') {
-			const current = store.current(name);
-			next = (next as (previous: unknown) => unknown)(current ? current.value : defaultValue);
+			store.update(name, next as (previous: unknown) => unknown, defaultValue);
+			return;
 		}
 		store.write(name, normalizeStateValue(name, next));
 	};
@@ -123,30 +122,238 @@ export interface HookStateWrite {
  */
 export interface HookStateBuffer extends HookStateStore {
 	drain(): HookStateWrite[];
+	/** Isolate one concurrent tool invocation's writes until it settles. */
+	createWriteScope(): HookStateWriteScope;
 }
 
+export interface HookStateWriteScope {
+	run<T>(callback: () => Promise<T>): Promise<T>;
+	commit(): void;
+	discard(): void;
+}
+
+interface HookStateWriteScopeState {
+	owner: HookStateBuffer;
+	status: 'active' | 'committed' | 'discarded';
+}
+
+interface BufferedHookStateWrite {
+	name: string;
+	value: unknown;
+	resolved: boolean;
+	failed: boolean;
+	error?: unknown;
+	operation:
+		| { type: 'set'; value: unknown }
+		| { type: 'update'; updater: (previous: unknown) => unknown; defaultValue: unknown };
+	scope?: HookStateWriteScopeState;
+}
+
+interface PendingHookStateValue {
+	resolved: boolean;
+	value: unknown;
+	activeScopes: Set<HookStateWriteScopeState>;
+}
+
+const hookStateWriteScopeStorage = new AsyncLocalStorage<HookStateWriteScopeState>();
+
 export function createHookStateBuffer(snapshot: ReadonlyMap<string, unknown>): HookStateBuffer {
-	const overlay = new Map<string, unknown>();
-	let pending: HookStateWrite[] = [];
-	const currentValue = (name: string): { value: unknown } | undefined => {
-		if (overlay.has(name)) return { value: overlay.get(name) };
+	// Values already drained into a canonical append remain visible to setters
+	// for the rest of this attempt. Writes not yet drained stay in one global
+	// call-order ledger, regardless of which parallel tool owns them.
+	const drainedOverlay = new Map<string, unknown>();
+	let pending: BufferedHookStateWrite[] = [];
+	let rebaseError: unknown;
+	let hasRebaseError = false;
+	const baseCurrentValue = (name: string): { value: unknown } | undefined => {
+		if (drainedOverlay.has(name)) return { value: drainedOverlay.get(name) };
 		if (snapshot.has(name)) return { value: snapshot.get(name) };
 		return undefined;
 	};
-	return {
-		current: currentValue,
+	const resolveOperation = (
+		name: string,
+		operation: BufferedHookStateWrite['operation'],
+		current: { value: unknown } | undefined,
+	): unknown => {
+		if (operation.type === 'set') return operation.value;
+		return normalizeStateValue(
+			name,
+			operation.updater(current ? current.value : operation.defaultValue),
+		);
+	};
+	const recomputePending = (): Map<string, PendingHookStateValue> => {
+		rebaseError = undefined;
+		hasRebaseError = false;
+		const values = new Map<string, PendingHookStateValue>();
+		try {
+			for (const write of pending) {
+				if (write.scope?.status === 'discarded') continue;
+				if (write.failed) throw write.error;
+				const base = baseCurrentValue(write.name);
+				const current = values.get(write.name) ?? {
+					resolved: true,
+					value: base?.value,
+					activeScopes: new Set<HookStateWriteScopeState>(),
+				};
+				const ownActiveScope = write.scope?.status === 'active' ? write.scope : undefined;
+				if (write.operation.type === 'set') {
+					write.value = write.operation.value;
+					write.resolved = true;
+					values.set(write.name, {
+						resolved: true,
+						value: write.value,
+						activeScopes: new Set(ownActiveScope ? [ownActiveScope] : []),
+					});
+					continue;
+				}
+				if (!write.resolved) {
+					const dependsOnAnotherActiveScope =
+						!current.resolved || [...current.activeScopes].some((scope) => scope !== write.scope);
+					if (dependsOnAnotherActiveScope) {
+						const activeScopes = new Set(current.activeScopes);
+						if (ownActiveScope) activeScopes.add(ownActiveScope);
+						values.set(write.name, { resolved: false, value: undefined, activeScopes });
+						continue;
+					}
+					try {
+						write.value = resolveOperation(
+							write.name,
+							write.operation,
+							base || current.value !== undefined ? { value: current.value } : undefined,
+						);
+						write.resolved = true;
+					} catch (error) {
+						write.failed = true;
+						write.error = error;
+						throw error;
+					}
+				}
+				// A resolved updater was evaluated only after every dependency
+				// outside its own scope was final. Its own writes live or die as a
+				// unit, so the value never needs to be evaluated again.
+				values.set(write.name, {
+					resolved: true,
+					value: write.value,
+					activeScopes: new Set(ownActiveScope ? [ownActiveScope] : []),
+				});
+			}
+		} catch (error) {
+			rebaseError = error;
+			hasRebaseError = true;
+		}
+		return values;
+	};
+	const currentValue = (name: string): { value: unknown } | undefined => {
+		const current = recomputePending().get(name);
+		if (hasRebaseError) throw rebaseError;
+		if (current && !current.resolved) {
+			throw new Error(
+				`[flue] State "${name}" cannot be read while its value depends on another active tool.`,
+			);
+		}
+		return current ? { value: current.value } : baseCurrentValue(name);
+	};
+	const store: HookStateBuffer = {
+		current(name) {
+			return currentValue(name);
+		},
 		write(name, value) {
-			const current = currentValue(name);
-			if (current && JSON.stringify(current.value) === JSON.stringify(value)) return;
-			pending.push({ name, value });
-			overlay.set(name, value);
+			const scope = hookStateWriteScopeStorage.getStore();
+			if (scope?.owner === store) {
+				// An abandoned tool keeps its async context until its promise really
+				// settles. Once discarded, writes from that orphan are intentionally
+				// ignored so they cannot leak into a later turn or attempt.
+				if (scope.status !== 'active') return;
+				pending.push({
+					name,
+					value,
+					resolved: true,
+					failed: false,
+					operation: { type: 'set', value },
+					scope,
+				});
+				return;
+			}
+			pending.push({
+				name,
+				value,
+				resolved: true,
+				failed: false,
+				operation: { type: 'set', value },
+			});
+		},
+		update(name, updater, defaultValue) {
+			const scope = hookStateWriteScopeStorage.getStore();
+			if (scope?.owner === store && scope.status !== 'active') return;
+			const operation = { type: 'update' as const, updater, defaultValue };
+			const write: BufferedHookStateWrite = {
+				name,
+				value: undefined,
+				resolved: false,
+				failed: false,
+				operation,
+				...(scope?.owner === store ? { scope } : {}),
+			};
+			pending.push(write);
+			recomputePending();
+			if (hasRebaseError) {
+				const error = rebaseError;
+				pending = pending.filter((candidate) => candidate !== write);
+				recomputePending();
+				throw error;
+			}
 		},
 		drain() {
-			const drained = pending;
-			pending = [];
+			recomputePending();
+			if (hasRebaseError) throw rebaseError;
+			const drained: HookStateWrite[] = [];
+			const retained: BufferedHookStateWrite[] = [];
+			let blocked = false;
+			for (const write of pending) {
+				if (write.scope?.status === 'discarded') continue;
+				if (write.scope?.status === 'active') {
+					blocked = true;
+					retained.push(write);
+					continue;
+				}
+				// A later updater may have observed an earlier active write. Preserve
+				// the call-order suffix until that scope commits or discards, so the
+				// updater can be rebased if its dependency is rolled back.
+				if (blocked) {
+					retained.push(write);
+					continue;
+				}
+				const current = baseCurrentValue(write.name);
+				if (current && JSON.stringify(current.value) === JSON.stringify(write.value)) continue;
+				drained.push({ name: write.name, value: write.value });
+				drainedOverlay.set(write.name, write.value);
+			}
+			pending = retained;
 			return drained;
 		},
+		createWriteScope() {
+			const state: HookStateWriteScopeState = {
+				owner: store,
+				status: 'active',
+			};
+			return {
+				run: (callback) => hookStateWriteScopeStorage.run(state, callback),
+				commit() {
+					if (state.status === 'active') {
+						state.status = 'committed';
+						recomputePending();
+					}
+				},
+				discard() {
+					if (state.status === 'active') {
+						state.status = 'discarded';
+						recomputePending();
+					}
+				},
+			};
+		},
 	};
+	return store;
 }
 
 function readPersisted(

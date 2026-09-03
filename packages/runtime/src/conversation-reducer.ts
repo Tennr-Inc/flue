@@ -145,6 +145,14 @@ interface ReducedConversationStateBase {
 	 * its keys: the content then lives on the committed tool-result entries.
 	 */
 	toolOutcomes: Map<string, string>;
+	/**
+	 * Bodies for the uncommitted outcomes indexed by `toolOutcomes`. Recovery
+	 * uses them to publish a delayed terminal tool event after it commits a
+	 * batch which was parked or interrupted between outcome persistence and the
+	 * normal live publication callback. They are released with the matching
+	 * `tool_results_committed` record, alongside `toolOutcomes`.
+	 */
+	toolOutcomeRecords: Map<string, Extract<ConversationRecord, { type: 'tool_outcome' }>>;
 	childConversations: Map<string, CanonicalChildSessionRef>;
 	/**
 	 * Custom response metadata per submission: `responseMetadata` from the
@@ -331,7 +339,7 @@ export interface ReducedContextEntry {
  * against from-scratch folds at every batch boundary, so shape drift without
  * a matching codec change fails CI.
  */
-export const REDUCED_STATE_FORMAT = 2;
+export const REDUCED_STATE_FORMAT = 3;
 
 export function createReducedInstanceState(): ReducedInstanceState {
 	return {
@@ -417,6 +425,7 @@ function cloneReducedInstanceState(state: ReducedInstanceState): ReducedInstance
 						]),
 					),
 					toolOutcomes: new Map(conversation.toolOutcomes),
+					toolOutcomeRecords: new Map(conversation.toolOutcomeRecords),
 					childConversations: new Map(conversation.childConversations),
 					// Values are replaced immutably on update, so shallow copies suffice.
 					responseMetadata: new Map(conversation.responseMetadata),
@@ -474,6 +483,7 @@ export function applyConversationRecord(
 			activeLeafId: null,
 			inProgressMessages: new Map(),
 			toolOutcomes: new Map(),
+			toolOutcomeRecords: new Map(),
 			childConversations: new Map(),
 			responseMetadata: new Map(),
 			responseDataParts: new Map(),
@@ -682,8 +692,16 @@ export function applyConversationRecord(
 				fail(record, `Tool outcome for "${record.toolCallId}" already exists.`);
 			}
 			conversation.toolOutcomes.set(outcomeKey, record.id);
+			conversation.toolOutcomeRecords.set(outcomeKey, record);
 			break;
 		}
+		case 'tool_approval_requested':
+		case 'tool_approval_decided':
+		case 'tool_approval_execution_started':
+			// Operational approval records are intentionally not conversation
+			// entries; the approval table is the lifecycle projection and the
+			// canonical body is retained for audit/recovery.
+			break;
 		case 'tool_results_committed': {
 			const assistant = conversation.entries.get(record.assistantMessageId);
 			if (
@@ -751,6 +769,9 @@ export function applyConversationRecord(
 				// retained outcome body downgrade together. In-place set keeps
 				// the map's insertion order for stream-order scans.
 				conversation.toolOutcomes.delete(
+					toolOutcomeKey(record.assistantMessageId, outcome.toolCallId),
+				);
+				conversation.toolOutcomeRecords.delete(
 					toolOutcomeKey(record.assistantMessageId, outcome.toolCallId),
 				);
 				state.recordsById.set(outcome.id, {
@@ -963,6 +984,9 @@ function indexConversationRecord(record: ConversationRecord): IndexedConversatio
 		case 'agent_finish_cycle':
 		case 'assistant_message_completed':
 		case 'tool_outcome':
+		case 'tool_approval_requested':
+		case 'tool_approval_decided':
+		case 'tool_approval_execution_started':
 			return record;
 		case 'assistant_message_started':
 			return {

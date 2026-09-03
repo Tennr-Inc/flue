@@ -14,6 +14,7 @@ export type {
 	FlueClient,
 	HttpClientOptions,
 	RequestHeaders,
+	ResolveToolApprovalOptions,
 } from './client.ts';
 export { createFlueClient } from './client.ts';
 export { FlueApiError } from './http.ts';
@@ -24,6 +25,10 @@ export type {
 	FlueConversationSettlement,
 	FlueConversationSnapshot,
 	FlueConversationState,
+	FlueToolApproval,
+	FlueToolApprovalDecisionStatus,
+	FlueToolApprovalPresentation,
+	FlueToolApprovalStatus,
 } from './public/conversation.ts';
 // The conversation `updates` wire union is not stable application API, but
 // first-party presenters (the CLI) reduce it directly, so the type is

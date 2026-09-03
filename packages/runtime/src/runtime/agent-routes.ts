@@ -11,7 +11,15 @@
  * the same on both forks too.
  */
 
-import { InvalidRequestError, RouteNotFoundError } from '../errors.ts';
+import type { AgentConversationToolApproval } from '../conversation-public.ts';
+import {
+	InvalidRequestError,
+	parseJsonBody,
+	RouteNotFoundError,
+	ToolApprovalUnavailableError,
+} from '../errors.ts';
+import type { ToolApproval, ToolApprovalDecisionStatus } from '../tool-approval.ts';
+import { MAX_TOOL_APPROVAL_PROPOSAL_ID_LENGTH } from '../tool-approval.ts';
 import type { CloudflareRuntime, FlueRuntime } from './flue-app.ts';
 import { handleAgentRequest } from './handle-agent.ts';
 import {
@@ -89,6 +97,45 @@ export async function executeAgentAbort(
 	// Cloudflare: forward to the owning agent DO, which recognizes the
 	// abort intent by the canonical path tail and settles via its coordinator.
 	return routeToAgent(rt, canonicalAgentRequest(target, '/abort'), target, 'abort');
+}
+
+/** Resolve one durable tool approval through the owning agent instance. */
+export async function executeAgentToolApprovalDecision(
+	rt: FlueRuntime,
+	target: AgentRequestTarget & { proposalId: string },
+): Promise<Response> {
+	const { agentName, instanceId, proposalId, request } = target;
+	assertToolApprovalProposalId(proposalId);
+	if (rt.target !== 'cloudflare') throw new ToolApprovalUnavailableError();
+
+	const body = await parseJsonBody(request);
+	if (!body || typeof body !== 'object' || Array.isArray(body)) {
+		throw new InvalidRequestError({
+			reason: 'A tool approval decision requires a JSON object with a status.',
+		});
+	}
+	const status = (body as { status?: unknown }).status;
+	if (!isToolApprovalDecisionStatus(status)) {
+		throw new InvalidRequestError({
+			reason:
+				'A tool approval decision status must be approved, rejected, expired, canceled, or aborted.',
+		});
+	}
+	const reason = (body as { reason?: unknown }).reason;
+	if (reason !== undefined && typeof reason !== 'string') {
+		throw new InvalidRequestError({ reason: 'A tool approval decision reason must be a string.' });
+	}
+
+	const approval: ToolApproval = await rt.resolveToolApproval({
+		agent: agentName,
+		id: instanceId,
+		proposalId,
+		status,
+		...(reason === undefined ? {} : { reason }),
+	});
+	return Response.json(publicToolApproval(approval), {
+		headers: { 'cache-control': 'no-store' },
+	});
 }
 
 /** Serve one attachment's bytes. */
@@ -173,4 +220,40 @@ export function assertAgentInstanceId(id: string): void {
 			reason: 'Agent conversation URLs must end with a non-empty conversation id segment.',
 		});
 	}
+}
+
+function assertToolApprovalProposalId(proposalId: string): void {
+	if (proposalId.trim() === '' || proposalId.length > MAX_TOOL_APPROVAL_PROPOSAL_ID_LENGTH) {
+		throw new InvalidRequestError({
+			reason: `Tool approval proposal ids must contain 1-${MAX_TOOL_APPROVAL_PROPOSAL_ID_LENGTH} characters.`,
+		});
+	}
+}
+
+function isToolApprovalDecisionStatus(value: unknown): value is ToolApprovalDecisionStatus {
+	return (
+		value === 'approved' ||
+		value === 'rejected' ||
+		value === 'expired' ||
+		value === 'canceled' ||
+		value === 'aborted'
+	);
+}
+
+function publicToolApproval(approval: ToolApproval): AgentConversationToolApproval {
+	return {
+		proposalId: approval.proposalId,
+		submissionId: approval.submissionId,
+		assistantMessageId: approval.assistantMessageId,
+		toolCallId: approval.toolCallId,
+		toolName: approval.toolName,
+		toolVersion: approval.toolVersion,
+		arguments: approval.arguments,
+		requestedAt: approval.requestedAt,
+		status: approval.status,
+		...(approval.expiresAt === undefined ? {} : { expiresAt: approval.expiresAt }),
+		...(approval.presentation === undefined ? {} : { presentation: approval.presentation }),
+		...(approval.decidedAt === undefined ? {} : { decidedAt: approval.decidedAt }),
+		...(approval.reason === undefined ? {} : { reason: approval.reason }),
+	};
 }

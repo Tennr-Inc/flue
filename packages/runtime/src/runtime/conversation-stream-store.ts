@@ -185,6 +185,21 @@ function splitChunks(data: string): string[] {
  */
 const MAX_BATCH_DATA_LENGTH = 12 * 1024 * 1024;
 
+/**
+ * Approval lifecycle rows may be mirrored by the coordinator while their
+ * submission is parked and has no live attempt. An explicit attemptId keeps
+ * the normal fence when a running session writes the same record types.
+ */
+function isAttemptOwnedRecord(record: ConversationRecord): boolean {
+	if (
+		(record.type === 'tool_approval_requested' || record.type === 'tool_approval_decided') &&
+		record.attemptId === undefined
+	) {
+		return false;
+	}
+	return record.submissionId !== undefined || record.attemptId !== undefined;
+}
+
 // The same per-append ceiling guards the shared async SQL store
 // (sql-conversation-stream-store.ts) and the MongoDB conversation store.
 function oversizedBatchReason(dataLength: number, records: readonly ConversationRecord[]): string {
@@ -481,9 +496,7 @@ export class InMemoryConversationStreamStore implements ConversationStreamStore 
 		submission: { submissionId: string; attemptId: string } | undefined,
 		records: readonly ConversationRecord[],
 	): Promise<void> {
-		const owned = records.filter(
-			(record) => record.submissionId !== undefined || record.attemptId !== undefined,
-		);
+		const owned = records.filter(isAttemptOwnedRecord);
 		if (!submission) {
 			if (owned.length > 0)
 				this.fail('append', path, 'Submission-owned records require an attempt authorization.');
@@ -923,9 +936,7 @@ export class SqliteConversationStreamStore implements ConversationStreamStore {
 		submission: { submissionId: string; attemptId: string } | undefined,
 		records: readonly ConversationRecord[],
 	): void {
-		const submissionRecords = records.filter(
-			(record) => record.submissionId !== undefined || record.attemptId !== undefined,
-		);
+		const submissionRecords = records.filter(isAttemptOwnedRecord);
 		if (!submission) {
 			if (submissionRecords.length > 0) {
 				this.fail('append', path, 'Submission-owned records require an attempt authorization.');

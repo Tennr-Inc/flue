@@ -37,21 +37,39 @@ import type { SqlStorage } from './sql-storage.ts';
 
 type SqlRow = Record<string, unknown>;
 
+export interface SqlAgentExecutionStoreOptions {
+	/** Enable the approval capability and its Durable Object-only schema. */
+	toolApprovals?: boolean;
+}
+
+import { markFlueSqlDurableToolApprovalFormat, migrateFlueSqlSchema } from './format-version.ts';
 import { hydratePersistedSubmissionAttachments } from './persisted-image-placement.ts';
 import {
 	type AgentSubmissionInput,
 	createDispatchAgentSubmissionInput,
 } from './runtime/agent-submissions.ts';
 import type { DispatchInput } from './runtime/dispatch-queue.ts';
-import { migrateFlueSqlSchema } from './format-version.ts';
 import {
 	createSqlSubmissionChunkStore,
 	ensureSqlSubmissionChunkTable,
 } from './sql-persisted-chunk-store.ts';
+import type {
+	ToolApproval,
+	ToolApprovalDecisionStatus,
+	ToolApprovalProposal,
+} from './tool-approval.ts';
 
-export function ensureSqlAgentExecutionTables(sql: SqlStorage): void {
+export function ensureSqlAgentExecutionTables(
+	sql: SqlStorage,
+	options: SqlAgentExecutionStoreOptions = {},
+): void {
 	migrateFlueSqlSchema(sql, () => {
-		ensureSubmissionTable(sql);
+		// Stamp the store before creating any approval-specific schema. If the
+		// process stops partway through the idempotent DDL below, an older
+		// runtime must still refuse to open the partially upgraded store.
+		if (options.toolApprovals) markFlueSqlDurableToolApprovalFormat(sql);
+		ensureSubmissionTable(sql, options.toolApprovals === true);
+		if (options.toolApprovals) ensureToolApprovalTable(sql);
 		ensureSqlSubmissionChunkTable(sql);
 	});
 }
@@ -66,14 +84,40 @@ export function ensureSqlAgentExecutionTables(sql: SqlStorage): void {
 export function createSqlAgentExecutionStoreFromSql(
 	sql: SqlStorage,
 	runTransaction: <T>(closure: () => T) => T,
+	options: SqlAgentExecutionStoreOptions = {},
 ): AgentSubmissionStore {
-	return new AgentSubmissionStoreImpl(sql, runTransaction);
+	const store = new AgentSubmissionStoreImpl(sql, runTransaction, options.toolApprovals === true);
+	if (!options.toolApprovals) return store;
+	return Object.assign(store, {
+		listWaitingForApprovalSubmissions: () => store.listWaitingForApprovalSubmissionsImpl(),
+		parkSubmissionForApproval: (
+			attempt: SubmissionAttemptRef,
+			pendingProposalIds: readonly string[],
+		) => store.parkSubmissionForApprovalImpl(attempt, pendingProposalIds),
+		createToolApproval: (proposal: ToolApprovalProposal) => store.createToolApprovalImpl(proposal),
+		getToolApproval: (proposalId: string) => store.getToolApprovalImpl(proposalId),
+		listToolApprovals: (submissionId: string) => store.listToolApprovalsImpl(submissionId),
+		listToolApprovalProjectionWork: () => store.listToolApprovalProjectionWorkImpl(),
+		markToolApprovalProjected: (proposalId: string, projection: 'requested' | 'decided') =>
+			store.markToolApprovalProjectedImpl(proposalId, projection),
+		claimToolApprovalNotification: (proposalId: string, now?: number) =>
+			store.claimToolApprovalNotificationImpl(proposalId, now),
+		completeToolApprovalNotification: (proposalId: string, now?: number) =>
+			store.completeToolApprovalNotificationImpl(proposalId, now),
+		decideToolApproval: (input: {
+			proposalId: string;
+			status: ToolApprovalDecisionStatus;
+			reason?: string;
+		}) => store.decideToolApprovalImpl(input),
+		expireToolApprovals: (now?: number) => store.expireToolApprovalsImpl(now),
+	});
 }
 
 class AgentSubmissionStoreImpl implements AgentSubmissionStore {
 	constructor(
 		private sql: SqlStorage,
 		private transactionSync: <T>(closure: () => T) => T,
+		private toolApprovals: boolean,
 	) {}
 
 	async getSubmission(submissionId: string): Promise<AgentSubmission | null> {
@@ -142,7 +186,7 @@ class AgentSubmissionStoreImpl implements AgentSubmissionStore {
 				.exec(
 					`SELECT 1
 					 FROM flue_agent_submissions
-				 WHERE status IN ('queued', 'running', 'terminalizing', 'joining', 'joined')
+					 WHERE status IN ('queued', 'running', 'waiting_for_approval', 'terminalizing', 'joining', 'joined')
 				 LIMIT 1`,
 				)
 				.toArray().length > 0
@@ -174,7 +218,7 @@ class AgentSubmissionStoreImpl implements AgentSubmissionStore {
 				     SELECT 1
 				     FROM flue_agent_submissions AS earlier
 				     WHERE earlier.session_key = current.session_key
-				       AND earlier.status IN ('queued', 'running', 'terminalizing', 'joining', 'joined')
+				       AND earlier.status IN ('queued', 'running', 'waiting_for_approval', 'terminalizing', 'joining', 'joined')
 				       AND earlier.sequence < current.sequence
 				   )
 				 ORDER BY current.sequence ASC`,
@@ -194,6 +238,20 @@ class AgentSubmissionStoreImpl implements AgentSubmissionStore {
 				)
 				.toArray(),
 			'active',
+		);
+	}
+
+	async listWaitingForApprovalSubmissionsImpl(): Promise<AgentSubmission[]> {
+		return this.parseOperationalRows(
+			this.sql
+				.exec(
+					`SELECT ${submissionColumns}
+					 FROM flue_agent_submissions
+					 WHERE status = 'waiting_for_approval'
+					 ORDER BY sequence ASC`,
+				)
+				.toArray(),
+			'waiting',
 		);
 	}
 
@@ -247,11 +305,20 @@ class AgentSubmissionStoreImpl implements AgentSubmissionStore {
 	async claimSubmission(claim: SubmissionClaimRef): Promise<AgentSubmission | null> {
 		const now = Date.now();
 		const timeoutAt = now + DURABILITY_DEFAULT_TIMEOUT_MS;
+		const timeoutUpdate = this.toolApprovals
+			? `CASE
+		       WHEN approval_timeout_remaining_ms IS NOT NULL
+		         THEN ? + MAX(approval_timeout_remaining_ms, 1)
+		       WHEN timeout_at = 0 THEN ?
+		       ELSE timeout_at
+		     END`
+			: 'CASE WHEN timeout_at = 0 THEN ? ELSE timeout_at END';
 		const row = this.sql
 			.exec(
 				`UPDATE flue_agent_submissions AS current
 				 SET status = 'running', attempt_id = ?, started_at = ?, attempt_count = attempt_count + 1,
-				     max_attempts = ?, timeout_at = CASE WHEN timeout_at = 0 THEN ? ELSE timeout_at END,
+				     max_attempts = CASE WHEN input_applied_at IS NULL THEN ? ELSE max_attempts END,
+				     timeout_at = ${timeoutUpdate}${this.toolApprovals ? ', approval_timeout_remaining_ms = NULL' : ''},
 				     owner_id = ?, lease_expires_at = ?
 				 WHERE current.submission_id = ? AND current.status = 'queued'
 				   AND current.canonical_ready_at IS NOT NULL
@@ -259,13 +326,14 @@ class AgentSubmissionStoreImpl implements AgentSubmissionStore {
 				     SELECT 1
 				     FROM flue_agent_submissions AS earlier
 				     WHERE earlier.session_key = current.session_key
-				       AND earlier.status IN ('queued', 'running', 'terminalizing', 'joining', 'joined')
+				       AND earlier.status IN ('queued', 'running', 'waiting_for_approval', 'terminalizing', 'joining', 'joined')
 				       AND earlier.sequence < current.sequence
 				   )
 				 RETURNING ${submissionColumns}`,
 				claim.attemptId,
 				now,
 				DURABILITY_DEFAULT_MAX_ATTEMPTS,
+				...(this.toolApprovals ? [now] : []),
 				timeoutAt,
 				claim.ownerId,
 				claim.leaseExpiresAt,
@@ -294,18 +362,380 @@ class AgentSubmissionStoreImpl implements AgentSubmissionStore {
 		);
 	}
 
-	async requestSessionAbort(sessionKey: string): Promise<string[]> {
-		const rows = this.sql
-			.exec(
+	async parkSubmissionForApprovalImpl(
+		attempt: SubmissionAttemptRef,
+		pendingProposalIds: readonly string[],
+	): Promise<boolean> {
+		if (pendingProposalIds.length === 0) return false;
+		const placeholders = pendingProposalIds.map(() => '?').join(', ');
+		const pendingApproval = `EXISTS (
+			SELECT 1 FROM flue_tool_approvals
+			WHERE submission_id = ? AND status = 'pending'
+			  AND proposal_id IN (${placeholders})
+		)`;
+		const now = Date.now();
+		if (
+			this.updateOwnedSubmission(
 				`UPDATE flue_agent_submissions
-				 SET abort_requested_at = COALESCE(abort_requested_at, ?)
-				 WHERE session_key = ? AND status IN ('queued', 'running', 'joining', 'joined')
-				 RETURNING submission_id`,
-				Date.now(),
-				sessionKey,
+			 SET status = 'waiting_for_approval',
+			     approval_timeout_remaining_ms = CASE
+			       WHEN timeout_at > ? THEN timeout_at - ? ELSE 0 END,
+			     timeout_at = 0, attempt_id = NULL, started_at = NULL,
+			     owner_id = NULL, lease_expires_at = 0
+				 WHERE submission_id = ? AND status = 'running' AND attempt_id = ?
+				   AND abort_requested_at IS NULL
+				   AND timeout_at > ?
+				   AND ${pendingApproval}
+			 RETURNING submission_id`,
+				now,
+				now,
+				attempt.submissionId,
+				attempt.attemptId,
+				now,
+				attempt.submissionId,
+				...pendingProposalIds,
 			)
-			.toArray();
-		return rows.map((row) => String(row.submission_id));
+		) {
+			return true;
+		}
+		// Pi preflights a parallel batch one call at a time. The first approval
+		// parks the attempt; later approval calls in that same batch must be able
+		// to observe the already-parked submission rather than fail closed merely
+		// because its attempt fields were cleared by the first call.
+		return (
+			this.sql
+				.exec(
+					`SELECT 1 FROM flue_agent_submissions
+					 WHERE submission_id = ? AND status = 'waiting_for_approval'
+					   AND abort_requested_at IS NULL
+					   AND approval_timeout_remaining_ms > 0
+					   AND ${pendingApproval}
+					 LIMIT 1`,
+					attempt.submissionId,
+					attempt.submissionId,
+					...pendingProposalIds,
+				)
+				.toArray().length > 0
+		);
+	}
+
+	async createToolApprovalImpl(proposal: ToolApprovalProposal): Promise<ToolApproval> {
+		const proposalJson = JSON.stringify(proposal);
+		return this.transactionSync(() => {
+			this.sql.exec(
+				`INSERT OR IGNORE INTO flue_tool_approvals
+				 (proposal_id, submission_id, status, proposal_json, requested_at, expires_at)
+				 VALUES (?, ?, 'pending', ?, ?, ?)`,
+				proposal.proposalId,
+				proposal.submissionId,
+				proposalJson,
+				proposal.requestedAt,
+				proposal.expiresAt ?? null,
+			);
+			const row = this.sql
+				.exec(`SELECT * FROM flue_tool_approvals WHERE proposal_id = ?`, proposal.proposalId)
+				.toArray()[0];
+			if (!row) throw new Error('[flue] Tool approval proposal was not persisted.');
+			const existing = parseToolApproval(row);
+			if (JSON.stringify(stripApprovalState(existing)) !== proposalJson) {
+				throw new Error(
+					`[flue] Tool approval proposal "${proposal.proposalId}" conflicts with its persisted input snapshot.`,
+				);
+			}
+			return existing;
+		});
+	}
+
+	async getToolApprovalImpl(proposalId: string): Promise<ToolApproval | null> {
+		const row = this.sql
+			.exec(`SELECT * FROM flue_tool_approvals WHERE proposal_id = ?`, proposalId)
+			.toArray()[0];
+		return row ? parseToolApproval(row) : null;
+	}
+
+	async listToolApprovalsImpl(submissionId: string): Promise<ToolApproval[]> {
+		return this.sql
+			.exec(
+				`SELECT * FROM flue_tool_approvals WHERE submission_id = ? ORDER BY requested_at ASC, proposal_id ASC`,
+				submissionId,
+			)
+			.toArray()
+			.map(parseToolApproval);
+	}
+
+	async listToolApprovalProjectionWorkImpl(): Promise<
+		Array<{
+			approval: ToolApproval;
+			requestProjected: boolean;
+			decisionProjected: boolean;
+		}>
+	> {
+		return this.sql
+			.exec(
+				`SELECT * FROM flue_tool_approvals
+				 WHERE request_projected_at IS NULL
+				    OR (status <> 'pending' AND decision_projected_at IS NULL)
+				 ORDER BY requested_at ASC, proposal_id ASC`,
+			)
+			.toArray()
+			.map((row) => ({
+				approval: parseToolApproval(row),
+				requestProjected: typeof row.request_projected_at === 'number',
+				decisionProjected: typeof row.decision_projected_at === 'number',
+			}));
+	}
+
+	async markToolApprovalProjectedImpl(
+		proposalId: string,
+		projection: 'requested' | 'decided',
+	): Promise<boolean> {
+		const column = projection === 'requested' ? 'request_projected_at' : 'decision_projected_at';
+		const statusGuard = projection === 'decided' ? ` AND status <> 'pending'` : '';
+		return (
+			this.sql
+				.exec(
+					`UPDATE flue_tool_approvals SET ${column} = COALESCE(${column}, ?)
+					 WHERE proposal_id = ?${statusGuard}
+					 RETURNING proposal_id`,
+					Date.now(),
+					proposalId,
+				)
+				.toArray().length > 0
+		);
+	}
+
+	async claimToolApprovalNotificationImpl(proposalId: string, now = Date.now()): Promise<boolean> {
+		return this.transactionSync(() => {
+			const row = this.sql
+				.exec(
+					`SELECT notification_attempt_count FROM flue_tool_approvals
+					 WHERE proposal_id = ? AND status = 'pending'
+					   AND notification_delivered_at IS NULL
+					   AND notification_next_attempt_at <= ?`,
+					proposalId,
+					now,
+				)
+				.toArray()[0];
+			if (!row) return false;
+			const attemptCount = Number(row.notification_attempt_count ?? 0);
+			const retryDelayMs = Math.min(60 * 60_000, 30_000 * 2 ** Math.min(attemptCount, 7));
+			return (
+				this.sql
+					.exec(
+						`UPDATE flue_tool_approvals
+						 SET notification_attempt_count = notification_attempt_count + 1,
+						     notification_next_attempt_at = ?
+						 WHERE proposal_id = ? AND status = 'pending'
+						   AND notification_delivered_at IS NULL
+						   AND notification_next_attempt_at <= ?
+						 RETURNING proposal_id`,
+						now + retryDelayMs,
+						proposalId,
+						now,
+					)
+					.toArray().length > 0
+			);
+		});
+	}
+
+	async completeToolApprovalNotificationImpl(
+		proposalId: string,
+		now = Date.now(),
+	): Promise<boolean> {
+		return (
+			this.sql
+				.exec(
+					`UPDATE flue_tool_approvals
+					 SET notification_delivered_at = COALESCE(notification_delivered_at, ?)
+					 WHERE proposal_id = ?
+					 RETURNING proposal_id`,
+					now,
+					proposalId,
+				)
+				.toArray().length > 0
+		);
+	}
+
+	async decideToolApprovalImpl(input: {
+		proposalId: string;
+		status: ToolApprovalDecisionStatus;
+		reason?: string;
+	}): Promise<{ approval: ToolApproval; decisionApplied: boolean; resumed: boolean }> {
+		if (
+			input.status !== 'approved' &&
+			input.status !== 'rejected' &&
+			input.status !== 'expired' &&
+			input.status !== 'canceled' &&
+			input.status !== 'aborted'
+		) {
+			throw new Error('[flue] Tool approval decision status is invalid.');
+		}
+		if (input.reason !== undefined && typeof input.reason !== 'string') {
+			throw new Error('[flue] Tool approval decision reason must be a string.');
+		}
+		return this.transactionSync(() => {
+			const before = this.sql
+				.exec(`SELECT * FROM flue_tool_approvals WHERE proposal_id = ?`, input.proposalId)
+				.toArray()[0];
+			if (!before) throw new Error(`[flue] Unknown tool approval proposal "${input.proposalId}".`);
+			const existing = parseToolApproval(before);
+			if (existing.status !== 'pending') {
+				return { approval: existing, decisionApplied: false, resumed: false };
+			}
+			const now = Date.now();
+			const expired = existing.expiresAt !== undefined && existing.expiresAt <= now;
+			const status: ToolApprovalDecisionStatus = expired ? 'expired' : input.status;
+			const reason = expired
+				? 'Approval expired before a decision was delivered.'
+				: (input.reason ?? null);
+			this.sql.exec(
+				`UPDATE flue_tool_approvals SET status = ?, decided_at = ?, reason = ?
+				 WHERE proposal_id = ? AND status = 'pending'`,
+				status,
+				now,
+				reason,
+				input.proposalId,
+			);
+			const updatedRow = this.sql
+				.exec(`SELECT * FROM flue_tool_approvals WHERE proposal_id = ?`, input.proposalId)
+				.toArray()[0];
+			if (!updatedRow) throw new Error('[flue] Tool approval decision was not persisted.');
+			const approval = parseToolApproval(updatedRow);
+			const pending =
+				this.sql
+					.exec(
+						`SELECT 1 FROM flue_tool_approvals WHERE submission_id = ? AND status = 'pending' LIMIT 1`,
+						approval.submissionId,
+					)
+					.toArray().length > 0;
+			let resumed = false;
+			if (!pending) {
+				const resumedRow = this.sql
+					.exec(
+						`UPDATE flue_agent_submissions
+						 SET status = 'queued',
+						     attempt_count = MAX(attempt_count - 1, 0),
+						     timeout_at = 0,
+						     approval_timeout_remaining_ms = COALESCE(approval_timeout_remaining_ms, 1),
+						     attempt_id = NULL, started_at = NULL, owner_id = NULL, lease_expires_at = 0
+						 WHERE submission_id = ? AND status = 'waiting_for_approval'
+						 RETURNING submission_id`,
+						approval.submissionId,
+					)
+					.toArray()[0];
+				resumed = Boolean(resumedRow);
+			}
+			return { approval, decisionApplied: true, resumed };
+		});
+	}
+
+	async expireToolApprovalsImpl(
+		now = Date.now(),
+	): Promise<Array<{ approval: ToolApproval; resumed: boolean }>> {
+		return this.transactionSync(() => {
+			const rows = this.sql
+				.exec(
+					`SELECT * FROM flue_tool_approvals
+					 WHERE status = 'pending' AND expires_at IS NOT NULL AND expires_at <= ?
+					 ORDER BY requested_at ASC`,
+					now,
+				)
+				.toArray();
+			const expired: Array<{ approval: ToolApproval; resumed: boolean }> = [];
+			for (const row of rows) {
+				const proposal = parseToolApproval(row);
+				this.sql.exec(
+					`UPDATE flue_tool_approvals SET status = 'expired', decided_at = ?, reason = ?
+					 WHERE proposal_id = ? AND status = 'pending'`,
+					now,
+					'Approval expired before a decision was delivered.',
+					proposal.proposalId,
+				);
+				const updatedRow = this.sql
+					.exec(`SELECT * FROM flue_tool_approvals WHERE proposal_id = ?`, proposal.proposalId)
+					.toArray()[0];
+				if (!updatedRow) throw new Error('[flue] Tool approval expiration was not persisted.');
+				const updated = parseToolApproval(updatedRow);
+				const resumed = this.resumeIfNoPendingApprovals(updated.submissionId);
+				expired.push({ approval: updated, resumed });
+			}
+			return expired;
+		});
+	}
+
+	private resumeIfNoPendingApprovals(submissionId: string): boolean {
+		const pending =
+			this.sql
+				.exec(
+					`SELECT 1 FROM flue_tool_approvals WHERE submission_id = ? AND status = 'pending' LIMIT 1`,
+					submissionId,
+				)
+				.toArray().length > 0;
+		if (pending) return false;
+		return (
+			this.sql
+				.exec(
+					`UPDATE flue_agent_submissions
+					 SET status = 'queued',
+					     attempt_count = MAX(attempt_count - 1, 0),
+					     timeout_at = 0,
+					     approval_timeout_remaining_ms = COALESCE(approval_timeout_remaining_ms, 1),
+				     attempt_id = NULL, started_at = NULL, owner_id = NULL, lease_expires_at = 0
+				 WHERE submission_id = ? AND status = 'waiting_for_approval'
+				 RETURNING submission_id`,
+					submissionId,
+				)
+				.toArray().length > 0
+		);
+	}
+
+	async requestSessionAbort(sessionKey: string): Promise<string[]> {
+		if (!this.toolApprovals) {
+			const rows = this.sql
+				.exec(
+					`UPDATE flue_agent_submissions
+					 SET abort_requested_at = COALESCE(abort_requested_at, ?)
+					 WHERE session_key = ? AND status IN ('queued', 'running', 'joining', 'joined')
+					 RETURNING submission_id`,
+					Date.now(),
+					sessionKey,
+				)
+				.toArray();
+			return rows.map((row) => String(row.submission_id));
+		}
+		return this.transactionSync(() => {
+			const now = Date.now();
+			// This write is deliberately before the submission transition. It
+			// acquires the SQLite writer lock so a concurrent park either becomes
+			// visible here and is aborted, or observes the abort stamp below and
+			// refuses to park a pending proposal.
+			this.sql.exec(
+				`UPDATE flue_tool_approvals
+				 SET status = 'aborted', decided_at = ?,
+				     reason = 'Approval canceled because the session was aborted.'
+				 WHERE status = 'pending' AND submission_id IN (
+				   SELECT submission_id FROM flue_agent_submissions
+				   WHERE session_key = ? AND status = 'waiting_for_approval'
+				 )`,
+				now,
+				sessionKey,
+			);
+			const rows = this.sql
+				.exec(
+					`UPDATE flue_agent_submissions
+				 SET abort_requested_at = COALESCE(abort_requested_at, ?),
+				     status = CASE WHEN status = 'waiting_for_approval' THEN 'queued' ELSE status END,
+				     input_applied_at = CASE WHEN status = 'waiting_for_approval' THEN NULL ELSE input_applied_at END,
+				     approval_timeout_remaining_ms = CASE WHEN status = 'waiting_for_approval' THEN NULL ELSE approval_timeout_remaining_ms END,
+				     timeout_at = CASE WHEN status = 'waiting_for_approval' THEN 0 ELSE timeout_at END
+				 WHERE session_key = ? AND status IN ('queued', 'running', 'waiting_for_approval', 'joining', 'joined')
+				 RETURNING submission_id`,
+					now,
+					sessionKey,
+				)
+				.toArray();
+			return rows.map((row) => String(row.submission_id));
+		});
 	}
 
 	async requeueSubmission(attempt: SubmissionAttemptRef): Promise<boolean> {
@@ -664,7 +1094,10 @@ class AgentSubmissionStoreImpl implements AgentSubmissionStore {
 		);
 	}
 
-	private parseOperationalRows(rows: SqlRow[], status: 'queued' | 'active'): AgentSubmission[] {
+	private parseOperationalRows(
+		rows: SqlRow[],
+		status: 'queued' | 'active' | 'waiting',
+	): AgentSubmission[] {
 		const submissions: AgentSubmission[] = [];
 		for (const row of rows) {
 			try {
@@ -684,7 +1117,7 @@ class AgentSubmissionStoreImpl implements AgentSubmissionStore {
 
 	private failSubmissionSequence(
 		sequence: number,
-		status: 'queued' | 'active',
+		status: 'queued' | 'active' | 'waiting',
 		error: unknown,
 	): void {
 		const message = error instanceof Error ? error.message : String(error);
@@ -693,7 +1126,7 @@ class AgentSubmissionStoreImpl implements AgentSubmissionStore {
 				.exec(
 					`UPDATE flue_agent_submissions
 					 SET status = 'settled', settled_at = ?, error = ?
-					 WHERE sequence = ? AND ${status === 'queued' ? "status = 'queued'" : "status = 'running'"}
+						WHERE sequence = ? AND ${status === 'queued' ? "status = 'queued'" : status === 'waiting' ? "status = 'waiting_for_approval'" : "status = 'running'"}
 					 RETURNING submission_id`,
 					Date.now(),
 					message,
@@ -759,6 +1192,7 @@ function parseSubmission(
 		typeof row.payload !== 'string' ||
 		(row.status !== 'queued' &&
 			row.status !== 'running' &&
+			row.status !== 'waiting_for_approval' &&
 			row.status !== 'terminalizing' &&
 			row.status !== 'settled' &&
 			row.status !== 'joining' &&
@@ -786,14 +1220,16 @@ function parseSubmission(
 			row.settled_at !== undefined &&
 			typeof row.settled_at !== 'number') ||
 		(row.status === 'queued' &&
-			(row.attempt_id !== null ||
-				row.input_applied_at !== null ||
-				row.started_at !== null ||
-				row.joined_into !== null)) ||
+			(row.attempt_id != null || row.started_at != null || row.joined_into != null)) ||
 		((row.status === 'joining' || row.status === 'joined') &&
 			typeof row.joined_into !== 'string') ||
 		((row.status === 'running' || row.status === 'terminalizing') &&
 			(typeof row.attempt_id !== 'string' || typeof row.started_at !== 'number')) ||
+		(row.status === 'waiting_for_approval' &&
+			(row.attempt_id != null ||
+				row.started_at != null ||
+				row.owner_id != null ||
+				row.lease_expires_at !== 0)) ||
 		typeof row.attempt_count !== 'number' ||
 		typeof row.max_attempts !== 'number' ||
 		typeof row.timeout_at !== 'number'
@@ -841,7 +1277,7 @@ function parseSubmission(
 	};
 }
 
-function ensureSubmissionTable(sql: SqlStorage): void {
+function ensureSubmissionTable(sql: SqlStorage, toolApprovals: boolean): void {
 	sql.exec(
 		`CREATE TABLE IF NOT EXISTS flue_agent_submissions (
 		 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -860,14 +1296,18 @@ function ensureSubmissionTable(sql: SqlStorage): void {
 		 settled_at INTEGER,
 		 error TEXT,
 		 attempt_count INTEGER NOT NULL DEFAULT 0,
-		 max_attempts INTEGER NOT NULL DEFAULT ${DURABILITY_DEFAULT_MAX_ATTEMPTS},
-		 timeout_at INTEGER NOT NULL DEFAULT 0,
+			max_attempts INTEGER NOT NULL DEFAULT ${DURABILITY_DEFAULT_MAX_ATTEMPTS},
+			timeout_at INTEGER NOT NULL DEFAULT 0,
+			${toolApprovals ? 'approval_timeout_remaining_ms INTEGER,' : ''}
 		 owner_id TEXT,
 		 lease_expires_at INTEGER NOT NULL DEFAULT 0,
 		 settlement_record_id TEXT,
 		 settlement_record TEXT
 		)`,
 	);
+	if (toolApprovals) {
+		ensureSqlColumn(sql, 'flue_agent_submissions', 'approval_timeout_remaining_ms', 'INTEGER');
+	}
 	sql.exec(
 		'CREATE INDEX IF NOT EXISTS flue_agent_submissions_status_sequence_idx ON flue_agent_submissions (status, sequence ASC)',
 	);
@@ -877,4 +1317,95 @@ function ensureSubmissionTable(sql: SqlStorage): void {
 	sql.exec(
 		'CREATE INDEX IF NOT EXISTS flue_agent_submissions_joined_into_idx ON flue_agent_submissions (joined_into) WHERE joined_into IS NOT NULL',
 	);
+}
+
+function ensureSqlColumn(sql: SqlStorage, table: string, column: string, definition: string): void {
+	const columns = sql.exec(`PRAGMA table_info(${table})`).toArray();
+	if (!columns.some((row) => row.name === column)) {
+		sql.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+	}
+}
+
+function ensureToolApprovalTable(sql: SqlStorage): void {
+	sql.exec(
+		`CREATE TABLE IF NOT EXISTS flue_tool_approvals (
+			proposal_id TEXT PRIMARY KEY,
+			submission_id TEXT NOT NULL,
+			status TEXT NOT NULL,
+			proposal_json TEXT NOT NULL,
+			requested_at INTEGER NOT NULL,
+			expires_at INTEGER,
+			decided_at INTEGER,
+			reason TEXT,
+			request_projected_at INTEGER,
+			decision_projected_at INTEGER,
+			notification_attempt_count INTEGER NOT NULL DEFAULT 0,
+			notification_next_attempt_at INTEGER NOT NULL DEFAULT 0,
+			notification_delivered_at INTEGER
+		)`,
+	);
+	ensureSqlColumn(sql, 'flue_tool_approvals', 'request_projected_at', 'INTEGER');
+	ensureSqlColumn(sql, 'flue_tool_approvals', 'decision_projected_at', 'INTEGER');
+	ensureSqlColumn(
+		sql,
+		'flue_tool_approvals',
+		'notification_attempt_count',
+		'INTEGER NOT NULL DEFAULT 0',
+	);
+	ensureSqlColumn(
+		sql,
+		'flue_tool_approvals',
+		'notification_next_attempt_at',
+		'INTEGER NOT NULL DEFAULT 0',
+	);
+	ensureSqlColumn(sql, 'flue_tool_approvals', 'notification_delivered_at', 'INTEGER');
+	sql.exec(
+		'CREATE INDEX IF NOT EXISTS flue_tool_approvals_submission_idx ON flue_tool_approvals (submission_id, requested_at ASC)',
+	);
+	sql.exec(
+		'CREATE INDEX IF NOT EXISTS flue_tool_approvals_pending_expiry_idx ON flue_tool_approvals (status, expires_at)',
+	);
+	sql.exec(
+		'CREATE INDEX IF NOT EXISTS flue_tool_approvals_projection_idx ON flue_tool_approvals (request_projected_at, decision_projected_at, status)',
+	);
+}
+
+function stripApprovalState(approval: ToolApproval): ToolApprovalProposal {
+	const { status: _status, decidedAt: _decidedAt, reason: _reason, ...proposal } = approval;
+	return proposal;
+}
+
+function parseToolApproval(row: SqlRow): ToolApproval {
+	if (
+		typeof row.proposal_id !== 'string' ||
+		typeof row.proposal_json !== 'string' ||
+		(row.status !== 'pending' &&
+			row.status !== 'approved' &&
+			row.status !== 'rejected' &&
+			row.status !== 'expired' &&
+			row.status !== 'canceled' &&
+			row.status !== 'aborted')
+	) {
+		throw new Error('[flue] Persisted tool approval row is malformed.');
+	}
+	const proposal = JSON.parse(row.proposal_json) as ToolApprovalProposal;
+	if (
+		proposal.proposalId !== row.proposal_id ||
+		typeof proposal.submissionId !== 'string' ||
+		typeof proposal.instanceId !== 'string' ||
+		typeof proposal.conversationId !== 'string' ||
+		typeof proposal.assistantMessageId !== 'string' ||
+		typeof proposal.toolCallId !== 'string' ||
+		typeof proposal.toolName !== 'string' ||
+		typeof proposal.toolVersion !== 'string' ||
+		typeof proposal.requestedAt !== 'number'
+	) {
+		throw new Error('[flue] Persisted tool approval proposal is malformed.');
+	}
+	return {
+		...proposal,
+		status: row.status as ToolApproval['status'],
+		...(typeof row.decided_at === 'number' ? { decidedAt: row.decided_at } : {}),
+		...(typeof row.reason === 'string' ? { reason: row.reason } : {}),
+	};
 }

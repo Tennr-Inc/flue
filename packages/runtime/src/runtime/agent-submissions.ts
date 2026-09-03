@@ -65,7 +65,7 @@ export interface AgentSubmissionInput {
 export interface AgentSubmissionInterruption {
 	readonly submissionId: string;
 	readonly kind: AgentSubmissionInput['kind'];
-	readonly reason: 'exhausted_retry_budget' | 'exceeded_timeout' | 'aborted';
+	readonly reason: 'exhausted_retry_budget' | 'exceeded_timeout' | 'failed' | 'aborted';
 	readonly message: string;
 }
 
@@ -718,11 +718,7 @@ export async function settleUnclaimableSubmission(
 	error: unknown,
 	emitCoordinatorEvent: CoordinatorEventEmitter,
 ): Promise<boolean> {
-	const settled = await submissions.settleQueuedSubmission(
-		submission.submissionId,
-		outcome,
-		error,
-	);
+	const settled = await submissions.settleQueuedSubmission(submission.submissionId, outcome, error);
 	if (!settled) return false;
 	const errorInfo = { errorInfo: classifyError(error) };
 	emitCoordinatorEvent(
@@ -917,9 +913,35 @@ export async function processSubmission(opts: ProcessSubmissionOptions): Promise
 				execute,
 			);
 		await run();
+		const afterRun = await submissions.getSubmission(submission.submissionId);
+		// Approval parking relinquishes this attempt. A fast decision may already
+		// have moved the row from waiting back to queued before the old handler
+		// unwinds, so status alone is insufficient: settle only while this exact
+		// running attempt still owns the submission.
+		if (afterRun?.status !== 'running' || afterRun.attemptId !== attempt.attemptId) return;
 	} catch (error) {
 		if (opts.isShutdownAbort?.(error)) {
 			throw error;
+		}
+		const afterError = await submissions.getSubmission(submission.submissionId);
+		if (afterError?.status !== 'running' || afterError.attemptId !== attempt.attemptId) {
+			return;
+		}
+		// The durable stamp is authoritative for the proposal→park abort race.
+		// A store must reject running→waiting once abort_requested_at is set; if
+		// that rejection reaches us before the in-process abort signal fires,
+		// terminalize as aborted here instead of misclassifying it as a failure.
+		if (afterError.abortRequestedAt !== undefined) {
+			await settleAbortedWithContext(
+				submissions,
+				afterError,
+				attempt,
+				agent,
+				ctx,
+				opts.conversationWriter,
+				opts.emitCoordinatorEvent,
+			);
+			return;
 		}
 		// Abort: keyed on the coordinator signal's reason (robust even when the
 		// provider rejects with a generic AbortError) rather than the thrown
@@ -945,6 +967,31 @@ export async function processSubmission(opts: ProcessSubmissionOptions): Promise
 		// the settlement would serialize as internal_error.
 		const settleError =
 			opts.signal?.reason instanceof SubmissionTimeoutError ? opts.signal.reason : error;
+		const interruptionReason =
+			settleError instanceof SubmissionTimeoutError ? 'exceeded_timeout' : 'failed';
+		await closePendingToolApprovals(
+			submissions,
+			submission.submissionId,
+			interruptionReason === 'exceeded_timeout' ? 'expired' : 'canceled',
+			settleError instanceof Error ? settleError.message : String(settleError),
+			opts.emitCoordinatorEvent,
+		);
+		try {
+			await createAgentSubmissionSessionHandler(agent, input, (session) =>
+				session.recordSubmissionTerminal({
+					submissionId: submission.submissionId,
+					kind: submission.kind,
+					reason: interruptionReason,
+					message: settleError instanceof Error ? settleError.message : String(settleError),
+				}),
+			)(ctx);
+		} catch (terminalError) {
+			console.error(
+				'[flue:submission] Failed to record terminal conversation state for submission',
+				submission.submissionId,
+				terminalError,
+			);
+		}
 		await settleJoinedSubmissions(
 			submissions,
 			attempt,
@@ -998,6 +1045,14 @@ async function failInterruptedSubmission(
 ): Promise<void> {
 	const { input } = submission;
 	const ctx = createContext(input.submissionId);
+	const terminalPreview = createError(undefined);
+	await closePendingToolApprovals(
+		submissions,
+		submission.submissionId,
+		reason === 'exceeded_timeout' ? 'expired' : 'canceled',
+		terminalPreview.message,
+		emitCoordinatorEvent,
+	);
 	// The terminal record settles the conversation to a deterministic rest
 	// state (ghost stream materialized, unresolved tool calls marker-settled)
 	// and reports which calls were interrupted; the settlement error is then
@@ -1012,7 +1067,7 @@ async function failInterruptedSubmission(
 				submissionId: submission.submissionId,
 				kind: submission.kind,
 				reason,
-				message: createError(undefined).message,
+				message: terminalPreview.message,
 			}),
 		)(ctx)) as ReadonlyArray<InterruptedToolCallRef>;
 	} catch (terminalError) {
@@ -1069,6 +1124,17 @@ async function settleAbortedWithContext(
 	emitCoordinatorEvent?: CoordinatorEventEmitter,
 ): Promise<void> {
 	const error = new SubmissionAbortedError();
+	// Store-level requestSessionAbort implementations should do this in the
+	// same transaction as the abort stamp. Repeat it at terminalization as an
+	// idempotent backstop so an older/custom adapter cannot leave proposals
+	// pending forever. First decision wins in decideToolApproval.
+	await closePendingToolApprovals(
+		submissions,
+		submission.submissionId,
+		'aborted',
+		'Submission aborted before the approved tool call ran.',
+		emitCoordinatorEvent,
+	);
 	// Visible timeline advisory for both kinds.
 	try {
 		await createAgentSubmissionSessionHandler(agent, submission.input, (s) =>
@@ -1109,6 +1175,33 @@ async function settleAbortedWithContext(
 		error,
 		conversationWriter,
 	);
+}
+
+async function closePendingToolApprovals(
+	submissions: AgentSubmissionStore,
+	submissionId: string,
+	status: 'expired' | 'canceled' | 'aborted',
+	reason: string,
+	emitCoordinatorEvent?: CoordinatorEventEmitter,
+): Promise<void> {
+	if (!submissions.listToolApprovals || !submissions.decideToolApproval) return;
+	for (const approval of await submissions.listToolApprovals(submissionId)) {
+		if (approval.status !== 'pending') continue;
+		const decision = await submissions.decideToolApproval({
+			proposalId: approval.proposalId,
+			status,
+			reason,
+		});
+		if (!decision.decisionApplied) continue;
+		emitCoordinatorEvent?.({
+			type: 'tool_approval_decided',
+			proposalId: decision.approval.proposalId,
+			toolName: decision.approval.toolName,
+			toolCallId: decision.approval.toolCallId,
+			status: decision.approval.status === 'pending' ? 'canceled' : decision.approval.status,
+			reason: decision.approval.reason,
+		});
+	}
 }
 
 /**

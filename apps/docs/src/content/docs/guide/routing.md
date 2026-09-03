@@ -71,13 +71,14 @@ A few properties worth knowing:
 
 Each conversation lives at the mount path plus a conversation id you choose: `/agents/support/ticket-8472`. The id is the same caller-chosen identifier described in the [Agents guide](/docs/guide/building-agents/) — a user id, a ticket number, any string — and the conversation is created on the first message it receives. Relative to the mount, the router serves:
 
-| Route                                | Purpose                                                    |
-| ------------------------------------ | ---------------------------------------------------------- |
-| `POST /:id`                          | Deliver one message (`202` admission).                     |
-| `GET /:id`                           | Read the conversation (snapshot, updates, or live stream). |
-| `HEAD /:id`                          | Read conversation stream metadata.                         |
-| `POST /:id/abort`                    | Abort in-flight and queued work.                           |
-| `GET /:id/attachments/:attachmentId` | Download one attachment's bytes.                           |
+| Route                                  | Purpose                                                    |
+| -------------------------------------- | ---------------------------------------------------------- |
+| `POST /:id`                            | Deliver one message (`202` admission).                     |
+| `GET /:id`                             | Read the conversation (snapshot, updates, or live stream). |
+| `HEAD /:id`                            | Read conversation stream metadata.                         |
+| `POST /:id/abort`                      | Abort in-flight and queued work.                           |
+| `POST /:id/tool-approvals/:proposalId` | Resolve one durable tool approval.                         |
+| `GET /:id/attachments/:attachmentId`   | Download one attachment's bytes.                           |
 
 ### Sending a message
 
@@ -105,13 +106,29 @@ Sends are **fire-and-forget**: the server responds `202` as soon as the message 
 
 There is no "wait for the reply" mode on this route. The agent's reply lands in the conversation, and you read it from there.
 
+### Resolving a tool approval
+
+Approval-gated tools use the same mounted agent surface. `createAgentRouter(...)` adds `POST /:id/tool-approvals/:proposalId` automatically; you do not need to add a ToT route or start a separate approval runtime. The body is a decision object with `status` (`approved`, `rejected`, `expired`, `canceled`, or `aborted`) and an optional string `reason`:
+
+```http title="Approve a refund"
+POST /agents/support/ticket-8472/tool-approvals/approval_01HZX... HTTP/1.1
+Content-Type: application/json
+
+{
+  "status": "approved",
+  "reason": "Operator confirmed the order and amount."
+}
+```
+
+The response is the durable approval row, including the proposal, its status, and any decision metadata. Invalid bodies return `400`; methods other than `POST` return `405`. Durable approval execution currently requires Cloudflare Durable Object SQLite. Because this route is inside the agent router, middleware mounted on `/agents/support/*` applies to it exactly as it does to prompts, reads, and aborts.
+
 ### Reading the conversation
 
 `GET` the same URL to read the conversation. A plain `GET` returns one materialized snapshot — every message reduced to complete, render-ready parts. Query parameters select live modes: `?view=updates&offset=...` reads changes after an offset, with long-polling or server-sent events for continuous streaming. The wire protocol is documented in the [Streaming Protocol](/docs/reference/streaming-protocol/) reference, but you rarely consume it by hand, because the Flue Agent SDK wraps it.
 
 ### The SDK wraps this surface
 
-A [`createFlueClient(...)`](/docs/sdk/create-flue-client/) client addresses exactly one conversation URL and packages the whole surface — `send()`, `wait()`, `observe()`, `history()`, `abort()`, and `attachmentUrl()` — over the routes above:
+A [`createFlueClient(...)`](/docs/sdk/create-flue-client/) client addresses exactly one conversation URL and packages the whole surface — `send()`, `wait()`, `observe()`, `history()`, `abort()`, `resolveToolApproval()`, and `attachmentUrl()` — over the routes above:
 
 ```ts
 import { createFlueClient } from '@flue/sdk';
@@ -165,7 +182,7 @@ app.route('/agents/support', createAgentRouter(Support));
 export default app;
 ```
 
-Because the middleware pattern ends in `/*`, it covers every route the agent router serves — prompts, reads, aborts, and attachment downloads alike. This is ordinary Hono composition, so anything your framework supports works here: shared middleware over a broader prefix (`app.use('/agents/*', requireUser)`), bearer tokens, session cookies, signature verification, per-route rate limits.
+Because the middleware pattern ends in `/*`, it covers every route the agent router serves — prompts, reads, aborts, tool approvals, and attachment downloads alike. This is ordinary Hono composition, so anything your framework supports works here: shared middleware over a broader prefix (`app.use('/agents/*', requireUser)`), bearer tokens, session cookies, signature verification, per-route rate limits.
 
 Two related patterns:
 

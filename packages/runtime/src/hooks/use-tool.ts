@@ -1,4 +1,5 @@
 import { assertToolDefinition } from '../tool.ts';
+import type { ToolApprovalPolicy } from '../tool-approval.ts';
 import type { ToolDefinition, ToolInputSchema, ToolOutputSchema } from '../tool-types.ts';
 import { requireRenderFrame } from './frame.ts';
 
@@ -27,8 +28,11 @@ export function useTool<
 >(tool: {
 	name: string;
 	description: string;
+	version?: string;
 	input?: TInput;
 	output?: TOutput;
+	approval?: ToolApprovalPolicy;
+	timeoutMs?: number;
 	/**
 	 * Connect this tool to the agent's runtime: `run` receives `harness` —
 	 * the one interface to the agent's environment (`harness.sandbox`) and

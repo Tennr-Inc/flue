@@ -107,8 +107,8 @@ interface DurabilityConfig {
 }
 ```
 
-- `maxAttempts` — maximum total attempts before a submission is terminalized as failed (`SubmissionRetryExhaustedError` settlement). The initial run counts as the first attempt; each interruption that re-runs the submission consumes another. Positive integer. Default `10`.
-- `timeoutMs` — maximum wall-clock milliseconds for a single submission, measured from the first attempt's start; a submission that exceeds it is aborted and settled failed (`SubmissionTimeoutError`). Turn-boundary joins and `useAgentFinish` continuations do not extend it. The deadline is checked cooperatively — before each turn and before recovery work, not preemptively during provider calls — so a hung provider call can outlive it; that case is covered by the attempt budget, not this check. Positive integer. Default `3_600_000` (one hour).
+- `maxAttempts` — maximum total attempts before a submission is terminalized as failed (`SubmissionRetryExhaustedError` settlement). The initial run counts as the first attempt; each interruption that re-runs the submission consumes another. A durable tool-approval wait releases and later reclaims ownership without consuming an attempt. Positive integer. Default `10`.
+- `timeoutMs` — maximum active-execution milliseconds for a single submission; a submission that exceeds it is aborted and settled failed (`SubmissionTimeoutError`). Durable tool-approval waiting pauses this budget, allowing an approval to wait for weeks without consuming the execution timeout. Its saved remaining time starts running again when the released submission is next claimed. Turn-boundary joins and `useAgentFinish` continuations do not extend it. The deadline is checked cooperatively — before each turn and before recovery work, not preemptively during provider calls — so a hung provider call can outlive it; that case is covered by the attempt budget, not this check. Positive integer. Default `3_600_000` (one hour).
 - Unknown fields throw at validation. Absent the static, the store defaults above apply.
 
 See [Durability](/docs/guide/durability/) for the recovery model.
@@ -183,6 +183,34 @@ Behavior and errors:
 - A missing `id` rejects with a human-readable `Error`; a malformed `message` throws `InvalidRequestError`.
 - A dispatch to a busy instance joins the live response at the next turn boundary; a dispatch to an idle instance wakes a new response. Deliveries that miss the live response run as their own submission from the durable queue — they are never lost. Dispatched activity belongs to the continuing instance and shares one accepted order with direct HTTP prompts to it.
 - **Target differences.** On Cloudflare, dispatch durably admits work to the target agent's Durable Object and may retry processing after an interruption. On Node, delivery durability follows the configured [persistence adapter](/docs/reference/data-persistence-api/): the default in-memory store is process-lifetime only, while a durable adapter keeps admitted dispatches across restarts and reconciles them on the replacement process. On both targets processing is at-least-once — design external side effects to be idempotent.
+
+## `resolveToolApproval()`
+
+```ts
+function resolveToolApproval(input: {
+  agent: string;
+  id: string;
+  proposalId: string;
+  status: 'approved' | 'rejected' | 'expired' | 'canceled' | 'aborted';
+  reason?: string;
+}): Promise<ToolApproval>;
+```
+
+Deliver a host decision for an approval-gated tool call. The proposal id is supplied by the configured [`ToolApprovalProvider`](#toolapprovalprovider) or by a persisted approval record. Decisions are durable and idempotent: once a proposal leaves `pending`, later decisions return the stored result and cannot overwrite it. `approved` resumes the parked submission after every approval in the current tool batch is decided; all other statuses record a deterministic tool error and never invoke the tool.
+
+This API currently requires the Cloudflare target and its SQLite-backed Durable Object execution store. Node runtimes and the LibSQL, PostgreSQL, MySQL, MongoDB, and Redis adapters do not implement durable tool approvals.
+
+The proposal stores the exact validated arguments and tool `version`. Flue executes that persisted validated snapshot only if the mounted definition keeps the recorded version; schema transforms are not run again during recovery. `expiresAt` deadlines are enforced by the submission coordinator, including after a process restart or Cloudflare isolate replacement.
+
+### `ToolApprovalProvider`
+
+```ts
+interface ToolApprovalProvider {
+  requested(proposal: ToolApprovalProposal): void | Promise<void>;
+}
+```
+
+Install one process-wide host notification adapter with `setToolApprovalProvider(provider)` before the runtime starts. Delivery is at-least-once: Flue replays pending parked proposals during reconciliation, including after a process restart or Cloudflare isolate replacement. Make `requested()` idempotent by `proposalId`. Notification is not the durable decision; after performing your own authorization, the host must call `resolveToolApproval()` to release the submission. The provider receives presentation hints, the exact arguments, the tool version, and the proposal deadline.
 
 ## Conditional sends
 
@@ -488,8 +516,11 @@ The agent's environment itself: the live [`Sandbox`](/docs/reference/sandbox-api
 function defineTool<...>(options: {
   name: string;
   description: string;
+  version?: string;          // stable approval/recovery identity; defaults to "1"
   input?: ToolInputSchema;   // Valibot schema; top-level object
   output?: ToolOutputSchema; // Valibot schema
+  approval?: { required: true; expiresInMs?: number; presentation?: ToolApprovalPresentation };
+  timeoutMs?: number;        // execution deadline; approval wait is not counted
   harness?: boolean;
   durable?: boolean;
   run(context: ToolContext<...>): ToolRunEnvelope<Output> | string | void | Promise<ToolRunEnvelope<Output> | string | void>;
@@ -499,8 +530,11 @@ function defineTool<...>(options: {
 A typing and validation helper: it validates the definition and returns it frozen, so bad definitions fail at module load instead of first render. Also importable from the lighter `@flue/runtime/tool` entry for tool-only modules. Agents mount the returned value per render with [`useTool()`](/docs/reference/agent-hooks-api/#usetool).
 
 - `name`, `description` — required non-empty strings. The description is the model-facing catalog line.
+- `version` — a non-empty, application-defined version string. An approval records it with the exact validated arguments; after a deploy, Flue refuses to execute an approved call if the mounted definition's version differs. Defaults to `"1"`.
 - `input` — a Valibot schema for the call's arguments. Must be a top-level object schema (the model sends a JSON object); anything else throws. When present, the parsed output arrives as `context.data`, typed by inference. When absent, the tool receives no `data` property and callers' arguments are ignored.
 - `output` — a Valibot schema for the return value. When present, the runtime parses the returned value through it before recording; a mismatch throws `ToolOutputValidationError`, and a schema producing `undefined` throws `ToolOutputSerializationError`.
+- `approval` — set `{ required: true }` to require a durable host decision before `run` is entered. `expiresInMs` sets an optional proposal deadline, and `presentation` carries optional UI text. Approval waiting is parked durable work: the model does not receive a placeholder tool result and does not continue to another turn. In a mixed batch, non-approval tools may finish, while the batch remains uncommitted until every approval is decided. Approval-gated tools must be mounted by the agent with `useTool()`; ephemeral per-call tools are rejected because durable recovery cannot reconstruct them.
+- `timeoutMs` — maximum execution time for this tool call after approval. It is independent of approval waiting; on expiry the call becomes an error result and the tool's signal is aborted. Positive finite number.
 - `harness`, `durable` — capability flags, detailed below. Must be booleans when present.
 - `run` — the implementation. May be async, and returns a `ToolRunEnvelope` — `{ output?, terminate? }`. `output` is the tool's result: it must be JSON-serializable, is snapshotted as JSON-compatible data, and is then JSON-stringified for the model; non-serializable output throws `ToolOutputSerializationError`. Returning a bare `string` is shorthand for `{ output: <string> }`, and returning nothing (`void`) is allowed only when no `output` schema is declared, reaching the model as `null`; any other bare return — a plain object, array, number, boolean, or `null` — throws, telling you to wrap it as `{ output: <value> }`. `terminate: true` ends the agent's turn once the current tool batch settles, the same loop-ending contract `finish`/`give_up` use — a multi-tool batch ends the turn only when every result in it terminates, a throwing tool never terminates, and the flag is recorded on the tool's canonical outcome, so termination survives a crash between the batch committing and the submission settling. Throwing inside `run` records a tool error the model sees; it does not fail the submission.
 - Arguments that fail the `input` schema throw `ToolInputValidationError` before `run` is invoked; the model receives the validation failure as the tool result and may retry.
@@ -544,6 +578,38 @@ The helper types `ToolInput<TTool>` and `ToolOutput<TTool>` extract a tool's inf
 - `durable: true` — `run` receives `step`, and every side effect in the run is expected to go through `step.do(...)`. In exchange, an interrupted call is re-executed on recovery — completed steps replay their recorded values instead of running again — rather than being settled with an unknown-outcome error like ordinary tools. See [Durable tools and `step.do`](/docs/guide/durability/#durable-tools-and-stepdo).
 
 The flags compose: a `durable: true, harness: true` tool receives both `step` and `harness` (wrap `harness.prompt(...)` in a step to avoid re-prompting on recovery).
+
+**Approval-gated tools.** Approval proposals are persisted with the submission, assistant message id, tool-call id, required explicit tool version, and validated arguments. Change the version whenever tool behavior changes; recovery refuses to execute an approval captured for any other version. The host receives proposals through `ToolApprovalProvider` when configured, then resolves one with the top-level `resolveToolApproval(...)` API:
+
+```ts
+import { defineTool, resolveToolApproval } from '@flue/runtime';
+import * as v from 'valibot';
+
+const sendPayment = defineTool({
+  name: 'send_payment',
+  description: 'Send the approved payment to the customer.',
+  version: 'payments-v2',
+  input: v.object({ paymentId: v.string(), amount: v.number() }),
+  approval: {
+    required: true,
+    expiresInMs: 15 * 60_000,
+    presentation: { title: 'Send payment' },
+  },
+  timeoutMs: 30_000,
+  async run({ data }) {
+    return { output: await payments.send(data) };
+  },
+});
+
+await resolveToolApproval({
+  agent: 'PaymentsAgent',
+  id: 'customer-42',
+  proposalId: 'approval_…',
+  status: 'approved',
+});
+```
+
+`resolveToolApproval` is idempotent: a later decision cannot overwrite the first non-pending status. Approvals can be `approved`, `rejected`, `expired`, `canceled`, or `aborted`; non-approved decisions produce a deterministic tool error and never enter `run`. The parked submission resumes only after all pending proposals in its batch are decided. Approval state and the canonical request/decision records survive process restarts and Cloudflare isolate replacement. Before an approved call enters `run`, Flue persists an invocation fence. If a non-durable process stops after that fence but before the outcome commits, recovery returns an interrupted-execution error rather than re-invoking a possibly completed side effect. This is at-most-once safety, not a general exactly-once external-effect guarantee: use the stable `context.toolCallId` as your external idempotency key. A `durable: true` approval tool resumes with its existing `step.do(...)` records.
 
 **`ToolStep`** — the durable-step surface a `durable: true` tool receives:
 

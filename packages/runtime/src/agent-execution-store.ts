@@ -12,6 +12,11 @@ import type { AgentSubmissionInput } from './runtime/agent-submissions.ts';
 import type { AttachmentStore } from './runtime/attachment-store.ts';
 import type { ConversationStreamStore } from './runtime/conversation-stream-store.ts';
 import type { DispatchInput } from './runtime/dispatch-queue.ts';
+import type {
+	ToolApproval,
+	ToolApprovalDecisionStatus,
+	ToolApprovalProposal,
+} from './tool-approval.ts';
 
 // ─── Durability defaults ────────────────────────────────────────────────────
 
@@ -56,10 +61,17 @@ export const LEASE_DURATION_MS = 30_000;
  *   payload and queue ordering (admission precedes the conversation's
  *   existence) and the once-stamped durability budget (`maxAttempts`/
  *   `timeoutAt`, installed at first input application so retries never
- *   re-anchor it).
+ *   re-anchor it; approval parking stores and restores the remaining active
+ *   time without charging the wait to that budget).
  */
-type AgentSubmissionStatus =
-	'queued' | 'running' | 'terminalizing' | 'settled' | 'joining' | 'joined';
+export type AgentSubmissionStatus =
+	| 'queued'
+	| 'running'
+	| 'waiting_for_approval'
+	| 'terminalizing'
+	| 'settled'
+	| 'joining'
+	| 'joined';
 
 export interface AgentSubmission {
 	readonly sequence: number;
@@ -125,6 +137,13 @@ export interface SubmissionDurability {
 	readonly timeoutAt: number;
 }
 
+/** One approval whose canonical public projection still needs repair. */
+export interface ToolApprovalProjectionWork {
+	readonly approval: ToolApproval;
+	readonly requestProjected: boolean;
+	readonly decisionProjected: boolean;
+}
+
 // ─── Dispatch admission ─────────────────────────────────────────────────────
 
 export type AgentDispatchAdmission =
@@ -152,7 +171,7 @@ export interface AgentSubmissionStore {
 	// Query
 	/** Return the submission, or `null` when the id is unknown. */
 	getSubmission(submissionId: string): Promise<AgentSubmission | null>;
-	/** True while any submission is queued, running, or joining/joined. */
+	/** True while any submission is queued, running, waiting, or joining/joined. */
 	hasUnsettledSubmissions(): Promise<boolean>;
 	/**
 	 * Queued submissions that are each the oldest unsettled submission of
@@ -167,6 +186,12 @@ export interface AgentSubmissionStore {
 	listUnreadySubmissions(): Promise<AgentSubmission[]>;
 	/** All running submissions, in admission order. */
 	listRunningSubmissions(): Promise<AgentSubmission[]>;
+	/**
+	 * Waiting submissions are parked without an active lease or retry attempt.
+	 * This and the approval methods below are one optional capability group;
+	 * Flue's built-in implementation currently targets Durable Object SQLite.
+	 */
+	listWaitingForApprovalSubmissions?(): Promise<AgentSubmission[]>;
 	/** Direct settlement obligations reserved but not yet finalized. */
 	listPendingSubmissionSettlements(): Promise<SubmissionSettlementObligation[]>;
 
@@ -208,9 +233,11 @@ export interface AgentSubmissionStore {
 	 * running ONLY when it is currently queued and is the runnable head of
 	 * its session (no earlier unsettled submission in the same session),
 	 * recording the attempt id, owner, lease expiry, and start time,
-	 * incrementing `attemptCount`, resetting `maxAttempts` to the system
-	 * default, and initializing `timeoutAt` when still unset (a previously
-	 * initialized timeout is preserved across requeue/reclaim). Returns the
+	 * incrementing `attemptCount` (approval parking first returns the prior
+	 * claim, so its resume is not charged as a recovery attempt), resetting `maxAttempts` to the system
+	 * default, and initializing `timeoutAt` when still unset. A claim resumed
+	 * after approval anchors the saved remaining execution time at claim time;
+	 * other previously initialized deadlines are preserved. Returns the
 	 * claimed submission, or `null` when any condition fails. Two concurrent
 	 * claims for the same submission must never both succeed.
 	 */
@@ -231,16 +258,63 @@ export interface AgentSubmissionStore {
 		durability?: SubmissionDurability,
 	): Promise<boolean>;
 	/**
+	 * Park a running attempt while one or more of `pendingProposalIds` are still
+	 * pending. Implementations must check that condition atomically with the
+	 * state transition: a decision that wins the race must leave the submission
+	 * running so its current attempt can repair and continue the batch.
+	 */
+	parkSubmissionForApproval?(
+		attempt: SubmissionAttemptRef,
+		pendingProposalIds: readonly string[],
+	): Promise<boolean>;
+	/**
+	 * Create or replay a proposal keyed by its stable proposal id. An existing
+	 * proposal is returned only when its immutable snapshot is identical.
+	 */
+	createToolApproval?(proposal: ToolApprovalProposal): Promise<ToolApproval>;
+	/** Read one proposal, or null when it is unknown. */
+	getToolApproval?(proposalId: string): Promise<ToolApproval | null>;
+	/** Read all proposals belonging to a submission in request order. */
+	listToolApprovals?(submissionId: string): Promise<ToolApproval[]>;
+	/** Read approval rows whose canonical request or terminal decision is not acknowledged yet. */
+	listToolApprovalProjectionWork?(): Promise<ToolApprovalProjectionWork[]>;
+	/** Acknowledge that one deterministic canonical approval record is durable. */
+	markToolApprovalProjected?(
+		proposalId: string,
+		projection: 'requested' | 'decided',
+	): Promise<boolean>;
+	/**
+	 * Atomically reserve a host notification attempt. Failed attempts become
+	 * claimable again with durable exponential backoff; a successful completion
+	 * is never claimed again.
+	 */
+	claimToolApprovalNotification?(proposalId: string, now?: number): Promise<boolean>;
+	/** Mark a claimed host notification as successfully delivered. */
+	completeToolApprovalNotification?(proposalId: string, now?: number): Promise<boolean>;
+	/**
+	 * Apply a decision idempotently. When the last pending proposal for a
+	 * parked submission is decided, the submission becomes runnable and its
+	 * remaining execution budget is preserved for the next claim.
+	 */
+	decideToolApproval?(input: {
+		proposalId: string;
+		status: ToolApprovalDecisionStatus;
+		reason?: string;
+	}): Promise<{ approval: ToolApproval; decisionApplied: boolean; resumed: boolean }>;
+	/** Expire pending proposals whose deadline has passed. */
+	expireToolApprovals?(now?: number): Promise<Array<{ approval: ToolApproval; resumed: boolean }>>;
+	/**
 	 * Record an abort request for every unsettled submission in a session.
 	 * Atomically stamps `abortRequestedAt` (COALESCE — first request wins) on
-	 * each `queued`, `running`, `joining`, or `joined` submission with the given `sessionKey` and
-	 * returns their submission ids. It does NOT settle anything and does NOT
-	 * change `status`: terminal settlement always happens through an
-	 * attempt-based path (the pre-execution abort check when a queued submission
-	 * is claimed, the in-flight abort settle, or the recovery abort branch) so a
-	 * durable canonical terminal record always exists. `terminalizing` and
-	 * `settled` submissions are left untouched (a committed outcome must not be
-	 * overridden). Idempotent; returns an empty array when nothing is unsettled.
+	 * each `queued`, `running`, `waiting_for_approval`, `joining`, or `joined`
+	 * submission with the given `sessionKey` and returns their submission ids.
+	 * A waiting submission has no live attempt to observe the abort, so this
+	 * operation MUST atomically decide its pending approvals as `aborted` and
+	 * return it to `queued`; its normal pre-execution abort path then writes the
+	 * canonical terminal record. Other states stay non-terminal until their
+	 * attempt-based path settles them. `terminalizing` and `settled` submissions
+	 * are left untouched. Idempotent; returns an empty array when nothing is
+	 * unsettled.
 	 */
 	requestSessionAbort(sessionKey: string): Promise<string[]>;
 	/**
