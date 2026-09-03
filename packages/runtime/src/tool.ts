@@ -6,6 +6,7 @@ import {
 import { cloneJsonSerializable } from './json-snapshot.ts';
 import { generateToolCallId } from './runtime/ids.ts';
 import { isTopLevelObjectSchema, isValibotSchema, parseValibot } from './schema.ts';
+import type { ToolApprovalPolicy } from './tool-approval.ts';
 import type {
 	ToolContext,
 	ToolDefinition,
@@ -24,8 +25,11 @@ export function defineTool<
 >(options: {
 	name: string;
 	description: string;
+	version?: string;
 	input?: TInput;
 	output?: TOutput;
+	approval?: ToolApprovalPolicy;
+	timeoutMs?: number;
 	harness?: THarness;
 	durable?: TDurable;
 	run: ToolDefinition<TInput, TOutput, THarness, TDurable>['run'];
@@ -34,8 +38,11 @@ export function defineTool<
 	return Object.freeze({
 		name: options.name,
 		description: options.description,
+		version: options.version ?? '1',
 		input: options.input as TInput,
 		output: options.output as TOutput,
+		...(options.approval ? { approval: freezeApproval(options.approval) } : {}),
+		...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
 		harness: options.harness as THarness,
 		durable: options.durable as TDurable,
 		run: options.run,
@@ -45,8 +52,11 @@ export function defineTool<
 const TOOL_DEFINITION_FIELDS = new Set([
 	'name',
 	'description',
+	'version',
 	'input',
 	'output',
+	'approval',
+	'timeoutMs',
 	'harness',
 	'durable',
 	'run',
@@ -72,6 +82,7 @@ export function assertToolDefinition(
 	const tool = value as Partial<ToolDefinition>;
 	assertNonEmptyString(tool.name, `${label} name`);
 	assertNonEmptyString(tool.description, `${label} description`);
+	if (tool.version !== undefined) assertNonEmptyString(tool.version, `${label} version`);
 	if (tool.input !== undefined) {
 		if (!isValibotSchema(tool.input)) {
 			throw new Error(`[flue] ${label} input must be a Valibot schema.`);
@@ -89,9 +100,57 @@ export function assertToolDefinition(
 	if (tool.durable !== undefined && typeof tool.durable !== 'boolean') {
 		throw new Error(`[flue] ${label} durable must be a boolean.`);
 	}
+	if (tool.timeoutMs !== undefined && (!Number.isFinite(tool.timeoutMs) || tool.timeoutMs <= 0)) {
+		throw new Error(`[flue] ${label} timeoutMs must be a positive finite number.`);
+	}
+	if (tool.approval !== undefined) {
+		if (!isApprovalPolicy(tool.approval)) {
+			throw new Error(`[flue] ${label} approval must be { required: true }.`);
+		}
+		if (
+			tool.approval.expiresInMs !== undefined &&
+			(!Number.isFinite(tool.approval.expiresInMs) || tool.approval.expiresInMs <= 0)
+		) {
+			throw new Error(`[flue] ${label} approval.expiresInMs must be a positive finite number.`);
+		}
+		const presentation = tool.approval.presentation;
+		if (presentation !== undefined) {
+			if (
+				typeof presentation !== 'object' ||
+				presentation === null ||
+				Array.isArray(presentation)
+			) {
+				throw new Error(`[flue] ${label} approval.presentation must be an object.`);
+			}
+			if (presentation.title !== undefined)
+				assertString(presentation.title, `${label} approval.presentation.title`);
+			if (presentation.description !== undefined)
+				assertString(presentation.description, `${label} approval.presentation.description`);
+		}
+	}
 	if (typeof tool.run !== 'function') {
 		throw new Error(`[flue] ${label} run must be a function.`);
 	}
+}
+
+function isApprovalPolicy(value: unknown): value is ToolApprovalPolicy {
+	return (
+		typeof value === 'object' &&
+		value !== null &&
+		!Array.isArray(value) &&
+		(value as { required?: unknown }).required === true
+	);
+}
+
+function freezeApproval(policy: ToolApprovalPolicy): ToolApprovalPolicy {
+	return Object.freeze({
+		...policy,
+		...(policy.presentation ? { presentation: Object.freeze({ ...policy.presentation }) } : {}),
+	});
+}
+
+function assertString(value: unknown, label: string): asserts value is string {
+	if (typeof value !== 'string') throw new Error(`[flue] ${label} must be a string.`);
 }
 
 /** Runtime facilities the executing session injects into {@link ToolContext}. */
@@ -111,6 +170,34 @@ export function parseToolInput<TTool extends ToolDefinition>(
 	signal?: AbortSignal,
 	facilities?: ToolRunFacilities,
 ): { context: Parameters<TTool['run']>[0]; data: unknown } {
+	if (!tool.input) {
+		return {
+			context: createParsedToolContext(tool, undefined, signal, facilities),
+			data: undefined,
+		};
+	}
+	const parsed = parseValibot(tool.input, data === undefined ? {} : data);
+	if (!parsed.success) {
+		throw new ToolInputValidationError({ tool: tool.name, issues: parsed.issues });
+	}
+	return {
+		context: createParsedToolContext(tool, parsed.output, signal, facilities),
+		data: parsed.output,
+	};
+}
+
+/**
+ * Build a tool context from input that has already passed the definition's
+ * schema. Durable approval recovery uses this to replay the exact persisted
+ * parsed arguments without running non-idempotent schema transformations a
+ * second time.
+ */
+export function createParsedToolContext<TTool extends ToolDefinition>(
+	tool: TTool,
+	data: unknown,
+	signal?: AbortSignal,
+	facilities?: ToolRunFacilities,
+): Parameters<TTool['run']>[0] {
 	const base: Record<string, unknown> = {
 		signal,
 		log: facilities?.log ?? NOOP_LOGGER,
@@ -121,15 +208,7 @@ export function parseToolInput<TTool extends ToolDefinition>(
 		// without recording — same semantics, no persistence.
 		...(tool.durable ? { step: facilities?.step ?? createEphemeralToolStep(tool.name) } : {}),
 	};
-	if (!tool.input) return { context: base as Parameters<TTool['run']>[0], data: undefined };
-	const parsed = parseValibot(tool.input, data === undefined ? {} : data);
-	if (!parsed.success) {
-		throw new ToolInputValidationError({ tool: tool.name, issues: parsed.issues });
-	}
-	return {
-		context: { ...base, data: parsed.output } as Parameters<TTool['run']>[0],
-		data: parsed.output,
-	};
+	return (tool.input ? { ...base, data } : base) as Parameters<TTool['run']>[0];
 }
 
 /** Standalone runs have no conversation stream to log into. */

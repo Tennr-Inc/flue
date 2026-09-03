@@ -40,6 +40,7 @@ import {
 	createCoordinatorEventEmitter,
 	drainGlobalEventDeliveries,
 } from '../runtime/events.ts';
+import type { ToolApprovalResolutionInput } from '../runtime/flue-app.ts';
 import { assertAgentDispatchAdmissionInput, handleAgentRequest } from '../runtime/handle-agent.ts';
 import {
 	handleAgentAttachmentRead,
@@ -48,7 +49,9 @@ import {
 } from '../runtime/handle-conversation-routes.ts';
 import { generateAttemptId, isKeyDerivedSubmissionId } from '../runtime/ids.ts';
 import { agentStreamPath } from '../runtime/stream-offsets.ts';
+import { getToolApprovalProvider } from '../runtime/tool-approval-provider.ts';
 import { createSessionStorageKey } from '../session-identity.ts';
+import type { ToolApproval } from '../tool-approval.ts';
 import type { DeliveredMessage } from '../types.ts';
 import {
 	createSqlAgentExecutionStore,
@@ -57,6 +60,7 @@ import {
 
 export const CLOUDFLARE_AGENT_INTERNAL_DISPATCH_PATH = '/__flue/internal/dispatch';
 export const CLOUDFLARE_AGENT_INTERNAL_INSTANCE_INFO_PATH = '/__flue/internal/instance-info';
+export const CLOUDFLARE_AGENT_INTERNAL_APPROVAL_PATH = '/__flue/internal/tool-approval';
 
 const FLUE_AGENT_SUBMISSION_WAKE_CALLBACK = '__flueWakeAgentSubmissions';
 const FLUE_AGENT_SUBMISSION_WAKE_SECONDS = 30;
@@ -173,6 +177,10 @@ export interface CloudflareAgentRuntime {
 	 */
 	drainSubmissions(instance: CloudflareAgentInstance): Promise<void>;
 	onRequest(instance: CloudflareAgentInstance, request: Request): Promise<Response | null>;
+	resolveToolApproval(
+		instance: CloudflareAgentInstance,
+		input: ToolApprovalResolutionInput,
+	): Promise<ToolApproval>;
 	onFiberRecovered(
 		instance: CloudflareAgentInstance,
 		ctx: CloudflareAgentRecoveredFiberContext,
@@ -225,6 +233,9 @@ export function createCloudflareAgentRuntime(
 		},
 		onRequest(instance, request) {
 			return getCoordinator(instance).onRequest(request);
+		},
+		resolveToolApproval(instance, input) {
+			return getCoordinator(instance).resolveToolApproval(input);
 		},
 		onFiberRecovered(instance, ctx, inherited) {
 			return getCoordinator(instance).onFiberRecovered(ctx, inherited);
@@ -442,6 +453,48 @@ class CloudflareAgentCoordinator {
 		});
 	}
 
+	async resolveToolApproval(input: ToolApprovalResolutionInput): Promise<ToolApproval> {
+		if (input.agent !== this.agentName || input.id !== this.instance.name) {
+			throw new Error('[flue] Tool approval target does not match this agent instance.');
+		}
+		const getApproval = this.submissions.getToolApproval;
+		const decide = this.submissions.decideToolApproval;
+		if (!getApproval || !decide) {
+			throw new Error('[flue] The configured persistence adapter does not support tool approvals.');
+		}
+		const existing = await getApproval.call(this.submissions, input.proposalId);
+		if (!existing) throw new Error(`[flue] Unknown tool approval proposal "${input.proposalId}".`);
+		const submission = existing.agentName
+			? undefined
+			: await this.submissions.getSubmission(existing.submissionId);
+		const targetAgent = existing.agentName ?? submission?.input.agent;
+		const targetId = submission?.input.id ?? existing.instanceId;
+		if (targetAgent !== input.agent || targetId !== input.id || existing.instanceId !== input.id) {
+			throw new Error('[flue] Tool approval target does not match the persisted proposal.');
+		}
+		const result = await decide.call(this.submissions, input);
+		if (result.decisionApplied) {
+			this.emitCoordinatorEvent({
+				type: 'tool_approval_decided',
+				proposalId: result.approval.proposalId,
+				toolName: result.approval.toolName,
+				toolCallId: result.approval.toolCallId,
+				status: result.approval.status === 'pending' ? 'canceled' : result.approval.status,
+				reason: result.approval.reason,
+			});
+		}
+		if (result.decisionApplied && result.resumed) {
+			this.emitCoordinatorEvent({
+				type: 'tool_approval_resumed',
+				proposalId: result.approval.proposalId,
+				toolName: result.approval.toolName,
+				toolCallId: result.approval.toolCallId,
+			});
+		}
+		await this.armDrain();
+		return result.approval;
+	}
+
 	async onAlarm(inherited: () => Promise<unknown> | unknown): Promise<unknown> {
 		return this.runWithInstanceContext(() => inherited());
 	}
@@ -449,6 +502,17 @@ class CloudflareAgentCoordinator {
 	private async routeRequest(request: Request): Promise<Response | null> {
 		if (isInternalDispatchRequest(request)) return this.admitDispatch(request);
 		if (isInternalInstanceInfoRequest(request)) return this.instanceInfo();
+		if (isInternalApprovalRequest(request)) {
+			const input = (await request.json()) as ToolApprovalResolutionInput;
+			try {
+				return Response.json(await this.resolveToolApproval(input));
+			} catch (error) {
+				return Response.json(
+					{ error: error instanceof Error ? error.message : String(error) },
+					{ status: 400 },
+				);
+			}
+		}
 
 		if (isAbortRequest(request, this.agentName, this.instance.name)) {
 			const aborted = await this.abortInstance();
@@ -628,6 +692,26 @@ class CloudflareAgentCoordinator {
 		const toStart: Array<AgentSubmission> = [];
 		if (!(await this.submissions.hasUnsettledSubmissions())) return toStart;
 		try {
+			for (const result of (await this.submissions.expireToolApprovals?.()) ?? []) {
+				const { approval } = result;
+				this.emitCoordinatorEvent({
+					type: 'tool_approval_decided',
+					proposalId: approval.proposalId,
+					toolName: approval.toolName,
+					toolCallId: approval.toolCallId,
+					status: 'expired',
+					reason: approval.reason,
+				});
+				if (result.resumed) {
+					this.emitCoordinatorEvent({
+						type: 'tool_approval_resumed',
+						proposalId: approval.proposalId,
+						toolName: approval.toolName,
+						toolCallId: approval.toolCallId,
+					});
+				}
+			}
+			this.instance.ctx.waitUntil?.(this.replayWaitingToolApprovals());
 			for (const submission of await this.submissions.listUnreadySubmissions()) {
 				// A durable abort on an unready row settles here: the row is never
 				// claimable, so the attempt-based abort settle can never run — this
@@ -774,6 +858,31 @@ class CloudflareAgentCoordinator {
 		return toStart;
 	}
 
+	/** Re-deliver pending proposals after a Durable Object wake or replacement. */
+	private replayWaitingToolApprovals(): Promise<void> {
+		const provider = getToolApprovalProvider();
+		const listWaiting = this.submissions.listWaitingForApprovalSubmissions;
+		const listApprovals = this.submissions.listToolApprovals;
+		if (!provider || !listWaiting || !listApprovals) return Promise.resolve();
+		return Promise.resolve()
+			.then(async () => {
+				for (const submission of await listWaiting.call(this.submissions)) {
+					for (const approval of await listApprovals.call(
+						this.submissions,
+						submission.submissionId,
+					)) {
+						if (approval.status === 'pending') await provider.requested(approval);
+					}
+				}
+			})
+			.catch((error) => {
+				console.error(
+					'[flue:tool-approval] Failed to replay pending approval notification.',
+					error,
+				);
+			});
+	}
+
 	/**
 	 * Auto-fail a queued row whose materialization can never succeed, past its
 	 * admission-anchored durability bound (see `unreadySubmissionDeadline`).
@@ -869,9 +978,7 @@ class CloudflareAgentCoordinator {
 		// Abort intent wins over timeout, mirroring the settle-order in
 		// reconcileInterruptedSubmission. AbortController.abort is idempotent,
 		// so re-signaling on every pass is safe.
-		controller.abort(
-			abortRequested ? new SubmissionAbortedError() : new SubmissionTimeoutError(),
-		);
+		controller.abort(abortRequested ? new SubmissionAbortedError() : new SubmissionTimeoutError());
 		// The grace is anchored to when the fiber was first SIGNALED, not to
 		// the deadline itself: a delayed first pass (late alarms) must not
 		// abort and force-settle in the same breath. Abort intents were
@@ -894,9 +1001,7 @@ class CloudflareAgentCoordinator {
 				attemptCount: submission.attemptCount,
 				maxAttempts: submission.maxAttempts,
 				error: serializeSubmissionError(
-					abortRequested
-						? new SubmissionAbortedError()
-						: new SubmissionTimeoutError(),
+					abortRequested ? new SubmissionAbortedError() : new SubmissionTimeoutError(),
 				),
 			});
 			return false;
@@ -1043,8 +1148,10 @@ class CloudflareAgentCoordinator {
 			SUBMISSION_HARNESS_NAME,
 			SUBMISSION_SESSION_NAME,
 		);
+		const pendingApprovals = await this.listPendingApprovalsForSession(sessionKey);
 		const affected = await this.submissions.requestSessionAbort(sessionKey);
 		if (affected.length === 0) return false;
+		await this.emitAbortedApprovalEvents(pendingApprovals);
 		// Abort any of those attempt fibers live in this isolate —
 		// processSubmission's catch settles them aborted and the fiber tail
 		// arms the next wake. Queued ones settle via the pre-execution abort
@@ -1057,6 +1164,50 @@ class CloudflareAgentCoordinator {
 		}
 		await this.armDrain();
 		return true;
+	}
+
+	private async listPendingApprovalsForSession(sessionKey: string): Promise<ToolApproval[]> {
+		const listWaiting = this.submissions.listWaitingForApprovalSubmissions;
+		const listApprovals = this.submissions.listToolApprovals;
+		if (!listWaiting || !listApprovals) return [];
+		const pending: ToolApproval[] = [];
+		for (const submission of await listWaiting.call(this.submissions)) {
+			if (submission.sessionKey !== sessionKey) continue;
+			for (const approval of await listApprovals.call(this.submissions, submission.submissionId)) {
+				if (approval.status === 'pending') pending.push(approval);
+			}
+		}
+		return pending;
+	}
+
+	private async emitAbortedApprovalEvents(previouslyPending: ToolApproval[]): Promise<void> {
+		const getApproval = this.submissions.getToolApproval;
+		if (!getApproval) return;
+		const releasedBySubmission = new Map<string, ToolApproval>();
+		for (const snapshot of previouslyPending) {
+			const approval = await getApproval.call(this.submissions, snapshot.proposalId);
+			// A concurrent explicit decision may have won before the abort transaction.
+			// Its own request path emitted that status, so only report rows this abort
+			// actually transitioned.
+			if (approval?.status !== 'aborted') continue;
+			this.emitCoordinatorEvent({
+				type: 'tool_approval_decided',
+				proposalId: approval.proposalId,
+				toolName: approval.toolName,
+				toolCallId: approval.toolCallId,
+				status: 'aborted',
+				reason: approval.reason,
+			});
+			releasedBySubmission.set(approval.submissionId, approval);
+		}
+		for (const approval of releasedBySubmission.values()) {
+			this.emitCoordinatorEvent({
+				type: 'tool_approval_resumed',
+				proposalId: approval.proposalId,
+				toolName: approval.toolName,
+				toolCallId: approval.toolCallId,
+			});
+		}
 	}
 
 	/**
@@ -1375,6 +1526,13 @@ function isInternalInstanceInfoRequest(request: Request): boolean {
 	return (
 		request.method === 'GET' &&
 		new URL(request.url).pathname === CLOUDFLARE_AGENT_INTERNAL_INSTANCE_INFO_PATH
+	);
+}
+
+function isInternalApprovalRequest(request: Request): boolean {
+	return (
+		request.method === 'POST' &&
+		new URL(request.url).pathname === CLOUDFLARE_AGENT_INTERNAL_APPROVAL_PATH
 	);
 }
 

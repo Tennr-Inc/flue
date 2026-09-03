@@ -1,6 +1,7 @@
 import type { AssistantMessage, ToolResultMessage } from '@earendil-works/pi-ai';
 import type { ResourceSnapshot } from './resources.ts';
 import { generateEntryId, generateRecordId } from './runtime/ids.ts';
+import type { ToolApprovalDecisionStatus } from './tool-approval.ts';
 import type { PromptUsage } from './types.ts';
 
 interface ConversationRecordEnvelope {
@@ -269,6 +270,39 @@ interface ToolResultsCommittedRecord extends ConversationRecordEnvelope {
 	outcomeIds: string[];
 }
 
+export interface ToolApprovalRequestedRecord extends ConversationRecordEnvelope {
+	type: 'tool_approval_requested';
+	proposalId: string;
+	submissionId: string;
+	assistantMessageId: string;
+	toolCallId: string;
+	toolName: string;
+	toolVersion: string;
+	arguments: Record<string, unknown>;
+	expiresAt?: number;
+}
+
+export interface ToolApprovalDecidedRecord extends ConversationRecordEnvelope {
+	type: 'tool_approval_decided';
+	proposalId: string;
+	submissionId: string;
+	status: ToolApprovalDecisionStatus;
+	reason?: string;
+}
+
+/**
+ * A durable invocation fence for an approved tool. If a process fails after
+ * this record but before its tool outcome commits, recovery must not invoke
+ * the tool a second time because its side effects may already have happened.
+ */
+export interface ToolApprovalExecutionStartedRecord extends ConversationRecordEnvelope {
+	type: 'tool_approval_execution_started';
+	proposalId: string;
+	submissionId: string;
+	assistantMessageId: string;
+	toolCallId: string;
+}
+
 export interface CompactionRecord extends ConversationRecordEnvelope {
 	type: 'compaction';
 	entryId: string;
@@ -454,6 +488,9 @@ export type ConversationRecord =
 	| AssistantMessageCompletedRecord
 	| ToolOutcomeRecord
 	| ToolResultsCommittedRecord
+	| ToolApprovalRequestedRecord
+	| ToolApprovalDecidedRecord
+	| ToolApprovalExecutionStartedRecord
 	| CompactionRecord
 	| ChildSessionRetainedRecord
 	| SubmissionSettledRecord

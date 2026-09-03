@@ -68,6 +68,35 @@ const checkInventory = defineTool({
 
 **Errors.** A throw inside `run` does not crash the agent. It becomes an error result the model sees, so it can retry, try another approach, or tell the user. Throw (or return a descriptive failure value) rather than swallowing errors — the model can only respond to failures it can see.
 
+## Require approval before a tool runs
+
+For actions that need a human or external policy decision, add `approval: { required: true }` to the tool. Flue validates the model's arguments, persists an immutable proposal, and parks the durable submission before entering `run`:
+
+> Approval-gated execution is currently supported only by the Cloudflare target, where each agent instance uses Durable Object SQLite. Other persistence adapters continue to support ordinary tools, but an approval-gated call fails clearly because they do not implement the approval store capability.
+
+```ts
+const refund = defineTool({
+  name: 'refund_order',
+  description: 'Refund an order after an operator approves the exact amount.',
+  version: 'refund-v1',
+  input: v.object({ orderId: v.string(), amount: v.number() }),
+  approval: {
+    required: true,
+    expiresInMs: 10 * 60_000,
+    presentation: { title: 'Approve refund', description: 'Review the order and amount.' },
+  },
+  async run({ data }) {
+    return { output: await billing.refund(data.orderId, data.amount) };
+  },
+});
+```
+
+Install one process-wide `ToolApprovalProvider` with `setToolApprovalProvider(...)` before starting the runtime. Its `requested(proposal)` callback delivers the durable proposal to your approval UI or queue; it is at-least-once and must deduplicate by `proposalId`. After authenticating the human or policy decision in your own application, accept or reject it with `resolveToolApproval({ agent, id, proposalId, status })` from `@flue/runtime`. The decision is idempotent and durable. `approved` resumes the submission; `rejected`, `expired`, `canceled`, and `aborted` create a deterministic tool error and never call `run`.
+
+Approval waiting does not send a fake result to the model or let it continue to a new turn. If one model turn calls both ordinary and approval-gated tools, ordinary calls may finish, but Flue commits the whole tool batch only after every approval is decided. The proposal includes the validated arguments and `version`; after a deploy, Flue executes the persisted validated snapshot only when the mounted tool has the same version. `expiresInMs` is optional; use it when an old approval should not authorize a later action. Declare approval-gated tools with `useTool()` in the agent; per-call tools are intentionally rejected because their definitions cannot be reconstructed after a durable restart.
+
+`timeoutMs` is separate from approval waiting and starts only when the approved tool begins execution. The tool's `signal` is aborted at the deadline. Signal-aware code should pass it to downstream APIs; a signal-deaf operation is abandoned by the runtime and may still finish externally, so make side effects idempotent. Flue writes a durable invocation fence immediately before an approved call enters `run`: a non-durable call interrupted before its outcome commits is reported as unknown rather than run again. This is an at-most-once safety boundary, not a general exactly-once guarantee; use `toolCallId` as the stable idempotency key for an external operation. A `durable: true` approval tool instead resumes through its recorded `step.do(...)` values.
+
 **The rest of the context.** Alongside `data`, every `run` receives:
 
 - `signal` — an `AbortSignal` for the call. Pass it to your own async work so a cancelled tool call stops promptly. A `run` that ignores the signal cannot wedge the agent: when the signal fires, the runtime abandons the await — the call fails with an `AbortError` saying the work may still be running, and the orphaned promise's eventual result is discarded.

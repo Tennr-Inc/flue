@@ -718,11 +718,7 @@ export async function settleUnclaimableSubmission(
 	error: unknown,
 	emitCoordinatorEvent: CoordinatorEventEmitter,
 ): Promise<boolean> {
-	const settled = await submissions.settleQueuedSubmission(
-		submission.submissionId,
-		outcome,
-		error,
-	);
+	const settled = await submissions.settleQueuedSubmission(submission.submissionId, outcome, error);
 	if (!settled) return false;
 	const errorInfo = { errorInfo: classifyError(error) };
 	emitCoordinatorEvent(
@@ -917,9 +913,35 @@ export async function processSubmission(opts: ProcessSubmissionOptions): Promise
 				execute,
 			);
 		await run();
+		const afterRun = await submissions.getSubmission(submission.submissionId);
+		// Approval parking relinquishes this attempt. A fast decision may already
+		// have moved the row from waiting back to queued before the old handler
+		// unwinds, so status alone is insufficient: settle only while this exact
+		// running attempt still owns the submission.
+		if (afterRun?.status !== 'running' || afterRun.attemptId !== attempt.attemptId) return;
 	} catch (error) {
 		if (opts.isShutdownAbort?.(error)) {
 			throw error;
+		}
+		const afterError = await submissions.getSubmission(submission.submissionId);
+		if (afterError?.status !== 'running' || afterError.attemptId !== attempt.attemptId) {
+			return;
+		}
+		// The durable stamp is authoritative for the proposal→park abort race.
+		// A store must reject running→waiting once abort_requested_at is set; if
+		// that rejection reaches us before the in-process abort signal fires,
+		// terminalize as aborted here instead of misclassifying it as a failure.
+		if (afterError.abortRequestedAt !== undefined) {
+			await settleAbortedWithContext(
+				submissions,
+				afterError,
+				attempt,
+				agent,
+				ctx,
+				opts.conversationWriter,
+				opts.emitCoordinatorEvent,
+			);
+			return;
 		}
 		// Abort: keyed on the coordinator signal's reason (robust even when the
 		// provider rejects with a generic AbortError) rather than the thrown
@@ -1069,6 +1091,30 @@ async function settleAbortedWithContext(
 	emitCoordinatorEvent?: CoordinatorEventEmitter,
 ): Promise<void> {
 	const error = new SubmissionAbortedError();
+	// Store-level requestSessionAbort implementations should do this in the
+	// same transaction as the abort stamp. Repeat it at terminalization as an
+	// idempotent backstop so an older/custom adapter cannot leave proposals
+	// pending forever. First decision wins in decideToolApproval.
+	if (submissions.listToolApprovals && submissions.decideToolApproval) {
+		for (const approval of await submissions.listToolApprovals(submission.submissionId)) {
+			if (approval.status !== 'pending') continue;
+			const decision = await submissions.decideToolApproval({
+				proposalId: approval.proposalId,
+				status: 'aborted',
+				reason: 'Submission aborted before the approved tool call ran.',
+			});
+			if (decision.decisionApplied) {
+				emitCoordinatorEvent?.({
+					type: 'tool_approval_decided',
+					proposalId: decision.approval.proposalId,
+					toolName: decision.approval.toolName,
+					toolCallId: decision.approval.toolCallId,
+					status: decision.approval.status === 'pending' ? 'canceled' : decision.approval.status,
+					reason: decision.approval.reason,
+				});
+			}
+		}
+	}
 	// Visible timeline advisory for both kinds.
 	try {
 		await createAgentSubmissionSessionHandler(agent, submission.input, (s) =>

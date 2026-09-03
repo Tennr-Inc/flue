@@ -112,7 +112,7 @@ Two content guarantees hold for every event surface:
 
 ## Event types
 
-The v3 vocabulary contains 27 event types:
+The v3 vocabulary contains 31 event types:
 
 - Agent lifecycle — [`agent_start`, `agent_end`, `idle`](#agent_start-agent_end-idle)
 - Submission lifecycle — [`submission_queued`, `submission_running`](#submission_queued-submission_running), [`submission_settled`](#submission_settled)
@@ -120,7 +120,7 @@ The v3 vocabulary contains 27 event types:
 - Operations — [`operation_start`, `operation`](#operation_start-operation)
 - Model turns — [`turn_start`, `turn_request`, `turn`, `turn_messages`](#turn_start-turn_request-turn-turn_messages)
 - Messages and deltas — [`message_start`, `message_end`, `text_delta`, `thinking_start`, `thinking_delta`, `thinking_end`, `toolcall_delta`](#message-and-delta-events)
-- Tools — [`tool_start`, `tool`](#tool_start-tool)
+- Tools — [`tool_start`, `tool`](#tool_start-tool), [`tool_approval_requested`, `tool_approval_waiting`, `tool_approval_decided`, `tool_approval_resumed`](#tool-approval-events)
 - Tasks — [`task_start`, `task`](#task_start-task)
 - Compaction — [`compaction_start`, `compaction`](#compaction_start-compaction)
 - Logs — [`log`](#log)
@@ -457,6 +457,25 @@ Bounds of one tool execution, correlated by `toolCallId`. Emitted for model-invo
 - `durationMs` — measured once and shared with the durable record, so the two cannot disagree.
 
 For model-invoked calls the terminal `tool` event is published when the turn's tool batch durably commits, not the instant execution finishes — a tool whose batch is interrupted before commit never publishes its terminal event, matching the durable outcome. `shell()` publishes immediately. `shell()` per-call `env` values are redacted to `<redacted>` in the recorded arguments (keys stay visible); a failed `shell()` carries an error-shaped result whose `details.exitCode` is `-1`.
+
+### Tool approval events
+
+```ts
+{
+  type: 'tool_approval_requested';
+  proposalId: string;
+  toolName: string;
+  toolCallId: string;
+  toolVersion: string;
+  args: unknown;
+  expiresAt?: number;
+}
+{ type: 'tool_approval_waiting'; proposalId: string; toolName: string; toolCallId: string; expiresAt?: number }
+{ type: 'tool_approval_decided'; proposalId: string; toolName: string; toolCallId: string; status: 'approved' | 'rejected' | 'expired' | 'canceled' | 'aborted'; reason?: string }
+{ type: 'tool_approval_resumed'; proposalId: string; toolName: string; toolCallId: string }
+```
+
+These events identify a durable approval lifecycle. `requested` is emitted after the immutable proposal is persisted, `waiting` marks the parked submission, `decided` reports the first durable decision (including expiration or abort), and `resumed` means the last pending proposal for the batch released the submission. Approval waiting has no `tool` event and no model-visible placeholder result; a later `tool` event appears only when an approved call's batch commits.
 
 ### `task_start`, `task`
 

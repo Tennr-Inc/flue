@@ -1,6 +1,7 @@
 import type * as v from 'valibot';
 import { abortErrorFor, createCallHandle } from './abort.ts';
 import { SUBMISSION_HARNESS_NAME, SUBMISSION_SESSION_NAME } from './adapter-helpers.ts';
+import type { AgentSubmissionStore } from './agent-execution-store.ts';
 import { discoverSessionContext } from './context.ts';
 import type { ConversationRecordWriter } from './conversation-writer.ts';
 import { SessionNotFoundError } from './errors.ts';
@@ -14,9 +15,9 @@ import { createCwdSandbox } from './sandbox.ts';
 import {
 	type CreateTaskSessionOptions,
 	createPublicSession,
-	Session,
 	type SandboxRuntime,
 	type SandboxSlot,
+	Session,
 	type SessionRerender,
 	type SessionResourceRuntime,
 } from './session.ts';
@@ -56,6 +57,7 @@ export interface HarnessOptions {
 	toolFactory?: SandboxToolFactory;
 	conversationWriter: ConversationRecordWriter;
 	attachmentStore: AttachmentStore;
+	submissionStore?: AgentSubmissionStore;
 	executionContext?: FlueExecutionContext;
 	scopeName?: string;
 	scopeDepth?: number;
@@ -136,6 +138,7 @@ export class Harness implements FlueHarness {
 	private mcpUnavailable: McpUnavailableConnection[];
 	private conversationWriter: ConversationRecordWriter;
 	private attachmentStore: AttachmentStore;
+	private submissionStore: AgentSubmissionStore | undefined;
 	private executionContext: FlueExecutionContext;
 	private scopeName: string | undefined;
 	private scopeDepth: number;
@@ -155,6 +158,7 @@ export class Harness implements FlueHarness {
 		this.mcpUnavailable = options.mcpUnavailable ?? [];
 		this.conversationWriter = options.conversationWriter;
 		this.attachmentStore = options.attachmentStore;
+		this.submissionStore = options.submissionStore;
 		this.executionContext = options.executionContext ?? {};
 		this.scopeName = options.scopeName;
 		this.scopeDepth = options.scopeDepth ?? 0;
@@ -312,6 +316,7 @@ export class Harness implements FlueHarness {
 			resources: this.resources,
 			envSlot: this.envSlot,
 			envRuntime: this.envRuntime,
+			submissionStore: this.submissionStore,
 		});
 		await session.initializeCanonicalContext();
 		this.openSessions.set(sessionName, session);
@@ -411,6 +416,7 @@ export class Harness implements FlueHarness {
 			conversationWriter: this.conversationWriter,
 			attachmentStore: this.attachmentStore,
 			executionContext: { ...this.executionContext, harness: harnessScope, taskId: options.taskId },
+			submissionStore: this.submissionStore,
 		});
 		await session.initializeCanonicalContext();
 		return session;

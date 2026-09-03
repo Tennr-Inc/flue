@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { type HookStateStore, isRendering, requireRenderFrame } from './frame.ts';
 import { normalizeJsonValue } from './json-value.ts';
 
@@ -123,30 +124,98 @@ export interface HookStateWrite {
  */
 export interface HookStateBuffer extends HookStateStore {
 	drain(): HookStateWrite[];
+	/** Isolate one concurrent tool invocation's writes until it settles. */
+	createWriteScope(): HookStateWriteScope;
 }
+
+export interface HookStateWriteScope {
+	run<T>(callback: () => Promise<T>): Promise<T>;
+	commit(): void;
+	discard(): void;
+}
+
+interface HookStateWriteScopeState {
+	owner: HookStateBuffer;
+	active: boolean;
+	pending: HookStateWrite[];
+	overlay: Map<string, unknown>;
+}
+
+const hookStateWriteScopeStorage = new AsyncLocalStorage<HookStateWriteScopeState>();
 
 export function createHookStateBuffer(snapshot: ReadonlyMap<string, unknown>): HookStateBuffer {
 	const overlay = new Map<string, unknown>();
 	let pending: HookStateWrite[] = [];
-	const currentValue = (name: string): { value: unknown } | undefined => {
+	const baseCurrentValue = (name: string): { value: unknown } | undefined => {
 		if (overlay.has(name)) return { value: overlay.get(name) };
 		if (snapshot.has(name)) return { value: snapshot.get(name) };
 		return undefined;
 	};
-	return {
-		current: currentValue,
+	const writeBase = (name: string, value: unknown): void => {
+		const current = baseCurrentValue(name);
+		if (current && JSON.stringify(current.value) === JSON.stringify(value)) return;
+		pending.push({ name, value });
+		overlay.set(name, value);
+	};
+	const store: HookStateBuffer = {
+		current(name) {
+			const scope = hookStateWriteScopeStorage.getStore();
+			if (scope?.owner === store && scope.active && scope.overlay.has(name)) {
+				return { value: scope.overlay.get(name) };
+			}
+			return baseCurrentValue(name);
+		},
 		write(name, value) {
-			const current = currentValue(name);
-			if (current && JSON.stringify(current.value) === JSON.stringify(value)) return;
-			pending.push({ name, value });
-			overlay.set(name, value);
+			const scope = hookStateWriteScopeStorage.getStore();
+			if (scope?.owner === store) {
+				// An abandoned tool keeps its async context until its promise really
+				// settles. Once discarded, writes from that orphan are intentionally
+				// ignored so they cannot leak into a later turn or attempt.
+				if (!scope.active) return;
+				const current = scope.overlay.has(name)
+					? { value: scope.overlay.get(name) }
+					: baseCurrentValue(name);
+				if (current && JSON.stringify(current.value) === JSON.stringify(value)) return;
+				scope.pending.push({ name, value });
+				scope.overlay.set(name, value);
+				return;
+			}
+			writeBase(name, value);
 		},
 		drain() {
 			const drained = pending;
 			pending = [];
 			return drained;
 		},
+		createWriteScope() {
+			const state: HookStateWriteScopeState = {
+				owner: store,
+				active: true,
+				pending: [],
+				overlay: new Map(),
+			};
+			let finished = false;
+			return {
+				run: (callback) => hookStateWriteScopeStorage.run(state, callback),
+				commit() {
+					if (finished) return;
+					finished = true;
+					state.active = false;
+					for (const write of state.pending) writeBase(write.name, write.value);
+					state.pending = [];
+					state.overlay.clear();
+				},
+				discard() {
+					if (finished) return;
+					finished = true;
+					state.active = false;
+					state.pending = [];
+					state.overlay.clear();
+				},
+			};
+		},
 	};
+	return store;
 }
 
 function readPersisted(
