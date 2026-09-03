@@ -1,3 +1,4 @@
+import type { AgentSubmissionStore } from './agent-execution-store.ts';
 import { discoverSessionContext, skillCatalogEntries } from './context.ts';
 import { ConversationRecordWriter } from './conversation-writer.ts';
 import { normalizeLogAttributes } from './errors.ts';
@@ -61,6 +62,8 @@ export interface FlueContextConfig {
 	 * agent definition during harness initialization — so they are not inputs.
 	 */
 	agentConfig: Omit<AgentConfig, 'systemPrompt' | 'skills' | 'model'>;
+	/** Durable store used for approval proposals and decisions. */
+	submissionStore?: AgentSubmissionStore;
 	/**
 	 * The current HTTP request, if any. Surfaced to handlers as `ctx.req`.
 	 * Build plugins pass the standard Fetch `Request` through; non-HTTP entry
@@ -201,7 +204,12 @@ export function createFlueContext(config: FlueContextConfig): FlueContextInterna
 			}
 			return initializeRootHarness(
 				agent,
-				{ ...config, conversationWriter, attachmentStore, mcpConnections },
+				{
+					...config,
+					conversationWriter,
+					attachmentStore,
+					mcpConnections,
+				},
 				emitEvent,
 				delivery,
 			);
@@ -489,7 +497,11 @@ async function initializeRootHarness(
 		toolFactory,
 		conversationWriter: config.conversationWriter,
 		attachmentStore: config.attachmentStore,
-		executionContext: { instanceId: config.id },
+		submissionStore: config.submissionStore,
+		executionContext: {
+			instanceId: config.id,
+			...(config.agentName ? { agentName: config.agentName } : {}),
+		},
 		hookState,
 		rerender,
 		output: outputChannel,

@@ -18,8 +18,10 @@ import {
 } from '../errors.ts';
 import type { DispatchInput, DispatchQueue } from '../runtime/dispatch-queue.ts';
 import type { CloudflareRuntime } from '../runtime/flue-app.ts';
+import type { ToolApproval } from '../tool-approval.ts';
 import type { DispatchReceipt } from '../types.ts';
 import {
+	CLOUDFLARE_AGENT_INTERNAL_APPROVAL_PATH,
 	CLOUDFLARE_AGENT_INTERNAL_DISPATCH_PATH,
 	CLOUDFLARE_AGENT_INTERNAL_INSTANCE_INFO_PATH,
 } from './agent-coordinator.ts';
@@ -46,7 +48,7 @@ export interface CreateCloudflareWorkerConfigOptions {
 /** The Cloudflare-target seams the generated entry passes to `configureFlueRuntime`. */
 export type CloudflareWorkerConfig = Pick<
 	CloudflareRuntime,
-	'dispatchQueue' | 'routeAgentRequest' | 'instanceInfo'
+	'dispatchQueue' | 'routeAgentRequest' | 'instanceInfo' | 'resolveToolApproval'
 >;
 
 export function createCloudflareWorkerConfig(
@@ -125,7 +127,38 @@ export function createCloudflareWorkerConfig(
 		return { id: instanceId, ...(typeof info.uid === 'string' ? { uid: info.uid } : {}) };
 	};
 
-	return { dispatchQueue, routeAgentRequest, instanceInfo };
+	const resolveToolApproval: CloudflareRuntime['resolveToolApproval'] = async (input) => {
+		const binding = lookupBinding(input.agent, env);
+		if (!binding) throw new Error(`[flue] Approval target agent "${input.agent}" is unavailable.`);
+		// This is binding-only Durable Object RPC. Public agent requests retain
+		// their mounted route path, so they cannot match the exact private path
+		// handled by the Durable Object.
+		const response = await fetchAgent(
+			binding,
+			input.id,
+			new Request(`https://flue.invalid${CLOUDFLARE_AGENT_INTERNAL_APPROVAL_PATH}`, {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify(input),
+			}),
+		);
+		if (!response.ok) {
+			if (response.status >= 400 && response.status < 500) {
+				const body = (await response.json().catch(() => undefined)) as
+					{ error?: unknown } | undefined;
+				throw new InvalidRequestError({
+					reason:
+						typeof body?.error === 'string'
+							? body.error
+							: 'The tool approval decision was rejected by the target agent instance.',
+				});
+			}
+			throw new Error(`[flue] Tool approval delivery failed with status ${response.status}.`);
+		}
+		return (await response.json()) as ToolApproval;
+	};
+
+	return { dispatchQueue, routeAgentRequest, instanceInfo, resolveToolApproval };
 }
 
 /**
@@ -161,7 +194,8 @@ function dispatchAdmissionError(input: DispatchInput, status: number, rejection:
 			// The wire body's submissionId names the existing keyed submission;
 			// the dispatch input derived the same id, so it is the fallback.
 			return new SubmissionConflictError({
-				submissionId: typeof body.submissionId === 'string' ? body.submissionId : input.submissionId,
+				submissionId:
+					typeof body.submissionId === 'string' ? body.submissionId : input.submissionId,
 			});
 		case 'invalid_request':
 			return new InvalidRequestError({

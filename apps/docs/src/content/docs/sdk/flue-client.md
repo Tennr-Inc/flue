@@ -1,6 +1,6 @@
 ---
 title: FlueClient
-description: The Flue Agent SDK conversation client — send(), read(), wait(), abort(), history(), observe(), and attachmentUrl().
+description: The Flue Agent SDK conversation client — send(), read(), wait(), abort(), approvals, history(), observe(), and attachments.
 lastReviewedAt: 2026-07-21
 ---
 
@@ -13,6 +13,10 @@ interface FlueClient {
   read(target: AgentSendResult | string, options?: AgentReadOptions): Promise<AgentReadResult>;
   wait(admission: AgentSendResult, options?: AgentWaitOptions): Promise<void>;
   abort(options?: { signal?: AbortSignal }): Promise<AgentAbortResult>;
+  resolveToolApproval(
+    proposalId: string,
+    options: ResolveToolApprovalOptions,
+  ): Promise<FlueToolApproval>;
   history(options?: FlueConversationHistoryOptions): Promise<FlueConversationSnapshot>;
   observe(options?: AgentConversationObserveOptions): AgentConversationObservation;
   attachmentUrl(attachmentId: string): string;
@@ -204,6 +208,23 @@ interface AgentAbortResult {
 | --------- | ------------------------------------------------------------------------------------------------------------------------------------ |
 | `aborted` | `true` when there was in-flight or queued work that is now being aborted; `false` when the conversation was idle (nothing to abort). |
 
+## `resolveToolApproval()`
+
+```ts
+resolveToolApproval(
+  proposalId: string,
+  options: {
+    status: 'approved' | 'rejected' | 'expired' | 'canceled' | 'aborted';
+    reason?: string;
+    signal?: AbortSignal;
+  },
+): Promise<FlueToolApproval>;
+```
+
+`POST <conversation url>/tool-approvals/<proposalId>`. Resolves one durable proposal exposed by [`history()`](#history) or [`observe()`](#observe). The first non-pending decision wins; repeating a decision returns the stored row without changing it. The endpoint is mounted automatically by `createAgentRouter(...)` and is protected by the same host middleware as the rest of the conversation. Durable approval execution currently requires Cloudflare Durable Object SQLite.
+
+`approved` resumes the parked submission after every approval in its tool batch is decided. All other statuses record a deterministic tool error without entering the tool's `run` function. `signal` cancels only this HTTP request; it does not undo a decision already accepted by the Durable Object.
+
 ## `history()`
 
 ```ts
@@ -227,17 +248,41 @@ interface FlueConversationSnapshot {
   offset: string;
   messages: FlueConversationMessage[];
   settlements: FlueConversationSettlement[];
+  toolApprovals: FlueToolApproval[];
 }
 ```
 
 A complete materialized conversation read at a durable-stream offset.
 
-| Field         | Description                                                                                                                                                             |
-| ------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `v`           | Snapshot format version.                                                                                                                                                |
-| `offset`      | Opaque durable-stream checkpoint at which the snapshot was materialized. Pass it back only through Flue's own observation machinery; `observe()` manages it internally. |
-| `messages`    | The conversation transcript, in order.                                                                                                                                  |
-| `settlements` | Terminal outcomes of the conversation's tracked submissions.                                                                                                            |
+| Field           | Description                                                                                                                                                             |
+| --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `v`             | Snapshot format version.                                                                                                                                                |
+| `offset`        | Opaque durable-stream checkpoint at which the snapshot was materialized. Pass it back only through Flue's own observation machinery; `observe()` manages it internally. |
+| `messages`      | The conversation transcript, in order.                                                                                                                                  |
+| `settlements`   | Terminal outcomes of the conversation's tracked submissions.                                                                                                            |
+| `toolApprovals` | Durable tool approval requests in request order, including their current decision status.                                                                               |
+
+### `FlueToolApproval`
+
+```ts
+interface FlueToolApproval {
+  proposalId: string;
+  submissionId: string;
+  assistantMessageId: string;
+  toolCallId: string;
+  toolName: string;
+  toolVersion: string;
+  arguments: Record<string, unknown>;
+  requestedAt: number;
+  expiresAt?: number;
+  presentation?: { title?: string; description?: string };
+  status: 'pending' | 'approved' | 'rejected' | 'expired' | 'canceled' | 'aborted';
+  decidedAt?: number;
+  reason?: string;
+}
+```
+
+The exact validated arguments and tool version are frozen when the proposal is created. `requestedAt`, `expiresAt`, and `decidedAt` are Unix milliseconds. Decision fields are absent while `status` is `pending`.
 
 ### `FlueConversationMessage`
 
@@ -452,6 +497,7 @@ interface FlueConversationState {
   conversationId: string;
   messages: FlueConversationMessage[];
   settlements: FlueConversationSettlement[];
+  toolApprovals: FlueToolApproval[];
 }
 ```
 

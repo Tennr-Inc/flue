@@ -85,11 +85,16 @@ export {
 } from './runtime/conversation-stream-store.ts';
 export { installDevLifecycleLogger } from './runtime/dev-lifecycle-logger.ts';
 export type { DispatchInput, DispatchQueue } from './runtime/dispatch-queue.ts';
-export type { CloudflareRuntime, FlueRuntime, NodeRuntime } from './runtime/flue-app.ts';
+export type {
+	CloudflareRuntime,
+	FlueRuntime,
+	NodeRuntime,
+	ToolApprovalResolutionInput,
+} from './runtime/flue-app.ts';
 // `configureFlueRuntime` seeds the module-scoped config that mounted
 // agent-router handlers read at request time. Called once per generated entry,
 // before the listener (Node) or `default.fetch` (Cloudflare) takes traffic.
-export { configureFlueRuntime } from './runtime/flue-app.ts';
+export { configureFlueRuntime, resolveToolApproval } from './runtime/flue-app.ts';
 export type {
 	CreateAgentContextFn,
 	CreateAgentContextOptions,
@@ -125,7 +130,18 @@ export { rebuildSettledSubmissionRows } from './runtime/settlement-rebuild.ts';
 // Storage path of an agent instance's canonical conversation stream — the
 // durable-storage contract callers pair with the observation helpers above.
 export { agentStreamPath } from './runtime/stream-offsets.ts';
-
+export {
+	getToolApprovalProvider,
+	resetToolApprovalProvider,
+	setToolApprovalProvider,
+} from './runtime/tool-approval-provider.ts';
 export { bashFactoryToSandbox } from './sandbox.ts';
 export { parseSkillMarkdown } from './skill-frontmatter.ts';
 export { buildPackagedSkill, createSkillReference } from './skill-package.ts';
+export type {
+	ToolApproval,
+	ToolApprovalDecision,
+	ToolApprovalDecisionStatus,
+	ToolApprovalProposal,
+	ToolApprovalStatus,
+} from './tool-approval.ts';

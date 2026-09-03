@@ -3,6 +3,8 @@ import type {
 	FlueConversationHistoryOptions,
 	FlueConversationMessage,
 	FlueConversationSnapshot,
+	FlueToolApproval,
+	FlueToolApprovalDecisionStatus,
 } from './public/conversation.ts';
 import {
 	assertConversationStreamChunk,
@@ -39,6 +41,13 @@ export interface AgentAbortResult {
 	 * `observe()`, or `history()`.
 	 */
 	aborted: boolean;
+}
+
+/** Options for resolving a durable tool approval request. */
+export interface ResolveToolApprovalOptions {
+	status: FlueToolApprovalDecisionStatus;
+	reason?: string;
+	signal?: AbortSignal;
 }
 
 /** Options for creating a client for one agent conversation. */
@@ -85,6 +94,11 @@ export interface FlueClient {
 	 * outcome asynchronously.
 	 */
 	abort(options?: { signal?: AbortSignal }): Promise<AgentAbortResult>;
+	/** Resolves one pending tool approval for this conversation. */
+	resolveToolApproval(
+		proposalId: string,
+		options: ResolveToolApprovalOptions,
+	): Promise<FlueToolApproval>;
 	/** Reads one materialized conversation snapshot. */
 	history(options?: FlueConversationHistoryOptions): Promise<FlueConversationSnapshot>;
 	/** Observes the materialized conversation across history catch-up and live updates. */
@@ -128,6 +142,9 @@ function rewriteSnapshotAttachmentUrls(
 	return {
 		...snapshot,
 		messages: snapshot.messages.map((message) => withAttachmentUrls(message, http)),
+		// Additive compatibility for a rolling upgrade where the SDK reaches a
+		// server from before public approval projection shipped.
+		toolApprovals: snapshot.toolApprovals ?? [],
 	};
 }
 
@@ -156,6 +173,16 @@ export function createFlueClient(options: CreateFlueClientOptions): FlueClient {
 			http.json<AgentAbortResult>({
 				method: 'POST',
 				path: '/abort',
+				signal: opts.signal,
+			}),
+		resolveToolApproval: (proposalId, opts) =>
+			http.json<FlueToolApproval>({
+				method: 'POST',
+				path: `/tool-approvals/${encodeURIComponent(proposalId)}`,
+				body: {
+					status: opts.status,
+					...(opts.reason === undefined ? {} : { reason: opts.reason }),
+				},
 				signal: opts.signal,
 			}),
 		history: async (opts = {}) =>

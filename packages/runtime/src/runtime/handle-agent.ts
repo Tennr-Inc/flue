@@ -1,5 +1,6 @@
 /** Shared per-agent HTTP dispatcher for the Node and Cloudflare targets. */
 
+import type { AgentSubmissionStore } from '../agent-execution-store.ts';
 import type { FlueContextInternal } from '../client.ts';
 import { InvalidRequestError, parseJsonBody, toHttpResponse } from '../errors.ts';
 import { extractTraceCarrier } from '../execution-interceptor.ts';
@@ -40,6 +41,7 @@ export interface CreateAgentContextOptions {
 	agentName: string;
 	request: Request;
 	submissionId?: string;
+	submissionStore?: AgentSubmissionStore;
 }
 
 export type CreateAgentContextFn = (options: CreateAgentContextOptions) => FlueContextInternal;

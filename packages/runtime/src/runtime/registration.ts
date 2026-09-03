@@ -38,6 +38,7 @@ import {
 	executeAgentAttachmentRead,
 	executeAgentConversationRead,
 	executeAgentPrompt,
+	executeAgentToolApprovalDecision,
 } from './agent-routes.ts';
 import { getFlueRuntime } from './flue-app.ts';
 
@@ -242,6 +243,7 @@ export function resetFlueAgentRegistrationForTests(): void {
  * - `POST /:id` — send a prompt (202 admission)
  * - `GET|HEAD /:id` — DS conversation stream read
  * - `POST /:id/abort` — abort in-flight/queued work
+ * - `POST /:id/tool-approvals/:proposalId` — resolve a durable tool approval
  * - `ALL /:id/attachments/:attachmentId` — attachment byte download
  *
  * Mounting is the exposure decision; auth and other middleware compose in
@@ -288,6 +290,25 @@ export function createAgentRouter(agent: Agent): Hono {
 		return executeAgentAbort(rt, {
 			agentName: identity,
 			instanceId: id,
+			request: c.req.raw.clone(),
+			env: c.env,
+		});
+	});
+
+	// Resolve an approval discovered through the same conversation's history or
+	// updates stream. Host middleware at the agent mount protects this route in
+	// exactly the same way as prompts, stream reads, aborts, and attachments.
+	app.all('/:id/tool-approvals/:proposalId', async (c) => {
+		const rt = requireRuntime();
+		if (c.req.method !== 'POST') {
+			throw new MethodNotAllowedError({ method: c.req.method, allowed: ['POST'] });
+		}
+		const id = c.req.param('id') ?? '';
+		assertAgentInstanceId(id);
+		return executeAgentToolApprovalDecision(rt, {
+			agentName: identity,
+			instanceId: id,
+			proposalId: c.req.param('proposalId') ?? '',
 			request: c.req.raw.clone(),
 			env: c.env,
 		});

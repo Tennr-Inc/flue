@@ -110,7 +110,7 @@ Response: `200`, `Content-Type: application/json`, `Cache-Control: no-store`, `S
 
 ### `FlueConversationSnapshot`
 
-`@flue/sdk` exports the snapshot shapes as `FlueConversationSnapshot`, `FlueConversationMessage`, `FlueConversationPart`, and `FlueConversationSettlement`.
+`@flue/sdk` exports the snapshot shapes as `FlueConversationSnapshot`, `FlueConversationMessage`, `FlueConversationPart`, `FlueConversationSettlement`, and `FlueToolApproval`.
 
 ```ts
 interface FlueConversationSnapshot {
@@ -119,6 +119,23 @@ interface FlueConversationSnapshot {
   offset: string;
   messages: FlueConversationMessage[];
   settlements: FlueConversationSettlement[];
+  toolApprovals: FlueToolApproval[];
+}
+
+interface FlueToolApproval {
+  proposalId: string;
+  submissionId: string;
+  assistantMessageId: string;
+  toolCallId: string;
+  toolName: string;
+  toolVersion: string;
+  arguments: Record<string, unknown>;
+  requestedAt: number;
+  expiresAt?: number;
+  presentation?: { title?: string; description?: string };
+  status: 'pending' | 'approved' | 'rejected' | 'expired' | 'canceled' | 'aborted';
+  decidedAt?: number;
+  reason?: string;
 }
 
 interface FlueConversationSettlement {
@@ -300,7 +317,7 @@ type ChunkBody =
 ```
 
 - `position` — a monotonic ordering token: `batch` is the durable batch ordinal the chunk was projected from, `index` its position within that batch's projection. `{ batch, index }` is globally unique and ordered across the conversation; compare lexicographically (`batch`, then `index`) to dedupe redelivered chunks. Otherwise opaque — do not interpret the numbers.
-- `conversation-reset` — replace all accumulated state with the embedded [snapshot](#flueconversationsnapshot). Emitted when a batch contains a structural boundary (conversation creation, compaction); the reset subsumes every other chunk of its batch, so a fresh read from `offset=-1` begins with one. The embedded snapshot may already contain settlements — check `snapshot.settlements` as well as `submission-settled` chunks when awaiting an outcome.
+- `conversation-reset` — replace all accumulated state with the embedded [snapshot](#flueconversationsnapshot). Emitted when a batch contains a structural boundary (conversation creation, compaction) or a tool-approval lifecycle change. Approval changes use resets so runtimes remain wire-compatible with pre-approval 2.0 clients; current SDKs read the updated `snapshot.toolApprovals`, while older SDKs safely ignore that additional field. The reset subsumes every other chunk of its batch, so a fresh read from `offset=-1` begins with one. The embedded snapshot may already contain settlements — check `snapshot.settlements` as well as `submission-settled` chunks when awaiting an outcome.
 - `message-appended` — a complete message (user turn or system signal), in the same message format as the snapshot.
 - `message-started` — an assistant response opened. `metadata` carries agent-authored response metadata available at start. Assistant chunks are pre-coalesced: every model step of a submission addresses the submission's first assistant `messageId`, so accumulating parts per `messageId` reproduces the snapshot's one-message-per-response shape. A later `message-started` for an already-open `messageId` is a continuation, not a new message.
 - `message-metadata` — agent-authored metadata for an open response; merge onto the message.

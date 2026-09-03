@@ -155,6 +155,41 @@ export interface FlueConversationSettlement {
 	answeredBySubmissionId?: string;
 }
 
+/** A presentation hint for an approval UI. It never affects tool execution. */
+export interface FlueToolApprovalPresentation {
+	title?: string;
+	description?: string;
+}
+
+/** The lifecycle states of a durable tool approval. */
+export type FlueToolApprovalStatus =
+	'pending' | 'approved' | 'rejected' | 'expired' | 'canceled' | 'aborted';
+
+/** A status that can be supplied when resolving a pending tool approval. */
+export type FlueToolApprovalDecisionStatus = Exclude<FlueToolApprovalStatus, 'pending'>;
+
+/**
+ * One durable request to approve a tool invocation before it can run.
+ *
+ * The proposal fields identify the exact assistant tool call; decision fields
+ * are absent until the proposal has left the `pending` state.
+ */
+export interface FlueToolApproval {
+	proposalId: string;
+	submissionId: string;
+	assistantMessageId: string;
+	toolCallId: string;
+	toolName: string;
+	toolVersion: string;
+	arguments: Record<string, unknown>;
+	requestedAt: number;
+	expiresAt?: number;
+	presentation?: FlueToolApprovalPresentation;
+	status: FlueToolApprovalStatus;
+	decidedAt?: number;
+	reason?: string;
+}
+
 /**
  * A complete materialized conversation read at a durable-stream offset.
  *
@@ -178,6 +213,8 @@ export interface FlueConversationSnapshot {
 	incarnation?: string;
 	messages: FlueConversationMessage[];
 	settlements: FlueConversationSettlement[];
+	/** Durable approval requests for tool calls in this conversation. */
+	toolApprovals: FlueToolApproval[];
 }
 
 /** Live materialized conversation maintained by `observe()`. */
@@ -185,6 +222,7 @@ export interface FlueConversationState {
 	conversationId: string;
 	messages: FlueConversationMessage[];
 	settlements: FlueConversationSettlement[];
+	toolApprovals: FlueToolApproval[];
 }
 
 /** Options for one `history()` read. */

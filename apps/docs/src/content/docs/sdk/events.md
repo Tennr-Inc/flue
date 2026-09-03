@@ -34,7 +34,7 @@ observation.subscribe(() => {
 
 ## Exported types
 
-- `FlueConversationSnapshot`, `FlueConversationState`, `FlueConversationMessage`, `FlueConversationPart`, `FlueConversationSettlement` — the materialized conversation, documented field-by-field on [FlueClient](/docs/sdk/flue-client/#flueconversationsnapshot) with `history()` and `observe()`.
+- `FlueConversationSnapshot`, `FlueConversationState`, `FlueConversationMessage`, `FlueConversationPart`, `FlueConversationSettlement`, `FlueToolApproval` — the materialized conversation, documented field-by-field on [FlueClient](/docs/sdk/flue-client/#flueconversationsnapshot) with `history()` and `observe()`.
 - `ConversationStreamChunk` — the `updates`-view chunk union, documented on the [Streaming Protocol reference](/docs/reference/streaming-protocol/#conversationstreamchunk). Delivered raw by `wait()`'s `onEvent`; not stable application API — application code should consume materialized state via `observe()` instead.
 - `PromptUsage` — aggregated token and cost usage, carried by conversation settlements; the shape matches the runtime's export of the same name (pinned by a wire-conformance type test).
 

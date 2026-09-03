@@ -1,5 +1,6 @@
 import type * as v from 'valibot';
 import type { JsonValue } from './json-snapshot.ts';
+import type { ToolApprovalPolicy } from './tool-approval.ts';
 import type { FlueHarness, FlueLogger } from './types.ts';
 
 export type ToolInputSchema = v.GenericSchema<Record<string, unknown>, unknown>;
@@ -97,8 +98,14 @@ export interface ToolDefinition<
 > {
 	readonly name: string;
 	readonly description: string;
+	/** Stable definition version used when an approval is resumed after a deploy. */
+	readonly version?: string;
 	readonly input: TInput;
 	readonly output: TOutput;
+	/** Require a persisted host decision before `run` is entered. */
+	readonly approval?: ToolApprovalPolicy;
+	/** Maximum execution time for this tool invocation, independent of approval wait. */
+	readonly timeoutMs?: number;
 	/**
 	 * Connect this tool to the agent's runtime: `run` receives `harness`,
 	 * the one interface to the agent's environment (`harness.sandbox`, the

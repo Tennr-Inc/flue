@@ -21,6 +21,14 @@ import type { SqlStorage } from './sql-storage.ts';
 export const FLUE_FORMAT_VERSION = 1;
 
 /**
+ * Cloudflare Durable Object SQLite stores that have enabled parked approvals.
+ * Keeping this distinct from the cross-adapter base format makes a rollback to
+ * 2.0.3 fail closed without forcing migrations onto unrelated adapters.
+ */
+const PREVIOUS_FLUE_DURABLE_TOOL_APPROVAL_FORMAT_VERSION = '1+durable-tool-approvals-v1';
+export const FLUE_DURABLE_TOOL_APPROVAL_FORMAT_VERSION = '1+durable-tool-approvals-v2';
+
+/**
  * Throw {@link PersistedFormatVersionError} unless the stored version matches
  * the current {@link FLUE_FORMAT_VERSION}.
  *
@@ -30,11 +38,42 @@ export const FLUE_FORMAT_VERSION = 1;
  * version marker is unrecognized.
  */
 export function assertSupportedFlueFormatVersion(storedVersion: string): void {
-	if (storedVersion === String(FLUE_FORMAT_VERSION)) return;
+	if (
+		storedVersion === String(FLUE_FORMAT_VERSION) ||
+		storedVersion === PREVIOUS_FLUE_DURABLE_TOOL_APPROVAL_FORMAT_VERSION ||
+		storedVersion === FLUE_DURABLE_TOOL_APPROVAL_FORMAT_VERSION
+	) {
+		return;
+	}
 	throw new PersistedFormatVersionError({
 		storedVersion,
 		supportedVersion: FLUE_FORMAT_VERSION,
 	});
+}
+
+/** Stamp a SQLite store before it can persist a state older runtimes cannot understand. */
+export function markFlueSqlDurableToolApprovalFormat(sql: SqlStorage): void {
+	const stored = sql
+		.exec(`SELECT value FROM flue_meta WHERE key = 'format_version'`)
+		.toArray()[0]?.value;
+	assertSupportedFlueFormatVersion(String(stored));
+	if (String(stored) === FLUE_DURABLE_TOOL_APPROVAL_FORMAT_VERSION) return;
+	const updated = sql
+		.exec(
+			`UPDATE flue_meta SET value = ?
+			 WHERE key = 'format_version' AND value IN (?, ?)
+			 RETURNING value`,
+			FLUE_DURABLE_TOOL_APPROVAL_FORMAT_VERSION,
+			String(FLUE_FORMAT_VERSION),
+			PREVIOUS_FLUE_DURABLE_TOOL_APPROVAL_FORMAT_VERSION,
+		)
+		.toArray()[0];
+	if (!updated) {
+		throw new PersistedFormatVersionError({
+			storedVersion: String(stored),
+			supportedVersion: FLUE_FORMAT_VERSION,
+		});
+	}
 }
 
 export function migrateFlueSqlSchema(sql: SqlStorage, ensureCurrentSchema: () => void): void {

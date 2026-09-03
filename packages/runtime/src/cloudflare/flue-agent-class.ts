@@ -84,8 +84,8 @@ export function createFlueAgentClass(options: CreateFlueAgentClassOptions): Exte
 		 * attempt fibers detached — the fibers outlive the invocation on the
 		 * SDK's runFiber keepAlive/recovery machinery.
 		 */
-		__flueWakeAgentSubmissions() {
-			return runtime.drainSubmissions(this as unknown as CloudflareAgentInstance);
+		__flueWakeAgentSubmissions(wakeSlot?: unknown) {
+			return runtime.drainSubmissions(this as unknown as CloudflareAgentInstance, wakeSlot);
 		}
 
 		onRequest(request: Request) {

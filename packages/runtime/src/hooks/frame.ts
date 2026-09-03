@@ -76,6 +76,7 @@ export interface RenderStateContext {
 /** The write channel `usePersistentState` setters push into; drained by the session. */
 export interface HookStateStore {
 	write(name: string, value: unknown): void;
+	update(name: string, updater: (previous: unknown) => unknown, defaultValue: unknown): void;
 	current(name: string): { value: unknown } | undefined;
 }
 
