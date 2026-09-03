@@ -10,6 +10,8 @@ import type {
 	AgentMessage,
 	AgentTool,
 	AgentToolResult,
+	BeforeToolCallContext,
+	BeforeToolCallResult,
 	PrepareNextTurnContext,
 	StreamFn,
 } from '@earendil-works/pi-agent-core';
@@ -43,6 +45,7 @@ import {
 } from './agent.ts';
 import {
 	type AgentSubmission,
+	type AgentSubmissionStore,
 	DURABILITY_DEFAULT_MAX_ATTEMPTS,
 	DURABILITY_DEFAULT_TIMEOUT_MS,
 	type SubmissionDurability,
@@ -74,6 +77,8 @@ import {
 	generateConversationEntryId,
 	generateConversationRecordId,
 	RESERVED_SIGNAL_TYPES,
+	toolApprovalDecisionRecord,
+	toolApprovalRequestedRecord,
 	toolStepRecordId,
 } from './conversation-records.ts';
 import {
@@ -97,8 +102,10 @@ import {
 	SessionBusyError,
 	SkillNotRegisteredError,
 	SubagentNotDeclaredError,
+	SubmissionAbortedError,
 	SubmissionTimeoutError,
 	serializeEventError,
+	ToolInputValidationError,
 	ToolNameConflictError,
 } from './errors.ts';
 import {
@@ -109,6 +116,7 @@ import {
 import { type FlueExecutionContext, interceptExecution } from './execution-interceptor.ts';
 import { resolveSubagentDefinition } from './hooks/render.ts';
 import type { HookStateBuffer, HookStateWrite } from './hooks/use-persistent-state.ts';
+import { cloneJsonSerializable } from './json-snapshot.ts';
 import {
 	type AgentFinishContext,
 	type AgentFinishDeclaration,
@@ -166,6 +174,7 @@ import {
 	generateTurnId,
 } from './runtime/ids.ts';
 import { getRuntimeModels, providerTelemetryName } from './runtime/providers.ts';
+import { getToolApprovalProvider } from './runtime/tool-approval-provider.ts';
 import { createCwdSandbox } from './sandbox.ts';
 import { valibotToJsonSchema } from './schema.ts';
 import { execShellWithEvents, getErrorMessage } from './shell.ts';
@@ -174,16 +183,20 @@ import { getSkillReferenceDirectory } from './skill-package.ts';
 import {
 	countConsecutiveRetryableModelErrors,
 	findTrailingPartialToolBatch,
+	isRenderNarration,
 	isRetryableModelError,
 } from './submission-state.ts';
 import {
 	assertToolDefinition,
 	claimStepName,
 	cloneStepValue,
+	createParsedToolContext,
 	parseToolInput,
 	resolveToolRun,
 } from './tool.ts';
 import { getPreparedToolAdapter } from './tool-adapter.ts';
+import type { ToolApproval, ToolApprovalProposal } from './tool-approval.ts';
+import { toolApprovalProposalId } from './tool-approval.ts';
 import type {
 	AgentConfig,
 	CallHandle,
@@ -232,6 +245,13 @@ const MAX_TRANSIENT_MODEL_RETRIES = 3;
  */
 const MAX_AGENT_FINISH_CYCLES = 32;
 const TRANSIENT_MODEL_RETRY_BASE_DELAY_MS = 2_000;
+
+class ToolExecutionTimeoutError extends Error {
+	constructor(timeoutMs: number) {
+		super(`Tool execution timed out after ${timeoutMs}ms.`);
+		this.name = 'ToolExecutionTimeoutError';
+	}
+}
 
 type TurnInputMessage = Extract<
 	FlueEvent,
@@ -409,6 +429,7 @@ interface SessionInitOptions {
 	onClose?: () => void;
 	conversationWriter: ConversationRecordWriter;
 	attachmentStore: AttachmentStore;
+	submissionStore?: AgentSubmissionStore;
 	executionContext?: FlueExecutionContext;
 	/**
 	 * `usePersistentState` write buffer from the harness's render (function agents
@@ -564,6 +585,24 @@ interface CallOverrides {
 	extraTools?: AgentTool<any>[];
 	activePackagedSkills?: Record<string, PackagedSkillDirectory>;
 }
+
+type ToolApprovalStore = AgentSubmissionStore &
+	Required<
+		Pick<
+			AgentSubmissionStore,
+			| 'parkSubmissionForApproval'
+			| 'createToolApproval'
+			| 'getToolApproval'
+			| 'listToolApprovals'
+			| 'listToolApprovalProjectionWork'
+			| 'markToolApprovalProjected'
+			| 'claimToolApprovalNotification'
+			| 'completeToolApprovalNotification'
+			| 'decideToolApproval'
+			| 'expireToolApprovals'
+			| 'listWaitingForApprovalSubmissions'
+		>
+	>;
 
 interface InternalTaskResult<T> {
 	output: T;
@@ -736,6 +775,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 	private activeSubmissionAttemptId: string | undefined;
 	private conversationWriter: ConversationRecordWriter;
 	private attachmentStore: AttachmentStore;
+	private submissionStore: AgentSubmissionStore | undefined;
 	private canonicalAssistant:
 		| {
 				messageId: string;
@@ -819,6 +859,16 @@ export class Session implements FlueSession, AgentSubmissionSession {
 	private activeJoinSignal: AbortSignal | undefined;
 	/** The active submission's canonical input entry id (delivery-cursor floor). */
 	private activeInputEntryId: string | undefined;
+	/** Approval calls are blocked in Pi but intentionally have no canonical tool result. */
+	private approvalToolCalls = new Set<string>();
+	/** Approval snapshots created during the current Pi tool preflight. */
+	private approvalBatch = new Map<string, ToolApproval>();
+	/** Unguarded outcomes held so mixed-batch state can persist atomically before parking. */
+	private approvalBatchOutcomeRecords = new Map<string, ConversationRecord>();
+	/** Set after a proposal is persisted; Pi must end the current turn here. */
+	private approvalParked = false;
+	/** True only after the durable submission claim has actually been released. */
+	private approvalSubmissionParked = false;
 
 	private emitTurnRequestAndStream: StreamFn = async (model, context, options) => {
 		if (this.activeTurnId === undefined) this.activeTurnId = generateTurnId();
@@ -901,8 +951,13 @@ export class Session implements FlueSession, AgentSubmissionSession {
 	 * violation (conditional use()/hook) throws here and fails the run.
 	 */
 	private async prepareRerenderTurn(
-		turn?: PrepareNextTurnContext,
+		turn?: Pick<PrepareNextTurnContext, 'toolResults'>,
 	): Promise<AgentLoopTurnUpdate | undefined> {
+		// Pi invokes this hook after turn_end but before its loop-level stop
+		// predicate. A parked approval has already released the durable attempt
+		// by then, so rerendering could mutate resources or append canonical
+		// records from a stale owner while the approved successor starts.
+		if (this.approvalParked) return undefined;
 		if (!this.rerender) return undefined;
 		let next = this.rerender();
 		// Environment swap: a conditional useSandbox() whose presence flipped
@@ -1579,9 +1634,11 @@ export class Session implements FlueSession, AgentSubmissionSession {
 	 * wall-clock backstop — neither continuations nor joins extend it.
 	 */
 	private async runWouldStopPhase(options: {
+		inputEntryId: string;
 		errorLabel: string;
 		signal: AbortSignal;
 	}): Promise<void> {
+		if (this.approvalParked) return;
 		const submissionId = this.activeSubmissionId;
 		if (!submissionId) return;
 		const driveContinuation = async () => {
@@ -1589,14 +1646,17 @@ export class Session implements FlueSession, AgentSubmissionSession {
 				start: () => this.agentLoop.continue(),
 				signal: options.signal,
 			});
+			if (await this.stopAtApprovalBoundary(options)) return;
 			this.throwIfError(options.errorLabel);
 		};
 		if (await this.hasPendingSteeredContinuation(submissionId)) {
 			await driveContinuation();
+			if (this.approvalParked) return;
 		}
 		for (;;) {
 			if ((await this.applyQueuedJoins()) > 0) {
 				await driveContinuation();
+				if (this.approvalParked) return;
 				continue;
 			}
 			const hooks = this.outputChannel?.agentFinishes ?? [];
@@ -1618,6 +1678,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 				// rather than waking a serialized follow-up response.
 				if ((await this.applyQueuedJoins()) === 0) return;
 				await driveContinuation();
+				if (this.approvalParked) return;
 				continue;
 			}
 			if (cycle >= MAX_AGENT_FINISH_CYCLES) {
@@ -1640,6 +1701,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 				},
 			]);
 			await driveContinuation();
+			if (this.approvalParked) return;
 		}
 	}
 
@@ -1651,7 +1713,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 	 * entries, so the caller drives `continue()` from them. Trailing
 	 * straggler signals (flushed after the last boundary, never steered) do
 	 * NOT count: absent cycle records they settle un-continued, exactly as
-	 * before.
+	 * before. Render narration never requests a continuation on its own.
 	 */
 	private async hasPendingSteeredContinuation(submissionId: string): Promise<boolean> {
 		const hasCycles = (await this.countAgentFinishCycles(submissionId)) > 0;
@@ -1667,7 +1729,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 			if (entry?.type !== 'message') continue;
 			if (entry.message.role === 'assistant') return false;
 			if (joinedEntryIds.has(entry.id)) return true;
-			if (entry.message.role === 'signal' && hasCycles) return true;
+			if (entry.message.role === 'signal' && hasCycles && !isRenderNarration(entry)) return true;
 		}
 		return false;
 	}
@@ -2182,6 +2244,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		this.onClose = options.onClose;
 		this.conversationWriter = options.conversationWriter;
 		this.attachmentStore = options.attachmentStore;
+		this.submissionStore = options.submissionStore;
 		this.executionIdentity = options.executionContext ?? {};
 		this.hookState = options.hookState;
 		this.rerender = options.rerender;
@@ -2218,6 +2281,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 			},
 			streamFn: this.emitTurnRequestAndStream,
 			toolExecution: 'parallel',
+			beforeToolCall: (context) => this.beforeModelToolCall(context),
 			// Queued messages always drain together at the next boundary — 'all'
 			// is Flue's only queue behavior. The steering queue carries joined
 			// deliveries and finish-continuation appends: everything steered at a
@@ -2232,8 +2296,28 @@ export class Session implements FlueSession, AgentSubmissionSession {
 			// has committed the tool batch (state writes durable), so the next
 			// provider request gets fresh tool closures and a recomposed prompt.
 			...(options.rerender
-				? { prepareNextTurnWithContext: (turn) => this.prepareRerenderTurn(turn) }
+				? {
+						prepareNextTurnWithContext: (turn) =>
+							this.approvalParked ? undefined : this.prepareRerenderTurn(turn),
+					}
 				: {}),
+		});
+		// pi-agent-core 0.83.0 exposes shouldStopAfterTurn on its lower-level loop
+		// config, while AgentOptions only forwards the preflight hook. The runtime
+		// pins that release exactly and patches this narrow wrapper seam rather
+		// than modifying or forking pi.
+		const loop = this.agentLoop as unknown as {
+			createLoopConfig: (options?: unknown) => Record<string, unknown>;
+		};
+		if (typeof loop.createLoopConfig !== 'function') {
+			throw new Error(
+				'[flue] Installed pi-agent-core does not expose the required durable-approval loop seam.',
+			);
+		}
+		const createLoopConfig = loop.createLoopConfig.bind(loop);
+		loop.createLoopConfig = (options?: unknown) => ({
+			...createLoopConfig(options),
+			shouldStopAfterTurn: () => this.approvalParked,
 		});
 
 		this.eventCallback = options.onAgentEvent;
@@ -2523,6 +2607,13 @@ export class Session implements FlueSession, AgentSubmissionSession {
 				case 'tool_execution_update':
 					break;
 				case 'tool_execution_end': {
+					if (this.approvalToolCalls.has(event.toolCallId)) {
+						// Pi emits a synthetic blocked result for beforeToolCall. It is
+						// deliberately not a Flue tool outcome: the call is still pending
+						// and the model must not receive a placeholder result.
+						this.activeToolCalls.delete(event.toolCallId);
+						break;
+					}
 					const call = this.activeToolCalls.get(event.toolCallId) ?? {
 						startedAt: Date.now(),
 						toolName: event.toolName,
@@ -2546,24 +2637,31 @@ export class Session implements FlueSession, AgentSubmissionSession {
 					// Measure once and reuse for both the durable record and the
 					// ephemeral `tool` event so the two can never disagree.
 					const toolDurationMs = durationSince(call.startedAt);
-					await this.appendCanonical([
-						{
-							...this.canonicalEnvelope('tool_outcome', `record_tool_outcome_${outcomeKey}`),
-							type: 'tool_outcome',
-							assistantMessageId,
-							toolCallId: event.toolCallId,
-							toolName: event.toolName,
-							isError: event.isError,
-							content: outcomeContent,
-							...(hasStructuredOutput ? { output: details?.output } : {}),
-							// Durable mirror of the engine's loop-ending flag, captured
-							// at the one seam every tool result passes through (built-in
-							// finish/give_up and custom tools alike), so recovery can
-							// reproduce the engine's batch-termination verdict.
-							...(result.terminate === true ? { terminate: true } : {}),
-							durationMs: toolDurationMs,
-						},
-					]);
+					const outcomeRecord: ConversationRecord = {
+						...this.canonicalEnvelope('tool_outcome', `record_tool_outcome_${outcomeKey}`),
+						type: 'tool_outcome',
+						assistantMessageId,
+						toolCallId: event.toolCallId,
+						toolName: event.toolName,
+						isError: event.isError,
+						content: outcomeContent,
+						...(hasStructuredOutput ? { output: details?.output } : {}),
+						// Durable mirror of the engine's loop-ending flag, captured
+						// at the one seam every tool result passes through (built-in
+						// finish/give_up and custom tools alike), so recovery can
+						// reproduce the engine's batch-termination verdict.
+						...(result.terminate === true ? { terminate: true } : {}),
+						durationMs: toolDurationMs,
+					};
+					if (this.approvalParked) {
+						// A mixed batch must not persist this outcome separately from
+						// usePersistentState writes produced by the same parallel tools.
+						// Hold both until turn_end, then cross one SQLite transaction
+						// boundary before releasing the submission claim.
+						this.approvalBatchOutcomeRecords.set(event.toolCallId, outcomeRecord);
+					} else {
+						await this.appendCanonical([outcomeRecord]);
+					}
 					if (!call.startEmitted) {
 						this.emit(
 							{
@@ -2608,14 +2706,42 @@ export class Session implements FlueSession, AgentSubmissionSession {
 						const assistantMessageId = this.canonicalToolRequestMessageId;
 						if (!assistantMessageId)
 							throw new Error('[flue] Canonical tool results have no assistant request.');
+						if (this.approvalParked) await this.flushApprovalBatchBeforePark();
 						const conversation = await this.requireConversation();
-						const outcomeIds = event.toolResults.map((toolResult) => {
-							const outcome = conversation.toolOutcomes.get(
+						const outcomeIds = event.toolResults.map((toolResult) =>
+							conversation.toolOutcomes.get(
 								toolOutcomeKey(assistantMessageId, toolResult.toolCallId),
+							),
+						);
+						// An approval-blocked result exists only in Pi's transient event
+						// stream. Leave the batch partial so recovery can resolve the
+						// persisted decision and commit the complete ordered batch.
+						if (outcomeIds.some((id) => id === undefined)) {
+							const unexpectedMissing = event.toolResults.find(
+								(result, index) =>
+									outcomeIds[index] === undefined && !this.approvalToolCalls.has(result.toolCallId),
 							);
-							if (!outcome) throw new Error('[flue] Canonical tool result has no durable outcome.');
-							return outcome;
-						});
+							if (unexpectedMissing) {
+								throw new Error(
+									`[flue] Canonical tool result "${unexpectedMissing.toolCallId}" has no durable outcome.`,
+								);
+							}
+							// All unguarded calls and their state writes crossed one durable
+							// boundary above. Release the submission claim only now so mixed
+							// parallel batches never write through a stale attempt.
+							await this.parkCurrentApprovalBatch();
+							this.lastCommittedToolBatch = undefined;
+							this.emit({
+								type: 'turn_messages',
+								turnId,
+								purpose: 'agent',
+								message: event.message,
+								toolResults: [],
+							});
+							this.activeTurnId = undefined;
+							break;
+						}
+						const committedOutcomeIds = outcomeIds as string[];
 						const finalToolResult = event.toolResults.at(-1);
 						if (!finalToolResult) {
 							throw new ConversationRecordInvariantError({
@@ -2641,7 +2767,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 								type: 'tool_results_committed',
 								assistantMessageId,
 								parentId,
-								outcomeIds,
+								outcomeIds: committedOutcomeIds,
 							},
 						]);
 						for (const toolResult of event.toolResults) {
@@ -2802,7 +2928,16 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		// batch by resuming their in-flight children in-process, BEFORE the atomic
 		// commit, so the committed outcome is the real child result rather than an
 		// interrupted marker. Sequential and pre-commit by design (see plan §P1.4).
-		const resolvedOutcomes = await this.resumeUnresolvedTaskCalls(conversation, partial, signal);
+		const resolvedOutcomes = new Map<string, ConversationRecord>();
+		if (await this.resolveApprovalToolCalls(conversation, partial, signal, resolvedOutcomes))
+			return;
+		for (const [toolCallId, outcome] of await this.resumeUnresolvedTaskCalls(
+			conversation,
+			partial,
+			signal,
+		)) {
+			resolvedOutcomes.set(toolCallId, outcome);
+		}
 		await this.resumeDurableToolCalls(conversation, partial, signal, resolvedOutcomes);
 		await this.appendRepairedToolResultBatch(
 			partial.entryId,
@@ -2810,6 +2945,507 @@ export class Session implements FlueSession, AgentSubmissionSession {
 			conversation,
 			resolvedOutcomes,
 		);
+		// Recovery can execute tools and commit state just like a live turn.
+		// Refresh instructions, resources, and closures before the next model
+		// request, anchoring resource additions to the repaired batch's result.
+		const finalResult = this.agentLoop.state.messages.at(-1);
+		await this.prepareRerenderTurn(
+			finalResult?.role === 'toolResult' ? { toolResults: [finalResult] } : undefined,
+		);
+	}
+
+	/** Resolve approval calls only after every proposal in the batch is decided. */
+	private async resolveApprovalToolCalls(
+		conversation: ReducedConversationState,
+		partial: {
+			entryId: string;
+			assistant: AssistantMessage;
+			toolCalls: ReadonlyArray<{ id: string; name: string }>;
+		},
+		signal: AbortSignal,
+		resolved: Map<string, ConversationRecord>,
+	): Promise<boolean> {
+		const approvalStore = this.submissionStore;
+		const unresolvedCalls = partial.toolCalls.filter(
+			(call) => !conversation.toolOutcomes.has(toolOutcomeKey(partial.entryId, call.id)),
+		);
+		if (unresolvedCalls.length === 0) return false;
+		const currentlyGuarded = (call: { id: string; name: string }) =>
+			Boolean(
+				this.agentTools.find((candidate) => candidate.name === call.name)?.approval?.required,
+			);
+		const batchEntry = conversation.entries.get(partial.entryId);
+		const batchSubmissionId = batchEntry?.type === 'message' ? batchEntry.submissionId : undefined;
+		const recordedApprovalCalls = new Set<string>();
+		if (batchSubmissionId) {
+			for (const call of unresolvedCalls) {
+				const proposalId = toolApprovalProposalId(batchSubmissionId, partial.entryId, call.id);
+				if (
+					await this.conversationWriter.hasRecord(
+						`record_tool_approval_requested_${encodeCanonicalId(proposalId)}`,
+					)
+				) {
+					recordedApprovalCalls.add(call.id);
+				}
+			}
+		}
+		const knownApprovalCalls = unresolvedCalls.filter(
+			(call) => currentlyGuarded(call) || recordedApprovalCalls.has(call.id),
+		);
+		if (!batchSubmissionId) {
+			for (const call of knownApprovalCalls) {
+				resolved.set(
+					call.id,
+					this.approvalFailureOutcomeRecord(
+						partial.entryId,
+						call,
+						'Approval request has no durable submission identity; the tool was not executed.',
+					),
+				);
+			}
+			return false;
+		}
+		if (!approvalStore?.getToolApproval) {
+			for (const call of knownApprovalCalls) {
+				resolved.set(
+					call.id,
+					this.approvalFailureOutcomeRecord(
+						partial.entryId,
+						call,
+						'Approval state is unavailable; the tool was not executed.',
+					),
+				);
+			}
+			return false;
+		}
+		const approvalCalls: Array<{ id: string; name: string }> = [];
+		const approvals = new Map<string, ToolApproval>();
+		let pendingApprovals: ToolApproval[] = [];
+		for (const call of unresolvedCalls) {
+			const proposalId = toolApprovalProposalId(batchSubmissionId, partial.entryId, call.id);
+			let approval = await approvalStore.getToolApproval(proposalId);
+			if (!approval && !currentlyGuarded(call) && !recordedApprovalCalls.has(call.id)) continue;
+			approvalCalls.push(call);
+			if (!approval && currentlyGuarded(call)) {
+				try {
+					approval = await this.recreateMissingToolApproval(
+						this.requireToolApprovalStore(call.name),
+						batchSubmissionId,
+						partial,
+						call,
+						signal,
+					);
+				} catch (error) {
+					resolved.set(
+						call.id,
+						this.approvalFailureOutcomeRecord(
+							partial.entryId,
+							call,
+							`Approval proposal could not be reconstructed; the tool was not executed: ${getErrorMessage(error)}`,
+						),
+					);
+					continue;
+				}
+			}
+			if (!approval) {
+				resolved.set(
+					call.id,
+					this.approvalFailureOutcomeRecord(
+						partial.entryId,
+						call,
+						'Approval proposal is missing; the tool was not executed.',
+					),
+				);
+				continue;
+			}
+			if (
+				approval.proposalId !== proposalId ||
+				approval.submissionId !== batchSubmissionId ||
+				approval.conversationId !== this.conversationId ||
+				approval.assistantMessageId !== partial.entryId ||
+				approval.toolCallId !== call.id ||
+				approval.toolName !== call.name ||
+				approval.harness !== (this.executionIdentity.harness ?? 'default') ||
+				approval.session !== this.name
+			) {
+				resolved.set(
+					call.id,
+					this.approvalFailureOutcomeRecord(
+						partial.entryId,
+						call,
+						'Approval proposal does not match the durable tool call; the tool was not executed.',
+					),
+				);
+				continue;
+			}
+			// Repair a proposal which was committed immediately before a crash but
+			// whose canonical requested record was not. This must happen before a
+			// pending proposal can park or a decided one can produce its outcome.
+			await this.ensureApprovalRequestedRecord(approval);
+			approvals.set(call.id, approval);
+			if (approval.status === 'pending') {
+				pendingApprovals.push(approval);
+			}
+		}
+		if (approvalCalls.length === 0) return false;
+		if (pendingApprovals.length > 0) {
+			if (!approvalStore.parkSubmissionForApproval) {
+				throw new Error('[flue] Pending tool approval cannot durably park this submission.');
+			}
+			await this.throwIfSubmissionHalted();
+			if (
+				!(await approvalStore.parkSubmissionForApproval(
+					this.activeSubmissionAttempt(),
+					pendingApprovals.map((approval) => approval.proposalId),
+				))
+			) {
+				// A decision may have won after the read above. Reconcile from the
+				// durable projection rather than stranding the submission in a
+				// manufactured waiting state.
+				pendingApprovals = [];
+				for (const call of approvalCalls) {
+					const current = await approvalStore.getToolApproval(
+						toolApprovalProposalId(batchSubmissionId, partial.entryId, call.id),
+					);
+					if (!current) continue;
+					approvals.set(call.id, current);
+					if (current.status === 'pending') pendingApprovals.push(current);
+				}
+				if (pendingApprovals.length > 0) {
+					await this.throwIfSubmissionHalted();
+					throw new Error('[flue] Pending tool approval lost submission ownership while parking.');
+				}
+			} else {
+				this.approvalParked = true;
+				this.approvalSubmissionParked = true;
+				for (const approval of pendingApprovals) {
+					this.approvalToolCalls.add(approval.toolCallId);
+					this.emit({
+						type: 'tool_approval_requested',
+						proposalId: approval.proposalId,
+						toolName: approval.toolName,
+						toolCallId: approval.toolCallId,
+						toolVersion: approval.toolVersion,
+						args: approval.arguments,
+						...(approval.expiresAt !== undefined ? { expiresAt: approval.expiresAt } : {}),
+					});
+					this.emit({
+						type: 'tool_approval_waiting',
+						proposalId: approval.proposalId,
+						toolName: approval.toolName,
+						toolCallId: approval.toolCallId,
+						...(approval.expiresAt !== undefined ? { expiresAt: approval.expiresAt } : {}),
+					});
+					this.notifyApprovalProvider(approval);
+				}
+				return true;
+			}
+		}
+		for (const call of approvalCalls) {
+			const approval = approvals.get(call.id);
+			if (!approval) continue;
+			const decisionRecord = toolApprovalDecisionRecord(approval);
+			if (!(await this.conversationWriter.hasRecord(decisionRecord.id))) {
+				await this.appendCanonical([decisionRecord]);
+			}
+			await approvalStore.markToolApprovalProjected?.(approval.proposalId, 'decided');
+			resolved.set(call.id, await this.materializeApprovalOutcome(partial, call, approval, signal));
+		}
+		return false;
+	}
+
+	/**
+	 * Reconstruct a proposal only when the first persistence write never landed.
+	 * No person has approved this call yet, so reparsing the canonical model
+	 * arguments is safe; once a proposal exists, recovery always uses its frozen
+	 * parsed snapshot instead.
+	 */
+	private async recreateMissingToolApproval(
+		approvalStore: ToolApprovalStore,
+		submissionId: string,
+		partial: { entryId: string; assistant: AssistantMessage },
+		call: { id: string; name: string },
+		signal: AbortSignal,
+	): Promise<ToolApproval | null> {
+		const toolDef = this.agentTools.find((candidate) => candidate.name === call.name);
+		if (!toolDef?.approval?.required) return null;
+		const block = partial.assistant.content.find(
+			(candidate): candidate is Extract<typeof candidate, { type: 'toolCall' }> =>
+				candidate.type === 'toolCall' && candidate.id === call.id,
+		);
+		if (!block) return null;
+		const parsed = parseToolInput(toolDef, block.arguments, signal, {
+			log: this.createToolLogger(toolDef.name, call.id),
+			toolCallId: call.id,
+		});
+		const requestedAt = Date.now();
+		const proposal: ToolApprovalProposal = {
+			proposalId: toolApprovalProposalId(submissionId, partial.entryId, call.id),
+			submissionId,
+			...(this.executionIdentity.agentName ? { agentName: this.executionIdentity.agentName } : {}),
+			instanceId: this.executionIdentity.instanceId ?? this.conversationId,
+			conversationId: this.conversationId,
+			harness: this.executionIdentity.harness ?? 'default',
+			session: this.name,
+			assistantMessageId: partial.entryId,
+			toolCallId: call.id,
+			toolName: toolDef.name,
+			toolVersion: toolDef.version ?? '1',
+			arguments: cloneJsonSerializable(
+				parsed.data ?? {},
+				`Tool "${toolDef.name}" approval arguments`,
+			) as ToolApprovalProposal['arguments'],
+			requestedAt,
+			...(toolDef.approval.expiresInMs
+				? { expiresAt: requestedAt + toolDef.approval.expiresInMs }
+				: {}),
+			...(toolDef.approval.presentation ? { presentation: toolDef.approval.presentation } : {}),
+		};
+		const approval = await approvalStore.createToolApproval(proposal);
+		await this.ensureApprovalRequestedRecord(approval);
+		return approval;
+	}
+
+	private async materializeApprovalOutcome(
+		partial: { entryId: string; assistant: AssistantMessage },
+		call: { id: string; name: string },
+		approval: ToolApproval,
+		signal: AbortSignal,
+	): Promise<ConversationRecord> {
+		const toolDef = this.agentTools.find((candidate) => candidate.name === call.name);
+		if (!toolDef || !toolDef.approval?.required) {
+			return this.approvalFailureOutcomeRecord(
+				partial.entryId,
+				call,
+				'Tool definition is unavailable.',
+			);
+		}
+		if ((toolDef.version ?? '1') !== approval.toolVersion) {
+			return this.approvalFailureOutcomeRecord(
+				partial.entryId,
+				call,
+				`Tool version "${approval.toolVersion}" is no longer available; the tool was not executed.`,
+			);
+		}
+		if (approval.status !== 'approved') {
+			return this.approvalFailureOutcomeRecord(
+				partial.entryId,
+				call,
+				approval.reason ?? `Tool approval ${approval.status}; the tool was not executed.`,
+			);
+		}
+		// A parked submission resumes with only its original unused execution
+		// budget. Never start an approved side effect after that budget elapsed.
+		await this.throwIfSubmissionHalted();
+		const executionRecordId = `record_tool_approval_execution_started_${encodeCanonicalId(approval.proposalId)}`;
+		const executionAlreadyStarted = await this.conversationWriter.hasRecord(executionRecordId);
+		if (executionAlreadyStarted && !toolDef.durable) {
+			return this.approvalFailureOutcomeRecord(
+				partial.entryId,
+				call,
+				'Approved tool execution was interrupted before its outcome was recorded; the tool was not executed again.',
+			);
+		}
+		if (!executionAlreadyStarted) {
+			// The invocation fence is deliberately durable before entering user
+			// code. A crash after a non-durable side effect but before the tool
+			// outcome commits must repair to an explicit unknown-outcome error
+			// instead of replaying it. Durable tools may safely continue below:
+			// their step records replay completed work under this same call id.
+			await this.appendCanonical([
+				{
+					...this.canonicalEnvelope('tool_approval_execution_started', executionRecordId),
+					type: 'tool_approval_execution_started',
+					proposalId: approval.proposalId,
+					submissionId: approval.submissionId,
+					assistantMessageId: partial.entryId,
+					toolCallId: call.id,
+				},
+			]);
+		}
+		await this.throwIfSubmissionHalted();
+		const startedAt = Date.now();
+		const outcomeKey = `${encodeCanonicalId(partial.entryId)}_${encodeCanonicalId(call.id)}`;
+		const telemetry: ToolTelemetry = { origin: 'model', description: toolDef.description };
+		const invocationArguments = cloneJsonSerializable(
+			approval.arguments,
+			`Tool "${toolDef.name}" approved arguments`,
+		);
+		const buildOutcome = (isError: boolean, text: string, output?: unknown, terminate?: boolean) =>
+			({
+				...this.canonicalEnvelope('tool_outcome', `record_tool_outcome_${outcomeKey}`),
+				type: 'tool_outcome' as const,
+				assistantMessageId: partial.entryId,
+				toolCallId: call.id,
+				toolName: toolDef.name,
+				isError,
+				content: [{ type: 'text' as const, text }],
+				...(output !== undefined ? { output } : {}),
+				...(terminate ? { terminate: true } : {}),
+				durationMs: durationSince(startedAt),
+			}) as ConversationRecord;
+		const queueOutcomePublication = (
+			record: ConversationRecord,
+			effectiveResult: unknown,
+			error?: unknown,
+		) => {
+			if (record.type !== 'tool_outcome') return;
+			this.pendingToolPublications.set(call.id, () =>
+				this.emit(
+					{
+						type: 'tool',
+						toolName: record.toolName,
+						toolCallId: call.id,
+						isError: record.isError,
+						result: record.output ?? record.content,
+						durationMs: record.durationMs ?? 0,
+					},
+					{
+						...telemetry,
+						effectiveResult,
+						...(error !== undefined ? { errorInfo: classifyError(error) } : {}),
+					},
+				),
+			);
+		};
+		const log = this.createToolLogger(toolDef.name, call.id);
+		this.emit(
+			{ type: 'tool_start', toolName: toolDef.name, toolCallId: call.id },
+			{ ...telemetry, args: invocationArguments },
+		);
+		try {
+			const result = await interceptExecution(
+				{ type: 'tool', toolCallId: call.id, toolName: toolDef.name },
+				this.executionContext(),
+				() =>
+					this.runWithToolStateScope(signal, () =>
+						this.runWithToolTimeout(toolDef, signal, async (toolSignal) => {
+							const invocationSignal = toolSignal ?? signal;
+							const invocationId = toolDef.harness ? generateInvocationId() : undefined;
+							const harness = invocationId
+								? this.createInvocationHarness(invocationId, invocationSignal)
+								: undefined;
+							try {
+								const context = createParsedToolContext(
+									toolDef,
+									invocationArguments,
+									invocationSignal,
+									{
+										log,
+										toolCallId: call.id,
+										...(toolDef.durable
+											? { step: this.createToolStep(toolDef.name, call.id, log) }
+											: {}),
+										...(harness ? { harness } : {}),
+									},
+								);
+								return await toolDef.run(context);
+							} finally {
+								if (harness) {
+									this.activeActionHarnesses.delete(harness);
+									await harness.close();
+								}
+							}
+						}),
+					),
+			);
+			const resolved = resolveToolRun(toolDef, result);
+			const outcome = buildOutcome(
+				false,
+				resolved.output === undefined ? 'null' : JSON.stringify(resolved.output),
+				resolved.output,
+				resolved.terminate,
+			);
+			queueOutcomePublication(outcome, resolved.output);
+			return outcome;
+		} catch (error) {
+			if (signal.aborted) throw error;
+			const outcome = buildOutcome(true, getErrorMessage(error));
+			queueOutcomePublication(outcome, getErrorMessage(error), error);
+			return outcome;
+		}
+	}
+
+	private approvalInterruptedOutcomeRecord(
+		assistantMessageId: string,
+		call: { id: string; name: string },
+	): ConversationRecord {
+		return this.approvalFailureOutcomeRecord(
+			assistantMessageId,
+			call,
+			JSON.stringify({
+				type: 'interrupted',
+				message:
+					'Approved tool execution was interrupted before completion. The outcome is unknown; the tool was not executed again.',
+			}),
+		);
+	}
+
+	private approvalFailureOutcomeRecord(
+		assistantMessageId: string,
+		call: { id: string; name: string },
+		message: string,
+	): ConversationRecord {
+		const key = `${encodeCanonicalId(assistantMessageId)}_${encodeCanonicalId(call.id)}`;
+		return {
+			...this.canonicalEnvelope('tool_outcome', `record_tool_outcome_${key}`),
+			type: 'tool_outcome',
+			assistantMessageId,
+			toolCallId: call.id,
+			toolName: call.name,
+			isError: true,
+			content: [{ type: 'text', text: message }],
+		};
+	}
+
+	/** Run one tool with its definition timeout; approval waits happen outside this scope. */
+	private async runWithToolTimeout<T>(
+		toolDef: ToolDefinition,
+		signal: AbortSignal | undefined,
+		run: (signal: AbortSignal | undefined) => Promise<T>,
+	): Promise<T> {
+		if (toolDef.timeoutMs === undefined) return abandonToolOnAbort(() => run(signal), signal);
+		const timeoutController = new AbortController();
+		let timedOut = false;
+		const timer = setTimeout(() => {
+			timedOut = true;
+			timeoutController.abort(new ToolExecutionTimeoutError(toolDef.timeoutMs as number));
+		}, toolDef.timeoutMs);
+		const effectiveSignal = signal
+			? AbortSignal.any([signal, timeoutController.signal])
+			: timeoutController.signal;
+		try {
+			return await abandonToolOnAbort(() => run(effectiveSignal), effectiveSignal);
+		} catch (error) {
+			if (signal?.aborted) throw error;
+			if (timedOut) throw new ToolExecutionTimeoutError(toolDef.timeoutMs);
+			throw error;
+		} finally {
+			clearTimeout(timer);
+		}
+	}
+
+	/**
+	 * Keep one tool invocation's state writes isolated until its result is known.
+	 * A timed-out or submission-aborted promise may continue running after the
+	 * turn abandons it; discarding the scope fences every later setter call from
+	 * leaking into another tool, turn, or replacement attempt.
+	 */
+	private async runWithToolStateScope<T>(
+		signal: AbortSignal | undefined,
+		run: () => Promise<T>,
+	): Promise<T> {
+		const scope = this.hookState?.createWriteScope();
+		if (!scope) return run();
+		try {
+			const result = await scope.run(run);
+			scope.commit();
+			return result;
+		} catch (error) {
+			if (signal?.aborted || error instanceof ToolExecutionTimeoutError) scope.discard();
+			else scope.commit();
+			throw error;
+		}
 	}
 
 	/**
@@ -2928,20 +3564,26 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		// conversations, while step memos — keyed by toolCallId — carry across.
 		let harness: ActionHarness | undefined;
 		try {
-			const invocationId = toolDef.harness ? generateInvocationId() : undefined;
-			harness = invocationId ? this.createInvocationHarness(invocationId, signal) : undefined;
-			const parsed = parseToolInput(toolDef, params, signal, {
-				log,
-				toolCallId,
-				step: this.createToolStep(toolDef.name, toolCallId, log),
-				...(harness ? { harness } : {}),
-			});
-			const resolved = resolveToolRun(toolDef, await toolDef.run(parsed.context));
-			return buildOutcome(
-				false,
-				resolved.output === undefined ? 'null' : JSON.stringify(resolved.output),
-				resolved.output,
-				resolved.terminate,
+			return await this.runWithToolStateScope(signal, () =>
+				this.runWithToolTimeout(toolDef, signal, async (toolSignal) => {
+					const invocationId = toolDef.harness ? generateInvocationId() : undefined;
+					harness = invocationId
+						? this.createInvocationHarness(invocationId, toolSignal)
+						: undefined;
+					const parsed = parseToolInput(toolDef, params, toolSignal, {
+						log,
+						toolCallId,
+						step: this.createToolStep(toolDef.name, toolCallId, log),
+						...(harness ? { harness } : {}),
+					});
+					const resolved = resolveToolRun(toolDef, await toolDef.run(parsed.context));
+					return buildOutcome(
+						false,
+						resolved.output === undefined ? 'null' : JSON.stringify(resolved.output),
+						resolved.output,
+						resolved.terminate,
+					);
+				}),
 			);
 		} catch (error) {
 			if (signal.aborted) throw error;
@@ -3116,22 +3758,28 @@ export class Session implements FlueSession, AgentSubmissionSession {
 			});
 		}
 		const outcomeRecords: ConversationRecord[] = [];
+		const outcomeRecordsByToolCall = new Map<string, ConversationRecord>();
 		const outcomeIds: string[] = [];
 		for (const toolCall of toolCalls) {
 			const outcome = conversation.toolOutcomes.get(toolOutcomeKey(assistantEntryId, toolCall.id));
 			if (outcome) {
 				outcomeIds.push(outcome);
+				const record = conversation.toolOutcomeRecords.get(
+					toolOutcomeKey(assistantEntryId, toolCall.id),
+				);
+				if (record) outcomeRecordsByToolCall.set(toolCall.id, record);
 				continue;
 			}
 			const resolvedRecord = resolved.get(toolCall.id);
 			if (resolvedRecord) {
 				outcomeRecords.push(resolvedRecord);
 				outcomeIds.push(resolvedRecord.id);
+				outcomeRecordsByToolCall.set(toolCall.id, resolvedRecord);
 				continue;
 			}
 			const repairKey = `${encodeCanonicalId(assistantEntryId)}_${encodeCanonicalId(toolCall.id)}`;
 			const recordId = `record_tool_repair_outcome_${repairKey}`;
-			outcomeRecords.push({
+			const repairOutcome: ConversationRecord = {
 				...this.canonicalEnvelope('tool_outcome', recordId),
 				type: 'tool_outcome',
 				assistantMessageId: assistantEntryId,
@@ -3147,11 +3795,20 @@ export class Session implements FlueSession, AgentSubmissionSession {
 						}),
 					},
 				],
-			});
+			};
+			outcomeRecords.push(repairOutcome);
+			outcomeRecordsByToolCall.set(toolCall.id, repairOutcome);
 			outcomeIds.push(recordId);
 		}
-		if (outcomeRecords.length > 0) await this.appendCanonical(outcomeRecords);
+		// Approval recovery executes tools before this repair commit. Any
+		// usePersistentState writes produced by those tools must share the same
+		// durability point as their outcomes: if the batch commits, the writes do;
+		// if the append fails, neither becomes canonical. Keeping these records in
+		// one append also removes the crash window where an outcome could become
+		// durable without the state that its tool produced.
 		await this.appendCanonical([
+			...outcomeRecords,
+			...this.drainHookStateRecords(),
 			{
 				...this.canonicalEnvelope(
 					'tool_results_committed',
@@ -3163,7 +3820,39 @@ export class Session implements FlueSession, AgentSubmissionSession {
 				outcomeIds,
 			},
 		]);
+		for (const toolCall of toolCalls) {
+			const publish = this.pendingToolPublications.get(toolCall.id);
+			if (publish) {
+				publish();
+				this.pendingToolPublications.delete(toolCall.id);
+			} else {
+				this.publishRecoveredToolOutcome(toolCall.id, outcomeRecordsByToolCall.get(toolCall.id));
+			}
+		}
+		this.lastCommittedToolBatch = {
+			assistantMessageId: assistantEntryId,
+			toolCallId: finalToolCall.id,
+		};
+		if (this.canonicalToolRequestMessageId === assistantEntryId) {
+			this.canonicalToolRequestMessageId = undefined;
+		}
 		await this.rebuildCanonicalContext();
+	}
+
+	/** Re-emit an outcome whose original process parked or stopped before publication. */
+	private publishRecoveredToolOutcome(
+		toolCallId: string,
+		record: ConversationRecord | undefined,
+	): void {
+		if (!record || record.type !== 'tool_outcome') return;
+		this.emit({
+			type: 'tool',
+			toolName: record.toolName,
+			toolCallId,
+			isError: record.isError,
+			result: record.output ?? record.content,
+			durationMs: record.durationMs ?? 0,
+		});
 	}
 
 	/**
@@ -3362,9 +4051,107 @@ export class Session implements FlueSession, AgentSubmissionSession {
 
 		const settled: InterruptedToolCallRef[] = [];
 		const resolved = new Map<string, ConversationRecord>();
+		const approvalRecords: ConversationRecord[] = [];
+		const approvalDecisionEvents: ToolApproval[] = [];
+		const approvalStore = this.submissionStore;
+		const batchSubmissionId =
+			(batchEntry?.type === 'message' ? batchEntry.submissionId : undefined) ??
+			(scope === 'any' ? undefined : scope.submissionId);
+		const recordedApprovalCalls = new Set<string>();
+		if (batchSubmissionId) {
+			for (const toolCall of partial.toolCalls) {
+				const proposalId = toolApprovalProposalId(batchSubmissionId, partial.entryId, toolCall.id);
+				if (
+					await this.conversationWriter.hasRecord(
+						`record_tool_approval_requested_${encodeCanonicalId(proposalId)}`,
+					)
+				) {
+					recordedApprovalCalls.add(toolCall.id);
+				}
+			}
+		}
 		for (const toolCall of partial.toolCalls) {
 			if (conversation.toolOutcomes.has(toolOutcomeKey(partial.entryId, toolCall.id))) continue;
 			settled.push({ name: toolCall.name, id: toolCall.id });
+			const toolDef = this.agentTools.find((candidate) => candidate.name === toolCall.name);
+			const proposalId = batchSubmissionId
+				? toolApprovalProposalId(batchSubmissionId, partial.entryId, toolCall.id)
+				: undefined;
+			const approval =
+				proposalId && approvalStore?.getToolApproval
+					? await approvalStore.getToolApproval(proposalId)
+					: undefined;
+			if (toolDef?.approval?.required || recordedApprovalCalls.has(toolCall.id) || approval) {
+				const executionStarted = proposalId
+					? await this.conversationWriter.hasRecord(
+							`record_tool_approval_execution_started_${encodeCanonicalId(proposalId)}`,
+						)
+					: false;
+				const approvalMatches =
+					approval !== null &&
+					approval !== undefined &&
+					approval.proposalId === proposalId &&
+					approval.submissionId === batchSubmissionId &&
+					approval.conversationId === this.conversationId &&
+					approval.assistantMessageId === partial.entryId &&
+					approval.toolCallId === toolCall.id &&
+					approval.toolName === toolCall.name &&
+					approval.harness === (this.executionIdentity.harness ?? 'default') &&
+					approval.session === this.name;
+				if (approvalMatches && approvalStore?.decideToolApproval) {
+					const requestRecord = toolApprovalRequestedRecord(approval);
+					if (!(await this.conversationWriter.hasRecord(requestRecord.id))) {
+						approvalRecords.push(requestRecord);
+					}
+					const decision =
+						approval.status === 'pending'
+							? await approvalStore.decideToolApproval({
+									proposalId: approval.proposalId,
+									status: 'aborted',
+									reason: 'Submission aborted before the approved tool call ran.',
+								})
+							: { approval, decisionApplied: false, resumed: false };
+					const decided = decision.approval;
+					if (decision.decisionApplied) approvalDecisionEvents.push(decided);
+					if (decided.status === 'pending') {
+						throw new Error(
+							`[flue] Tool approval "${decided.proposalId}" remained pending after terminal abort.`,
+						);
+					}
+					const decisionRecord = toolApprovalDecisionRecord(decided);
+					if (!(await this.conversationWriter.hasRecord(decisionRecord.id))) {
+						approvalRecords.push(decisionRecord);
+					}
+					resolved.set(
+						toolCall.id,
+						executionStarted
+							? this.approvalInterruptedOutcomeRecord(partial.entryId, toolCall)
+							: this.approvalFailureOutcomeRecord(
+									partial.entryId,
+									toolCall,
+									decided.reason ?? `Tool approval ${decided.status}; the tool was not executed.`,
+								),
+					);
+				} else {
+					resolved.set(
+						toolCall.id,
+						executionStarted
+							? this.approvalInterruptedOutcomeRecord(partial.entryId, toolCall)
+							: this.approvalFailureOutcomeRecord(
+									partial.entryId,
+									toolCall,
+									!approvalStore?.getToolApproval
+										? 'Approval state is unavailable; the tool was not executed.'
+										: !approval
+											? 'Approval proposal is missing; the tool was not executed.'
+											: !approvalMatches
+												? 'Approval proposal does not match the durable tool call; the tool was not executed.'
+												: 'Approval decision state is unavailable; the tool was not executed.',
+								),
+					);
+				}
+				continue;
+			}
 			if (toolCall.name !== 'task') continue;
 			const ref = [...conversation.childConversations.values()].find(
 				(child): child is Extract<CanonicalChildSessionRef, { type: 'task' }> =>
@@ -3375,6 +4162,28 @@ export class Session implements FlueSession, AgentSubmissionSession {
 				toolCall.id,
 				this.taskInterruptedOutcomeRecord(partial.entryId, toolCall.id, ref.conversationId),
 			);
+		}
+		if (approvalRecords.length > 0) {
+			await this.appendCanonical(approvalRecords);
+			for (const record of approvalRecords) {
+				if (record.type !== 'tool_approval_requested' && record.type !== 'tool_approval_decided') {
+					continue;
+				}
+				await approvalStore?.markToolApprovalProjected?.(
+					record.proposalId,
+					record.type === 'tool_approval_requested' ? 'requested' : 'decided',
+				);
+			}
+		}
+		for (const approval of approvalDecisionEvents) {
+			this.emit({
+				type: 'tool_approval_decided',
+				proposalId: approval.proposalId,
+				toolName: approval.toolName,
+				toolCallId: approval.toolCallId,
+				status: approval.status === 'pending' ? 'canceled' : approval.status,
+				...(approval.reason ? { reason: approval.reason } : {}),
+			});
 		}
 		await this.appendRepairedToolResultBatch(
 			partial.entryId,
@@ -3736,7 +4545,8 @@ export class Session implements FlueSession, AgentSubmissionSession {
 					const result = await interceptExecution(
 						{ type: 'tool', toolCallId, toolName: tool.name },
 						this.executionContext(),
-						() => abandonToolOnAbort(prepared.run, signal),
+						() =>
+							this.runWithToolStateScope(signal, () => abandonToolOnAbort(prepared.run, signal)),
 					);
 					call.effectiveResult = prepared.result ? prepared.result(result) : result;
 					call.effectiveResultCaptured = true;
@@ -3758,6 +4568,253 @@ export class Session implements FlueSession, AgentSubmissionSession {
 	 */
 	private createToolLogger(tool: string, toolCallId: string): FlueLogger {
 		return this.createAttributedLogger({ tool, toolCallId });
+	}
+
+	/** The definition currently exposed to Pi, including ephemeral call tools. */
+	private findActiveAgentTool(name: string): ToolDefinition | undefined {
+		return [...this.agentTools, ...(this.activeCallOverrides?.tools ?? [])].find(
+			(candidate) => candidate.name === name,
+		);
+	}
+
+	private requireToolApprovalStore(toolName: string): ToolApprovalStore {
+		const store = this.submissionStore;
+		if (
+			!store?.parkSubmissionForApproval ||
+			!store.createToolApproval ||
+			!store.getToolApproval ||
+			!store.listToolApprovals ||
+			!store.listToolApprovalProjectionWork ||
+			!store.markToolApprovalProjected ||
+			!store.claimToolApprovalNotification ||
+			!store.completeToolApprovalNotification ||
+			!store.decideToolApproval ||
+			!store.expireToolApprovals ||
+			!store.listWaitingForApprovalSubmissions
+		) {
+			throw new Error(
+				`[flue] Approval-gated tool "${toolName}" requires a persistence adapter with the complete durable tool-approval API.`,
+			);
+		}
+		return store as ToolApprovalStore;
+	}
+
+	/**
+	 * Persist and park an approval-gated tool call during Pi's preflight phase.
+	 * Pi receives a blocked result internally, but Flue deliberately does not
+	 * write that placeholder into the canonical conversation or continue the
+	 * model loop. The durable submission is released only by a host decision.
+	 */
+	private async beforeModelToolCall(
+		context: BeforeToolCallContext,
+	): Promise<BeforeToolCallResult | undefined> {
+		const toolDef = this.findActiveAgentTool(context.toolCall.name);
+		if (!toolDef?.approval?.required) return undefined;
+		if (this.activeCallOverrides?.tools.includes(toolDef)) {
+			throw new Error(
+				`[flue] Approval-gated tool "${toolDef.name}" cannot be supplied through per-call tools because its definition would be unavailable during durable recovery. Declare it with useTool() instead.`,
+			);
+		}
+		if (!this.activeSubmissionId || !this.activeSubmissionAttemptId) {
+			throw new Error(
+				`[flue] Approval-gated tool "${toolDef.name}" requires a durable agent submission and an approval-capable persistence adapter.`,
+			);
+		}
+		const approvalStore = this.requireToolApprovalStore(toolDef.name);
+		const assistantMessageId = this.canonicalToolRequestMessageId;
+		if (!assistantMessageId) {
+			throw new Error(
+				`[flue] Approval-gated tool "${toolDef.name}" has no canonical assistant request.`,
+			);
+		}
+		// Validate and normalize before asking for approval. A malformed model call
+		// must take the ordinary tool-validation path so the model can correct it;
+		// an approval proposal is only created for the exact data `run` would see.
+		let args: Record<string, unknown>;
+		try {
+			const parsed = parseToolInput(toolDef, context.args ?? {}, undefined, {
+				log: this.createToolLogger(toolDef.name, context.toolCall.id),
+				toolCallId: context.toolCall.id,
+			});
+			args = cloneJsonSerializable(
+				parsed.data ?? {},
+				`Tool "${toolDef.name}" approval arguments`,
+			) as Record<string, unknown>;
+		} catch (error) {
+			if (error instanceof ToolInputValidationError) return undefined;
+			throw error;
+		}
+		const proposalId = toolApprovalProposalId(
+			this.activeSubmissionId,
+			assistantMessageId,
+			context.toolCall.id,
+		);
+		// A crash can happen after proposal persistence but before the canonical
+		// requested record. Reuse the persisted timestamps on retry: they are part
+		// of the immutable proposal snapshot, and a new clock reading would turn
+		// that repair into a false conflict.
+		const existing = await approvalStore.getToolApproval(proposalId);
+		const requestedAt = existing?.requestedAt ?? Date.now();
+		const proposal: ToolApprovalProposal = {
+			proposalId,
+			submissionId: this.activeSubmissionId,
+			...(this.executionIdentity.agentName ? { agentName: this.executionIdentity.agentName } : {}),
+			instanceId: this.executionIdentity.instanceId ?? this.conversationId,
+			conversationId: this.conversationId,
+			harness: this.executionIdentity.harness ?? 'default',
+			session: this.name,
+			assistantMessageId,
+			toolCallId: context.toolCall.id,
+			toolName: toolDef.name,
+			toolVersion: toolDef.version ?? '1',
+			arguments: args as ToolApprovalProposal['arguments'],
+			requestedAt,
+			...(existing?.expiresAt !== undefined
+				? { expiresAt: existing.expiresAt }
+				: toolDef.approval.expiresInMs
+					? { expiresAt: requestedAt + toolDef.approval.expiresInMs }
+					: {}),
+			...(toolDef.approval.presentation ? { presentation: toolDef.approval.presentation } : {}),
+		};
+		const approval = await approvalStore.createToolApproval(proposal);
+		await this.ensureApprovalRequestedRecord(approval);
+		this.approvalToolCalls.add(context.toolCall.id);
+		this.approvalBatch.set(context.toolCall.id, approval);
+		// Keep ownership through Pi's parallel execution phase. Unguarded calls
+		// in this same batch still need the live attempt fence to persist their
+		// outcomes; the turn_end handler parks only after those writes finish.
+		this.approvalParked = true;
+		return { block: true, reason: 'Approval is required before this tool can run.' };
+	}
+
+	/**
+	 * Reconcile the canonical side of a persisted proposal. Persistence adapters
+	 * and conversation streams are independent durable resources, so this is an
+	 * intentionally idempotent repair after a crash between the two writes.
+	 */
+	private async ensureApprovalRequestedRecord(approval: ToolApproval): Promise<void> {
+		const record = toolApprovalRequestedRecord(approval);
+		if (!(await this.conversationWriter.hasRecord(record.id))) {
+			await this.appendCanonical([record]);
+		}
+		await this.submissionStore?.markToolApprovalProjected?.(approval.proposalId, 'requested');
+	}
+
+	/** Persist an approval-blocked batch's completed ordinary work before parking. */
+	private async flushApprovalBatchBeforePark(): Promise<void> {
+		const records = [...this.approvalBatchOutcomeRecords.values(), ...this.drainHookStateRecords()];
+		if (records.length === 0) return;
+		// Conversation append is one SQLite transaction in a Durable Object. A
+		// reset therefore leaves either both the ordinary outcomes and their state
+		// writes, or neither; recovery never observes one without the other.
+		await this.appendCanonical(records);
+		this.approvalBatchOutcomeRecords.clear();
+	}
+
+	/**
+	 * Release the active submission only after Pi has completed every unguarded
+	 * call in the batch. Approval notifications happen after this transition so
+	 * a synchronous host decision always observes a parked submission.
+	 */
+	private async parkCurrentApprovalBatch(): Promise<void> {
+		if (!this.approvalParked || this.approvalSubmissionParked) return;
+		const store = this.requireToolApprovalStore('approval-gated tool');
+		let approvals: ToolApproval[] = [];
+		for (const snapshot of this.approvalBatch.values()) {
+			const current = await store.getToolApproval(snapshot.proposalId);
+			if (!current) {
+				throw new Error(
+					`[flue] Tool approval proposal "${snapshot.proposalId}" disappeared before parking.`,
+				);
+			}
+			approvals.push(current);
+		}
+		const pending = approvals.filter((approval) => approval.status === 'pending');
+		await this.throwIfSubmissionHalted();
+		if (pending.length > 0) {
+			if (
+				!(await store.parkSubmissionForApproval(
+					this.activeSubmissionAttempt(),
+					pending.map((approval) => approval.proposalId),
+				))
+			) {
+				approvals = await Promise.all(
+					approvals.map(async (approval) => {
+						const current = await store.getToolApproval(approval.proposalId);
+						if (!current) {
+							throw new Error(
+								`[flue] Tool approval proposal "${approval.proposalId}" disappeared while parking.`,
+							);
+						}
+						return current;
+					}),
+				);
+				if (approvals.some((approval) => approval.status === 'pending')) {
+					await this.throwIfSubmissionHalted();
+					throw new Error('[flue] Approval-gated tool lost submission ownership while parking.');
+				}
+			} else {
+				this.approvalSubmissionParked = true;
+			}
+		}
+		for (const approval of approvals) {
+			this.emit({
+				type: 'tool_approval_requested',
+				proposalId: approval.proposalId,
+				toolName: approval.toolName,
+				toolCallId: approval.toolCallId,
+				toolVersion: approval.toolVersion,
+				args: approval.arguments as Record<string, unknown>,
+				...(approval.expiresAt !== undefined ? { expiresAt: approval.expiresAt } : {}),
+			});
+			if (approval.status !== 'pending') continue;
+			this.emit({
+				type: 'tool_approval_waiting',
+				proposalId: approval.proposalId,
+				toolName: approval.toolName,
+				toolCallId: approval.toolCallId,
+				...(approval.expiresAt !== undefined ? { expiresAt: approval.expiresAt } : {}),
+			});
+			this.notifyApprovalProvider(approval);
+		}
+	}
+
+	private notifyApprovalProvider(approval: ToolApproval): void {
+		const provider = getToolApprovalProvider();
+		const claim = this.submissionStore?.claimToolApprovalNotification;
+		const complete = this.submissionStore?.completeToolApprovalNotification;
+		if (!provider || !claim || !complete) return;
+		// Start from an already-resolved promise so a provider that throws before
+		// returning a promise is isolated exactly like an asynchronous rejection.
+		void Promise.resolve()
+			.then(async () => {
+				if (!(await claim.call(this.submissionStore, approval.proposalId))) return;
+				await provider.requested(approval);
+				await complete.call(this.submissionStore, approval.proposalId);
+			})
+			.catch((error) => {
+				this.internalLog('error', '[flue:tool-approval] Host notification failed', {
+					proposalId: approval.proposalId,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			});
+	}
+
+	private async throwIfSubmissionHalted(): Promise<void> {
+		if (this.activeJoinSignal?.aborted) throw abortErrorFor(this.activeJoinSignal);
+		if (this.activeTimeoutAt !== undefined && Date.now() >= this.activeTimeoutAt) {
+			throw new SubmissionTimeoutError();
+		}
+		if (!this.activeSubmissionId || !this.submissionStore) return;
+		const submission = await this.submissionStore.getSubmission(this.activeSubmissionId);
+		if (submission?.abortRequestedAt !== undefined) throw new SubmissionAbortedError();
+	}
+
+	private activeSubmissionAttempt(): { submissionId: string; attemptId: string } {
+		if (!this.activeSubmissionId || !this.activeSubmissionAttemptId) {
+			throw new Error('[flue] Approval-gated tool has no active submission attempt.');
+		}
+		return { submissionId: this.activeSubmissionId, attemptId: this.activeSubmissionAttemptId };
 	}
 
 	/**
@@ -3876,18 +4933,19 @@ export class Session implements FlueSession, AgentSubmissionSession {
 				if (preparedToolAdapter) {
 					return {
 						args: params,
-						run: async () => ({
-							content: [
-								{
-									type: 'text' as const,
-									text: await preparedToolAdapter.execute(
-										params as Record<string, unknown>,
-										signal,
-									),
-								},
-							],
-							details: { customTool: toolDef.name },
-						}),
+						run: async () =>
+							this.runWithToolTimeout(toolDef, signal, async (toolSignal) => ({
+								content: [
+									{
+										type: 'text' as const,
+										text: await preparedToolAdapter.execute(
+											params as Record<string, unknown>,
+											toolSignal,
+										),
+									},
+								],
+								details: { customTool: toolDef.name },
+							})),
 						result: toolResultText,
 					};
 				}
@@ -3901,46 +4959,51 @@ export class Session implements FlueSession, AgentSubmissionSession {
 				});
 				return {
 					args: parsed.data,
-					run: async () => {
-						// The harness materializes at run time (a refused/aborted call
-						// never creates one) and closes when the run settles. The
-						// invocation id is per execution ATTEMPT (a recovery re-run of
-						// the same toolCallId gets a fresh scope, so its child sessions
-						// never collide with a prior attempt's retained conversations).
-						const invocationId = toolDef.harness ? generateInvocationId() : undefined;
-						const harness = invocationId
-							? this.createInvocationHarness(invocationId, signal)
-							: undefined;
-						try {
-							const context = harness
-								? ({ ...parsed.context, harness } as unknown as typeof parsed.context)
-								: parsed.context;
-							const resolved = resolveToolRun(toolDef, await toolDef.run(context));
-							const output = resolved.output;
-							return {
-								content: [
-									{
-										type: 'text' as const,
-										text: output === undefined ? 'null' : JSON.stringify(output),
+					run: async () =>
+						this.runWithToolTimeout(toolDef, signal, async (toolSignal) => {
+							// The harness materializes at run time (a refused/aborted call
+							// never creates one) and closes when the run settles. The
+							// invocation id is per execution ATTEMPT (a recovery re-run of
+							// the same toolCallId gets a fresh scope, so its child sessions
+							// never collide with a prior attempt's retained conversations).
+							const invocationId = toolDef.harness ? generateInvocationId() : undefined;
+							const harness = invocationId
+								? this.createInvocationHarness(invocationId, toolSignal)
+								: undefined;
+							try {
+								const context = harness
+									? ({
+											...parsed.context,
+											harness,
+											signal: toolSignal,
+										} as unknown as typeof parsed.context)
+									: ({ ...parsed.context, signal: toolSignal } as typeof parsed.context);
+								const resolved = resolveToolRun(toolDef, await toolDef.run(context));
+								const output = resolved.output;
+								return {
+									content: [
+										{
+											type: 'text' as const,
+											text: output === undefined ? 'null' : JSON.stringify(output),
+										},
+									],
+									details: {
+										customTool: toolDef.name,
+										output,
+										...(invocationId ? { invocationId } : {}),
 									},
-								],
-								details: {
-									customTool: toolDef.name,
-									output,
-									...(invocationId ? { invocationId } : {}),
-								},
-								// The engine ends the turn after this batch iff EVERY
-								// finalized result terminates — the same contract the
-								// built-in finish/give_up tools use (result.ts).
-								...(resolved.terminate ? { terminate: true } : {}),
-							};
-						} finally {
-							if (harness) {
-								this.activeActionHarnesses.delete(harness);
-								await harness.close();
+									// The engine ends the turn after this batch iff EVERY
+									// finalized result terminates — the same contract the
+									// built-in finish/give_up tools use (result.ts).
+									...(resolved.terminate ? { terminate: true } : {}),
+								};
+							} finally {
+								if (harness) {
+									this.activeActionHarnesses.delete(harness);
+									await harness.close();
+								}
 							}
-						}
-					},
+						}),
 					result: (value) => (value.details as { output?: unknown }).output,
 				};
 			});
@@ -5294,6 +6357,28 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		}
 	}
 
+	/** Reconcile approval stops from both ordinary turns and finish/join continuations. */
+	private async stopAtApprovalBoundary(options: {
+		inputEntryId: string;
+		errorLabel: string;
+		signal: AbortSignal;
+	}): Promise<boolean> {
+		if (!this.approvalParked) return false;
+		if (!this.approvalSubmissionParked) {
+			await this.throwIfSubmissionHalted();
+			// The proposals were decided before the post-batch park. The current
+			// attempt still owns the submission, so repair the canonical batch and
+			// continue without manufacturing a waiting transition.
+			this.approvalParked = false;
+			this.approvalToolCalls.clear();
+			this.approvalBatch.clear();
+			this.approvalBatchOutcomeRecords.clear();
+			await this.rebuildCanonicalContext();
+			await this.resumeConversationToCompletion(options);
+		}
+		return true;
+	}
+
 	/**
 	 * Resume the conversation from a persisted input entry to completion:
 	 * repair the conversation tail, classify the canonical state after the
@@ -5315,6 +6400,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		// reclassifies `tool_results`, an upgraded partial reclassifies
 		// `stream_continuation`.
 		await this.repairResumableTail(options.inputEntryId, options.signal);
+		if (this.approvalParked) return;
 		const state = classifyConversationSubmission(
 			await this.requireConversation(),
 			options.inputEntryId,
@@ -5357,6 +6443,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 					signal: options.signal,
 					resume: { assistant: state.assistant, errorLabel: options.errorLabel },
 				});
+				if (await this.stopAtApprovalBoundary(options)) return;
 				this.throwIfError(options.errorLabel);
 				break;
 			}
@@ -5371,6 +6458,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 					signal: options.signal,
 					resume: { assistant: state.assistant, errorLabel: options.errorLabel },
 				});
+				if (await this.stopAtApprovalBoundary(options)) return;
 				this.throwIfError(options.errorLabel);
 				break;
 			}
@@ -5489,6 +6577,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 				const durability = this.resolveSubmissionDurability(options.startedAt, options.timeoutAt);
 				this.activeTimeoutAt = durability.timeoutAt;
 				try {
+					await this.throwIfSubmissionHalted();
 					// Structural convergence, before anything else appends: any
 					// in-progress assistant persisted in this conversation is dead by
 					// construction here (per-session submissions are serialized and
@@ -5527,6 +6616,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 					// batch mid-history, where recorded tool outcomes are dropped
 					// from model context and the replayed turn re-executes them.
 					await this.repairResumableTail(options.inputEntryId, options.signal);
+					if (this.approvalParked) return;
 					// Wake diff: resource flips from a previous response's final
 					// batch (no turn boundary followed them) narrate before turn 1
 					// against the init render — the model's actual turn-1 view.
@@ -5545,10 +6635,13 @@ export class Session implements FlueSession, AgentSubmissionSession {
 						errorLabel: options.errorLabel,
 						signal: options.signal,
 					});
+					if (this.approvalParked) return;
 					await this.runWouldStopPhase({
+						inputEntryId: options.inputEntryId,
 						errorLabel: options.errorLabel,
 						signal: options.signal,
 					});
+					if (this.approvalParked) return;
 					await this.flushResponseOutput();
 				} finally {
 					// A failed attempt drops its unflushed signal appends (they never
@@ -5567,6 +6660,11 @@ export class Session implements FlueSession, AgentSubmissionSession {
 					this.activeJoinSignal = undefined;
 					this.activeInputEntryId = undefined;
 					this.activeTimeoutAt = undefined;
+					this.approvalParked = false;
+					this.approvalSubmissionParked = false;
+					this.approvalToolCalls.clear();
+					this.approvalBatch.clear();
+					this.approvalBatchOutcomeRecords.clear();
 				}
 			},
 		);

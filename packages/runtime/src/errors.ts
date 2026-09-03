@@ -238,6 +238,24 @@ export class RuntimeUnavailableError extends FlueHttpError {
 	}
 }
 
+/**
+ * The caller reached a tool-approval route on a runtime that cannot provide
+ * the durable approval state machine. The route is mounted consistently on
+ * every agent router so clients do not need target-specific URL maps, but
+ * only Cloudflare Durable Object agents currently implement it.
+ */
+export class ToolApprovalUnavailableError extends FlueHttpError {
+	constructor() {
+		super({
+			type: 'tool_approval_unavailable',
+			message: 'Durable tool approvals are unavailable on this runtime.',
+			details: 'This endpoint currently requires the Cloudflare Durable Object runtime.',
+			dev: '',
+			status: 501,
+		});
+	}
+}
+
 export class MethodNotAllowedError extends FlueHttpError {
 	constructor({ method, allowed }: { method: string; allowed: readonly string[] }) {
 		super({

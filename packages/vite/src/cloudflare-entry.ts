@@ -199,13 +199,14 @@ if ('fetch' in cloudflareHandlers) {
 // There is no default sandbox: agents that want shell/filesystem tools
 // declare an environment with useSandbox().
 
-function createAgentContextForRequest({ instance, agentName, request, submissionId }) {
+function createAgentContextForRequest({ instance, agentName, request, submissionId, submissionStore }) {
 	return createFlueContext({
 		id: instance.name,
 		agentName,
 		env: instance?.env ?? {},
 		req: request,
 		submissionId,
+		submissionStore,
 		agentConfig: { resolveModel },
 	});
 }

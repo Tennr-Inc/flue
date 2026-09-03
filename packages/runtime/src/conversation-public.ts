@@ -8,6 +8,7 @@ import type { ConversationRecord, SubmissionSettledRecord } from './conversation
 import type { ReducedConversationState, ReducedInstanceState } from './conversation-reducer.ts';
 import { getActiveConversationPath, toolResultEntryId } from './conversation-reducer.ts';
 import { toolResultOutput, toolResultText } from './message-rendering.ts';
+import type { ToolApprovalPresentation, ToolApprovalStatus } from './tool-approval.ts';
 
 interface AgentConversationSettlement {
 	submissionId: string;
@@ -22,6 +23,29 @@ interface AgentConversationSettlement {
 	 * on attempts that produced no assistant message.
 	 */
 	answeredBySubmissionId?: string;
+}
+
+/**
+ * Public, conversation-scoped view of one durable tool approval. Runtime and
+ * storage routing fields stay private; this is the proposal data a client
+ * needs to render and resolve the decision through the mounted agent route.
+ */
+export interface AgentConversationToolApproval {
+	proposalId: string;
+	submissionId: string;
+	assistantMessageId: string;
+	toolCallId: string;
+	toolName: string;
+	toolVersion: string;
+	arguments: Record<string, unknown>;
+	status: ToolApprovalStatus;
+	/** Capture time of the canonical request record, in Unix milliseconds. */
+	requestedAt: number;
+	expiresAt?: number;
+	presentation?: ToolApprovalPresentation;
+	/** Capture time of the canonical decision record, in Unix milliseconds. */
+	decidedAt?: number;
+	reason?: string;
 }
 
 /**
@@ -44,6 +68,7 @@ export interface AgentConversationSnapshot {
 	incarnation?: string;
 	messages: ConversationUiMessage[];
 	settlements: AgentConversationSettlement[];
+	toolApprovals: AgentConversationToolApproval[];
 }
 
 /**
@@ -164,7 +189,8 @@ export interface ConversationStreamCheckpointChunk {
 }
 
 /** Everything the `updates` wire can carry: projected chunks plus wire-only markers. */
-export type ConversationStreamWireChunk = ConversationStreamChunk | ConversationStreamCheckpointChunk;
+export type ConversationStreamWireChunk =
+	ConversationStreamChunk | ConversationStreamCheckpointChunk;
 
 // The public conversation API addresses exactly one conversation per agent
 // instance: the default harness/session root. An instance can hold other root
@@ -202,6 +228,7 @@ export function projectAgentConversationSnapshot(
 		offset: ui.streamOffset,
 		messages: ui.messages,
 		settlements: projectSettlements(state, conversation.conversationId),
+		toolApprovals: projectToolApprovals(state, conversation.conversationId),
 	};
 }
 
@@ -276,7 +303,15 @@ function withPositions(
 }
 
 function requiresSnapshotReset(record: ConversationRecord): boolean {
-	return record.type === 'conversation_created' || record.type === 'compaction';
+	return (
+		record.type === 'conversation_created' ||
+		record.type === 'compaction' ||
+		// Approval chunks were added after the 2.0.3 SDK's strict updates
+		// validator. A reset is understood by both generations; new clients read
+		// toolApprovals from it while old clients safely ignore the extra field.
+		record.type === 'tool_approval_requested' ||
+		record.type === 'tool_approval_decided'
+	);
 }
 
 function encodeRecord(
@@ -444,6 +479,64 @@ function encodeRecord(
 		default:
 			return [];
 	}
+}
+
+function pendingToolApproval(
+	record: Extract<ConversationRecord, { type: 'tool_approval_requested' }>,
+): AgentConversationToolApproval & { status: 'pending' } {
+	return {
+		proposalId: record.proposalId,
+		submissionId: record.submissionId,
+		assistantMessageId: record.assistantMessageId,
+		toolCallId: record.toolCallId,
+		toolName: record.toolName,
+		toolVersion: record.toolVersion,
+		arguments: record.arguments,
+		status: 'pending',
+		requestedAt: record.requestedAt ?? canonicalTimestamp(record.timestamp),
+		...(record.expiresAt === undefined ? {} : { expiresAt: record.expiresAt }),
+		...(record.presentation === undefined ? {} : { presentation: record.presentation }),
+	};
+}
+
+/** Rebuild latest approval state in request order from retained canonical records. */
+function projectToolApprovals(
+	state: ReducedInstanceState,
+	conversationId: string,
+): AgentConversationToolApproval[] {
+	const approvals = new Map<string, AgentConversationToolApproval>();
+	const decisions = new Map<
+		string,
+		Extract<ConversationRecord, { type: 'tool_approval_decided' }>
+	>();
+	for (const record of state.recordsById.values()) {
+		if (record.type === 'tool_approval_decided' && record.conversationId === conversationId) {
+			decisions.set(record.proposalId, record);
+		}
+	}
+	for (const record of state.recordsById.values()) {
+		if (record.type !== 'tool_approval_requested' || record.conversationId !== conversationId) {
+			continue;
+		}
+		const requested = pendingToolApproval(record);
+		const decision = decisions.get(record.proposalId);
+		approvals.set(
+			record.proposalId,
+			decision
+				? {
+						...requested,
+						status: decision.status,
+						decidedAt: decision.decidedAt ?? canonicalTimestamp(decision.timestamp),
+						...(decision.reason === undefined ? {} : { reason: decision.reason }),
+					}
+				: requested,
+		);
+	}
+	return [...approvals.values()];
+}
+
+function canonicalTimestamp(timestamp: string): number {
+	return new Date(timestamp).getTime();
 }
 
 function encodeToolResultEntry(
