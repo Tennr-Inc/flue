@@ -391,12 +391,12 @@ describe('approved tool batch repair', () => {
 			value: true,
 		} satisfies ConversationRecord;
 		const appendCanonical = vi.fn(async (_records: ConversationRecord[]) => {});
-		const approvalBatchOutcomeRecords = new Map<string, ConversationRecord>([
+		const pendingToolOutcomeRecords = new Map<string, ConversationRecord>([
 			['call-ordinary', outcome],
 		]);
 		const fakeSession = {
 			appendCanonical,
-			approvalBatchOutcomeRecords,
+			pendingToolOutcomeRecords,
 			drainHookStateRecords: vi.fn(() => [stateWrite]),
 		};
 		const flushApprovalBatchBeforePark = Reflect.get(
@@ -408,7 +408,7 @@ describe('approved tool batch repair', () => {
 
 		expect(appendCanonical).toHaveBeenCalledTimes(1);
 		expect(appendCanonical).toHaveBeenCalledWith([outcome, stateWrite]);
-		expect(approvalBatchOutcomeRecords.size).toBe(0);
+		expect(pendingToolOutcomeRecords.size).toBe(0);
 	});
 
 	it('commits recovered outcomes, persistent state, and the batch marker atomically', async () => {

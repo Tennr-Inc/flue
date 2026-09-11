@@ -862,8 +862,8 @@ export class Session implements FlueSession, AgentSubmissionSession {
 	private approvalToolCalls = new Set<string>();
 	/** Approval snapshots created during the current Pi tool preflight. */
 	private approvalBatch = new Map<string, ToolApproval>();
-	/** Unguarded outcomes held so mixed-batch state can persist atomically before parking. */
-	private approvalBatchOutcomeRecords = new Map<string, ConversationRecord>();
+	/** Outcomes held until the batch settles so their state writes persist with them. */
+	private pendingToolOutcomeRecords = new Map<string, ConversationRecord>();
 	/** Set after a proposal is persisted; Pi must end the current turn here. */
 	private approvalParked = false;
 	/** True only after the durable submission claim has actually been released. */
@@ -2650,15 +2650,11 @@ export class Session implements FlueSession, AgentSubmissionSession {
 						...(result.terminate === true ? { terminate: true } : {}),
 						durationMs: toolDurationMs,
 					};
-					if (this.approvalParked) {
-						// A mixed batch must not persist this outcome separately from
-						// usePersistentState writes produced by the same parallel tools.
-						// Hold both until turn_end, then cross one SQLite transaction
-						// boundary before releasing the submission claim.
-						this.approvalBatchOutcomeRecords.set(event.toolCallId, outcomeRecord);
-					} else {
-						await this.appendCanonical([outcomeRecord]);
-					}
+					// A parallel sibling may still own writes that later setters depend
+					// on. Hold every outcome until turn_end, when all write scopes have
+					// settled, so recovery cannot preserve a successful outcome without
+					// its state (or persist state from an interrupted sibling).
+					this.pendingToolOutcomeRecords.set(event.toolCallId, outcomeRecord);
 					if (!call.startEmitted) {
 						this.emit(
 							{
@@ -2705,10 +2701,12 @@ export class Session implements FlueSession, AgentSubmissionSession {
 							throw new Error('[flue] Canonical tool results have no assistant request.');
 						if (this.approvalParked) await this.flushApprovalBatchBeforePark();
 						const conversation = await this.requireConversation();
-						const outcomeIds = event.toolResults.map((toolResult) =>
-							conversation.toolOutcomes.get(
-								toolOutcomeKey(assistantMessageId, toolResult.toolCallId),
-							),
+						const outcomeIds = event.toolResults.map(
+							(toolResult) =>
+								this.pendingToolOutcomeRecords.get(toolResult.toolCallId)?.id ??
+								conversation.toolOutcomes.get(
+									toolOutcomeKey(assistantMessageId, toolResult.toolCallId),
+								),
 						);
 						// An approval-blocked result exists only in Pi's transient event
 						// stream. Leave the batch partial so recovery can resolve the
@@ -2747,14 +2745,14 @@ export class Session implements FlueSession, AgentSubmissionSession {
 								reason: 'A committed canonical tool-result batch must contain at least one result.',
 							});
 						}
-						// Buffered usePersistentState writes land in the same append batch as the
-						// commit marker — one store.append, one durability point. If
-						// recovery settles this batch as interrupted, the writes never
-						// happened, exactly like the tool side effects they rode with.
+						// Outcomes, usePersistentState writes, and the commit marker share
+						// one store.append. Before it commits, recovery sees unresolved
+						// calls; afterward, every preserved outcome has its state too.
 						// (Signal appends never sit pending at turn boundaries:
 						// `ctx.append` exists only inside lifecycle callbacks, and each
 						// callback's own batch drains them before it returns.)
 						await this.appendCanonical([
+							...this.pendingToolOutcomeRecords.values(),
 							...this.drainHookStateRecords(),
 							{
 								...this.canonicalEnvelope(
@@ -2767,6 +2765,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 								outcomeIds: committedOutcomeIds,
 							},
 						]);
+						this.pendingToolOutcomeRecords.clear();
 						for (const toolResult of event.toolResults) {
 							this.pendingToolPublications.get(toolResult.toolCallId)?.();
 							this.pendingToolPublications.delete(toolResult.toolCallId);
@@ -4692,13 +4691,13 @@ export class Session implements FlueSession, AgentSubmissionSession {
 
 	/** Persist an approval-blocked batch's completed ordinary work before parking. */
 	private async flushApprovalBatchBeforePark(): Promise<void> {
-		const records = [...this.approvalBatchOutcomeRecords.values(), ...this.drainHookStateRecords()];
+		const records = [...this.pendingToolOutcomeRecords.values(), ...this.drainHookStateRecords()];
 		if (records.length === 0) return;
 		// Conversation append is one SQLite transaction in a Durable Object. A
 		// reset therefore leaves either both the ordinary outcomes and their state
 		// writes, or neither; recovery never observes one without the other.
 		await this.appendCanonical(records);
-		this.approvalBatchOutcomeRecords.clear();
+		this.pendingToolOutcomeRecords.clear();
 	}
 
 	/**
@@ -5472,6 +5471,10 @@ export class Session implements FlueSession, AgentSubmissionSession {
 				);
 				throw surfaced;
 			} finally {
+				// Failed prompt/skill operations must not carry buffered outcomes or
+				// publications into a later operation on the same session.
+				this.pendingToolOutcomeRecords.clear();
+				this.pendingToolPublications.clear();
 				operationSignal?.removeEventListener('abort', onAbort);
 				this.emit({ type: 'idle' });
 				this.activeOperationId = undefined;
@@ -6372,7 +6375,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 				this.approvalParked = false;
 				this.approvalToolCalls.clear();
 				this.approvalBatch.clear();
-				this.approvalBatchOutcomeRecords.clear();
+				this.pendingToolOutcomeRecords.clear();
 				await this.rebuildCanonicalContext();
 				await this.resumeConversationToCompletion(options);
 			}
@@ -6646,7 +6649,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 					this.approvalSubmissionParked = false;
 					this.approvalToolCalls.clear();
 					this.approvalBatch.clear();
-					this.approvalBatchOutcomeRecords.clear();
+					this.pendingToolOutcomeRecords.clear();
 				}
 			},
 		);
