@@ -21,6 +21,7 @@ import type { FlueObservation } from '../types.ts';
 import {
 	CONTENT_TRANSFORM_FAILED,
 	CONTENT_UNSERIALIZABLE,
+	contentSentinel,
 	MIN_BUDGET_BYTES,
 	truncateContent,
 } from './truncate.ts';
@@ -57,10 +58,17 @@ export interface GenAIContentScope {
 export type ContentTransform = (content: unknown, scope: GenAIContentScope) => unknown | undefined;
 
 /**
- * The whole content surface: `false` opts out, `{ transform }` is policy,
- * absent means content on with the safety net alone.
+ * `false` opts out, `transform` applies policy, and `maxBytes` caps each
+ * serialized attribute for receivers with tighter limits than the span pool.
+ * Absent means content on with the safety net alone.
  */
-export type ContentOption = false | { transform?: ContentTransform };
+export type ContentOption =
+	| false
+	| {
+			transform?: ContentTransform;
+			/** Per-attribute UTF-8 byte limit, clamped to [128, CONTENT_BUDGET_BYTES]. The shared ledger may impose a tighter limit. */
+			maxBytes?: number;
+	  };
 
 /**
  * 56 KiB — the per-span content pool, and the ceiling for any single
@@ -117,22 +125,37 @@ export function contentAttribute(
 		try {
 			value = policy.transform(structuredClone(content), contentScope(event, options));
 		} catch {
-			return { value: CONTENT_TRANSFORM_FAILED };
+			return failureAttribute(CONTENT_TRANSFORM_FAILED, options);
 		}
 		if (value === undefined) return {};
 	}
 	const objectShaped = isPlainObject(value);
-	const budget =
-		typeof options.maxBytes === 'number' && Number.isFinite(options.maxBytes)
-			? Math.min(Math.max(Math.floor(options.maxBytes), MIN_BUDGET_BYTES), CONTENT_BUDGET_BYTES)
-			: CONTENT_BUDGET_BYTES;
+	const budget = Math.min(clampBudget(options.maxBytes), clampBudget(policy?.maxBytes));
 	let serialized = serialize(value, options);
-	if (serialized === undefined) return { value: CONTENT_UNSERIALIZABLE };
+	if (serialized === undefined) return failureAttribute(CONTENT_UNSERIALIZABLE, options);
 	if (ENCODER.encode(serialized).byteLength > budget) {
 		serialized = serialize(truncateContent(value, { maxBytes: budget }), options);
-		if (serialized === undefined) return { value: CONTENT_UNSERIALIZABLE };
+		if (serialized === undefined) return failureAttribute(CONTENT_UNSERIALIZABLE, options);
 	}
 	return { value: serialized, objectShaped };
+}
+
+function clampBudget(maxBytes: number | undefined): number {
+	return typeof maxBytes === 'number' && Number.isFinite(maxBytes)
+		? Math.min(Math.max(Math.floor(maxBytes), MIN_BUDGET_BYTES), CONTENT_BUDGET_BYTES)
+		: CONTENT_BUDGET_BYTES;
+}
+
+function failureAttribute(text: string, options: ContentAttributeOptions): ContentAttributeResult {
+	const kind = options.contentType;
+	const value =
+		kind === 'input_messages' ||
+		kind === 'output_messages' ||
+		kind === 'tool_definitions' ||
+		kind === 'system_instructions'
+			? [contentSentinel(text, kind)]
+			: text;
+	return { value: serialize(value, options) };
 }
 
 /** Content types that describe the request; everything else records the outcome. */

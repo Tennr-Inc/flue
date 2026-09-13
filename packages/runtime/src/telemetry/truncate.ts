@@ -20,6 +20,8 @@ export const CONTENT_BUDGET_EXCEEDED = '[flue] content exceeds attribute budget'
 
 /** Sentinels must themselves fit, so pathologically small budgets are refused. */
 export const MIN_BUDGET_BYTES = 128;
+export type ContentArrayKind =
+	'input_messages' | 'output_messages' | 'tool_definitions' | 'system_instructions';
 /** Below this, string leaves stop being worth splitting and we bail instead. */
 const MIN_LEAF_BYTES = 64;
 
@@ -44,7 +46,10 @@ function measure(value: unknown): number | undefined {
 
 function fit(value: unknown, budget: number): unknown {
 	const size = measure(value);
-	if (size === undefined) return CONTENT_UNSERIALIZABLE;
+	if (size === undefined) {
+		const kind = Array.isArray(value) ? arrayKind(value) : undefined;
+		return kind ? [contentSentinel(CONTENT_UNSERIALIZABLE, kind)] : CONTENT_UNSERIALIZABLE;
+	}
 	if (size <= budget) return value;
 	if (typeof value === 'string') return truncateString(value, budget);
 	if (Array.isArray(value)) return truncateArray(value, budget);
@@ -90,10 +95,10 @@ function safeSlice(value: string, end: number): string {
  * Drop whole elements from the front (for messages: oldest first) until the
  * rest fits, then represent the drop as one sentinel element matching the
  * array's item shape. A single element that is itself over budget gets its
- * string leaves shrunk in place.
+ * content strings shrunk on a copy; tool definitions only shorten descriptions.
  */
 function truncateArray(value: unknown[], budget: number): unknown {
-	const messageShaped = isMessageArray(value);
+	const kind = arrayKind(value);
 	const items = [...value];
 	let droppedCount = 0;
 	let droppedBytes = 0;
@@ -101,31 +106,78 @@ function truncateArray(value: unknown[], budget: number): unknown {
 		const removed = items.shift();
 		droppedCount += 1;
 		droppedBytes += (measure(removed) ?? 0) + 1;
-		const candidate = [sentinelItem(messageShaped, droppedCount, droppedBytes), ...items];
+		const candidate = [sentinelItem(kind, droppedCount, droppedBytes), ...items];
 		const size = measure(candidate);
 		if (size !== undefined && size <= budget) return candidate;
 	}
-	const sentinel =
-		droppedCount > 0 ? sentinelItem(messageShaped, droppedCount, droppedBytes) : undefined;
+	const sentinel = droppedCount > 0 ? sentinelItem(kind, droppedCount, droppedBytes) : undefined;
 	const overhead = (sentinel ? (measure(sentinel) ?? 0) + 1 : 0) + 4;
 	// Shrink the last element only when a workable slice of the budget is left
 	// beside the sentinel, and re-measure the result: nested fit() calls bottom
 	// out in fixed-size markers that can overshoot a tight budget.
 	const innerBudget = budget - overhead;
 	if (innerBudget >= MIN_LEAF_BYTES) {
-		const shrunk = fit(items[0], innerBudget);
+		// A parameter schema is executable metadata: shortening its string
+		// leaves can corrupt refs, patterns, enums, or required property names.
+		const shrunk =
+			kind === 'tool_definitions'
+				? shrinkToolDescription(items[0], innerBudget)
+				: fit(items[0], innerBudget);
 		const candidate = sentinel ? [sentinel, shrunk] : [shrunk];
 		const size = measure(candidate);
-		if (size !== undefined && size <= budget) return candidate;
+		// Shrinking can return a diagnostic string when structure alone is too
+		// large or cloning fails. It must not become a structured array item.
+		if (size !== undefined && size <= budget && (!kind || arrayKind(candidate) === kind)) {
+			return candidate;
+		}
 	}
 	// Nothing fits beside the sentinel: count the last element as dropped too,
-	// and bail to the bare exceeded marker when even that sentinel is too big.
+	// then use a compact marker when the detailed sentinel is too big.
 	const allDropped = [
-		sentinelItem(messageShaped, droppedCount + 1, droppedBytes + (measure(items[0]) ?? 0) + 1),
+		sentinelItem(kind, droppedCount + 1, droppedBytes + (measure(items[0]) ?? 0) + 1),
 	];
 	const allDroppedSize = measure(allDropped);
 	if (allDroppedSize !== undefined && allDroppedSize <= budget) return allDropped;
+	// The compact typed marker fits the public 128-byte floor even when
+	// the detailed omission count (or output finish_reason) does not.
+	if (kind) {
+		const compact = [contentSentinel(CONTENT_BUDGET_EXCEEDED, kind)];
+		if ((measure(compact) ?? Infinity) <= budget) return compact;
+	}
 	return CONTENT_BUDGET_EXCEEDED;
+}
+
+function arrayKind(value: unknown[]): ContentArrayKind | undefined {
+	if (isMessageArray(value)) {
+		return isOutputMessageArray(value) ? 'output_messages' : 'input_messages';
+	}
+	if (value.length === 0) return undefined;
+	if (
+		value.every(
+			(item) => isRecord(item) && typeof item.type === 'string' && typeof item.name === 'string',
+		)
+	) {
+		return 'tool_definitions';
+	}
+	if (value.every((item) => isRecord(item) && typeof item.type === 'string')) {
+		return 'system_instructions';
+	}
+	return undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function shrinkToolDescription(value: unknown, budget: number): unknown {
+	if (!isRecord(value) || typeof value.description !== 'string') return CONTENT_BUDGET_EXCEEDED;
+	const clone = { ...value, description: '' };
+	const overhead = measure(clone);
+	if (overhead === undefined) return CONTENT_UNSERIALIZABLE;
+	const descriptionBudget = budget - overhead + 2; // Empty JSON string already counted.
+	if (descriptionBudget < MIN_LEAF_BYTES) return CONTENT_BUDGET_EXCEEDED;
+	clone.description = truncateString(value.description, descriptionBudget);
+	return clone;
 }
 
 function isMessageArray(value: unknown[]): boolean {
@@ -141,14 +193,47 @@ function isMessageArray(value: unknown[]): boolean {
 	);
 }
 
+function isOutputMessageArray(value: unknown[]): boolean {
+	return value.every(
+		(item) => typeof (item as { finish_reason?: unknown }).finish_reason === 'string',
+	);
+}
+
 /**
  * `role: 'flue'` is deliberate: honest, filterable, and never confused with a
  * real conversation turn.
  */
-function sentinelItem(messageShaped: boolean, count: number, bytes: number): unknown {
+function sentinelItem(kind: ContentArrayKind | undefined, count: number, bytes: number): unknown {
+	const messageShaped = kind === 'input_messages' || kind === 'output_messages';
 	const text = `[flue] ${count} ${messageShaped ? 'messages' : 'items'} omitted (${bytes} bytes) to fit the attribute budget`;
-	if (!messageShaped) return text;
-	return { role: 'flue', parts: [{ type: 'text', content: text }] };
+	return contentSentinel(text, kind);
+}
+
+/** In-band diagnostics retain the schema of the surrounding array. */
+export function contentSentinel(text: string, kind?: ContentArrayKind): unknown {
+	switch (kind) {
+		case 'input_messages':
+		case 'output_messages':
+			return messageSentinel(text, kind === 'output_messages');
+		case 'tool_definitions':
+			// A generic diagnostic definition, never an actual callable function.
+			return { type: 'flue', name: '[flue]', description: text };
+		case 'system_instructions':
+			return { type: 'text', content: text };
+		default:
+			return text;
+	}
+}
+
+/** A diagnostic is message content, never a bare string in a message array. */
+export function messageSentinel(text: string, output = false): unknown {
+	return {
+		role: 'flue',
+		parts: [{ type: 'text', content: text }],
+		// Output messages require a finish reason; this synthetic diagnostic
+		// does not describe a model generation, so leave the reason unknown.
+		...(output ? { finish_reason: '' } : {}),
+	};
 }
 
 /**

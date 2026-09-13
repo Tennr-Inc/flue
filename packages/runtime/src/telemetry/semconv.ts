@@ -17,8 +17,12 @@
  * hand schema-aware tooling a dead link with defined semantics.
  */
 export const GEN_AI_SEMCONV_REVISION = '4c8addb53718b544134be47e256237026fe88875';
-/** Bumped when the role/parts message projection changes shape. */
-export const GEN_AI_PROJECTION_REVISION = 5;
+/**
+ * Bumped when the content projection changes shape. Revision 7: tool
+ * definition and system instruction diagnostics retain their array item
+ * schemas; tool budgeting preserves names, types, and parameter schemas.
+ */
+export const GEN_AI_PROJECTION_REVISION = 7;
 /**
  * Bumped when the `flue.*` extension vocabulary changes. Revision 4: the
  * `flue.telemetry.content.<type>.truncated/.omitted` marker attributes are
