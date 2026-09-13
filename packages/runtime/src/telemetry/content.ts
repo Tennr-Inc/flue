@@ -22,6 +22,7 @@ import {
 	CONTENT_TRANSFORM_FAILED,
 	CONTENT_UNSERIALIZABLE,
 	MIN_BUDGET_BYTES,
+	messageSentinel,
 	truncateContent,
 } from './truncate.ts';
 
@@ -117,7 +118,7 @@ export function contentAttribute(
 		try {
 			value = policy.transform(structuredClone(content), contentScope(event, options));
 		} catch {
-			return { value: CONTENT_TRANSFORM_FAILED };
+			return failureAttribute(CONTENT_TRANSFORM_FAILED, options);
 		}
 		if (value === undefined) return {};
 	}
@@ -127,12 +128,21 @@ export function contentAttribute(
 			? Math.min(Math.max(Math.floor(options.maxBytes), MIN_BUDGET_BYTES), CONTENT_BUDGET_BYTES)
 			: CONTENT_BUDGET_BYTES;
 	let serialized = serialize(value, options);
-	if (serialized === undefined) return { value: CONTENT_UNSERIALIZABLE };
+	if (serialized === undefined) return failureAttribute(CONTENT_UNSERIALIZABLE, options);
 	if (ENCODER.encode(serialized).byteLength > budget) {
 		serialized = serialize(truncateContent(value, { maxBytes: budget }), options);
-		if (serialized === undefined) return { value: CONTENT_UNSERIALIZABLE };
+		if (serialized === undefined) return failureAttribute(CONTENT_UNSERIALIZABLE, options);
 	}
 	return { value: serialized, objectShaped };
+}
+
+function failureAttribute(text: string, options: ContentAttributeOptions): ContentAttributeResult {
+	const messages =
+		options.contentType === 'input_messages' || options.contentType === 'output_messages';
+	const value = messages
+		? [messageSentinel(text, options.contentType === 'output_messages')]
+		: text;
+	return { value: serialize(value, options) };
 }
 
 /** Content types that describe the request; everything else records the outcome. */

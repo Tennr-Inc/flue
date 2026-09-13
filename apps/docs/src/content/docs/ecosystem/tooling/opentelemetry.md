@@ -9,7 +9,7 @@ lastReviewedAt: 2026-07-21
 
 `@flue/opentelemetry` projects Flue's live runtime observations into standard OpenTelemetry GenAI spans and metrics. It does not configure an SDK, exporter, sampling, credentials, or deployment-specific flushing.
 
-The package implements the Development GenAI conventions pinned at commit `4c8addb53718b544134be47e256237026fe88875`. Its Flue-to-GenAI projection revision is `5` and its Flue extension revision is `4`; the vocabulary, projection, and revision constants live in `@flue/runtime/telemetry` and are shared verbatim with the [native Cloudflare tracing adapter](/docs/guide/cloudflare-target/#createcloudflaretracing), so a payload written for one backend reads identically on the other. Updating any revision requires an explicit compatibility review.
+The package implements the Development GenAI conventions pinned at commit `4c8addb53718b544134be47e256237026fe88875`. Its Flue-to-GenAI projection revision is `6` and its Flue extension revision is `4`; the vocabulary, projection, and revision constants live in `@flue/runtime/telemetry` and are shared verbatim with the [native Cloudflare tracing adapter](/docs/guide/cloudflare-target/#createcloudflaretracing), so a payload written for one backend reads identically on the other. Updating any revision requires an explicit compatibility review.
 
 ## Configure
 
@@ -64,6 +64,8 @@ const instrumentation = createOpenTelemetryInstrumentation({
 ```
 
 A detached converted value passes through `transform` once per content type; returning `undefined` omits that content, and a throwing transform emits a `[flue]` failure sentinel instead of the unredacted value. `scope` carries the content type, event type, execution identity, and `traceId`/`spanId`. For byte budgets, slice inside the transform or use the exported `truncateContent(content, { maxBytes })`. After the transform, a 56 KiB per-span content budget is enforced **in-band**: everything content-bearing a span carries — messages, system instructions, tool definitions and payloads, exception message/stack — shares one pool, with a reserve held so response content has room beside large prompts. Payloads stay valid JSON, oldest messages drop first behind a `role: "flue"` sentinel message, and oversized strings are cut with a `[flue:truncated, …]` suffix — there are no side-channel truncation marker attributes; search payloads for `[flue]` instead.
+
+Message fallbacks retain the message-array shape, including when serialization fails or a single message cannot fit after truncation. Their diagnostic text lives in a text part under `role: "flue"`; synthetic output diagnostics include an empty `finish_reason` because no model finish reason applies. At tight budgets, the detailed omission count may be replaced with a compact budget diagnostic. Custom transforms that reshape content must preserve the schema of the corresponding GenAI attribute.
 
 Object-shaped tool arguments/results use standard `gen_ai.tool.call.*` attributes; other shapes use `flue.tool.call.arguments` or `flue.tool.call.result` under the same policy.
 

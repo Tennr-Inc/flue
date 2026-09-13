@@ -44,7 +44,11 @@ function measure(value: unknown): number | undefined {
 
 function fit(value: unknown, budget: number): unknown {
 	const size = measure(value);
-	if (size === undefined) return CONTENT_UNSERIALIZABLE;
+	if (size === undefined) {
+		return Array.isArray(value) && isMessageArray(value)
+			? [messageSentinel(CONTENT_UNSERIALIZABLE, isOutputMessageArray(value))]
+			: CONTENT_UNSERIALIZABLE;
+	}
 	if (size <= budget) return value;
 	if (typeof value === 'string') return truncateString(value, budget);
 	if (Array.isArray(value)) return truncateArray(value, budget);
@@ -94,6 +98,7 @@ function safeSlice(value: string, end: number): string {
  */
 function truncateArray(value: unknown[], budget: number): unknown {
 	const messageShaped = isMessageArray(value);
+	const output = messageShaped && isOutputMessageArray(value);
 	const items = [...value];
 	let droppedCount = 0;
 	let droppedBytes = 0;
@@ -101,12 +106,12 @@ function truncateArray(value: unknown[], budget: number): unknown {
 		const removed = items.shift();
 		droppedCount += 1;
 		droppedBytes += (measure(removed) ?? 0) + 1;
-		const candidate = [sentinelItem(messageShaped, droppedCount, droppedBytes), ...items];
+		const candidate = [sentinelItem(messageShaped, droppedCount, droppedBytes, output), ...items];
 		const size = measure(candidate);
 		if (size !== undefined && size <= budget) return candidate;
 	}
 	const sentinel =
-		droppedCount > 0 ? sentinelItem(messageShaped, droppedCount, droppedBytes) : undefined;
+		droppedCount > 0 ? sentinelItem(messageShaped, droppedCount, droppedBytes, output) : undefined;
 	const overhead = (sentinel ? (measure(sentinel) ?? 0) + 1 : 0) + 4;
 	// Shrink the last element only when a workable slice of the budget is left
 	// beside the sentinel, and re-measure the result: nested fit() calls bottom
@@ -116,15 +121,30 @@ function truncateArray(value: unknown[], budget: number): unknown {
 		const shrunk = fit(items[0], innerBudget);
 		const candidate = sentinel ? [sentinel, shrunk] : [shrunk];
 		const size = measure(candidate);
-		if (size !== undefined && size <= budget) return candidate;
+		// fit() can return a diagnostic string when the message's structure
+		// alone is too large or cloning fails. It must not become a message.
+		if (size !== undefined && size <= budget && (!messageShaped || isMessageArray(candidate))) {
+			return candidate;
+		}
 	}
 	// Nothing fits beside the sentinel: count the last element as dropped too,
-	// and bail to the bare exceeded marker when even that sentinel is too big.
+	// then use a compact marker when the detailed sentinel is too big.
 	const allDropped = [
-		sentinelItem(messageShaped, droppedCount + 1, droppedBytes + (measure(items[0]) ?? 0) + 1),
+		sentinelItem(
+			messageShaped,
+			droppedCount + 1,
+			droppedBytes + (measure(items[0]) ?? 0) + 1,
+			output,
+		),
 	];
 	const allDroppedSize = measure(allDropped);
 	if (allDroppedSize !== undefined && allDroppedSize <= budget) return allDropped;
+	// The compact message marker fits the public 128-byte floor even when
+	// the detailed omission count (or output finish_reason) does not.
+	if (messageShaped) {
+		const compact = [messageSentinel(CONTENT_BUDGET_EXCEEDED, output)];
+		if ((measure(compact) ?? Infinity) <= budget) return compact;
+	}
 	return CONTENT_BUDGET_EXCEEDED;
 }
 
@@ -141,14 +161,36 @@ function isMessageArray(value: unknown[]): boolean {
 	);
 }
 
+function isOutputMessageArray(value: unknown[]): boolean {
+	return value.every(
+		(item) => typeof (item as { finish_reason?: unknown }).finish_reason === 'string',
+	);
+}
+
 /**
  * `role: 'flue'` is deliberate: honest, filterable, and never confused with a
  * real conversation turn.
  */
-function sentinelItem(messageShaped: boolean, count: number, bytes: number): unknown {
+function sentinelItem(
+	messageShaped: boolean,
+	count: number,
+	bytes: number,
+	output: boolean,
+): unknown {
 	const text = `[flue] ${count} ${messageShaped ? 'messages' : 'items'} omitted (${bytes} bytes) to fit the attribute budget`;
 	if (!messageShaped) return text;
-	return { role: 'flue', parts: [{ type: 'text', content: text }] };
+	return messageSentinel(text, output);
+}
+
+/** A diagnostic is message content, never a bare string in a message array. */
+export function messageSentinel(text: string, output = false): unknown {
+	return {
+		role: 'flue',
+		parts: [{ type: 'text', content: text }],
+		// Output messages require a finish reason; this synthetic diagnostic
+		// does not describe a model generation, so leave the reason unknown.
+		...(output ? { finish_reason: '' } : {}),
+	};
 }
 
 /**

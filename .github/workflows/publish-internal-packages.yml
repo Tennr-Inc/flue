@@ -65,7 +65,7 @@ jobs:
         run: pnpm --filter @flue/runtime --filter @flue/sdk --filter @flue/vite --filter @flue/opentelemetry check:types
 
       - name: Test packages with test suites
-        run: pnpm --filter @flue/runtime --filter @flue/sdk test
+        run: pnpm --filter @flue/runtime --filter @flue/sdk --filter @flue/opentelemetry test
 
       - name: Test internal package preparation
         run: pnpm release:internal:test
