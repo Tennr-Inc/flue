@@ -219,14 +219,15 @@ export function projectConversationUi(
 ): ConversationUiSnapshot {
 	const messages: ConversationUiMessage[] = [];
 	const byId = new Map<string, ConversationUiMessage>();
-	// One UI message per assistant response (the UIMessage ecosystem shape):
-	// every assistant step of a tracked submission folds into the submission's
-	// first assistant message, parts accumulating across steps in record order.
+	// One UI message per contiguous assistant response segment (the UIMessage
+	// ecosystem shape): model steps within a segment fold into its first
+	// assistant message, while a user message starts a new segment.
 	const responseBySubmission = new Map<string, ConversationUiMessage>();
 	for (const entry of getActiveConversationPath(conversation)) {
 		if (entry.type !== 'message') continue;
 		const projected = projectCompletedMessage(entry);
 		if (projected) {
+			if (projected.role === 'user') responseBySubmission.clear();
 			if (projected.role === 'assistant' && projected.submissionId) {
 				const open = responseBySubmission.get(projected.submissionId);
 				if (open) {
@@ -308,9 +309,9 @@ export function projectConversationUi(
 }
 
 /**
- * Fold a later assistant step of the same submission into its response
- * message: parts append in record order; identity fields (id, turnId) stay
- * the first step's.
+ * Fold a later assistant step in the same response segment into its message:
+ * parts append in record order; identity fields (id, turnId) stay the first
+ * step's.
  */
 function mergeAssistantContinuation(
 	open: ConversationUiMessage,

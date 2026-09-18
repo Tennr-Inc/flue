@@ -267,26 +267,36 @@ export function projectAgentConversationBatch(options: {
 }
 
 /**
- * Map each tracked submission to its response message id — the first
- * assistant messageId recorded for the submission. Chunk encoding rewrites
- * every assistant-scoped record onto this id so the live stream assembles the
- * same one-message-per-response shape the snapshot projection produces (a
- * later step's `message-started` then dedupes client-side and its parts
- * accumulate on the open message).
+ * Match the snapshot's contiguous response segments, preserving user-message
+ * boundaries while still combining model steps within each segment.
  */
-function buildResponseMessageIndex(conversation: ReducedConversationState): Map<string, string> {
-	const first = new Map<string, string>();
+function buildResponseMessageIndex(conversation: ReducedConversationState): {
+	byMessage: Map<string, string>;
+	bySubmission: Map<string, Set<string>>;
+} {
+	const byMessage = new Map<string, string>();
+	const bySubmission = new Map<string, Set<string>>();
+	const open = new Map<string, string>();
+	const add = (id: string, submissionId: string, canContinue = true) => {
+		const anchor = (canContinue ? open.get(submissionId) : undefined) ?? id;
+		byMessage.set(id, anchor);
+		open.set(submissionId, anchor);
+		const segments = bySubmission.get(submissionId) ?? new Set<string>();
+		segments.add(anchor);
+		bySubmission.set(submissionId, segments);
+	};
 	for (const entry of getActiveConversationPath(conversation)) {
-		if (entry.type !== 'message' || entry.message.role !== 'assistant' || !entry.submissionId) {
-			continue;
+		if (entry.type !== 'message') continue;
+		if (entry.message.role === 'user') open.clear();
+		if (entry.message.role === 'assistant' && entry.submissionId) {
+			add(entry.id, entry.submissionId);
 		}
-		if (!first.has(entry.submissionId)) first.set(entry.submissionId, entry.id);
 	}
 	for (const message of conversation.inProgressMessages.values()) {
-		if (!message.submissionId || first.has(message.submissionId)) continue;
-		first.set(message.submissionId, message.messageId);
+		if (!message.submissionId) continue;
+		add(message.messageId, message.submissionId, message.parentId === conversation.activeLeafId);
 	}
-	return first;
+	return { byMessage, bySubmission };
 }
 
 /**
@@ -318,12 +328,10 @@ function encodeRecord(
 	record: ConversationRecord,
 	conversationId: string,
 	state: ReducedInstanceState,
-	responseIds: Map<string, string>,
+	responseIds: ReturnType<typeof buildResponseMessageIndex>,
 ): ConversationStreamChunkBody[] {
-	// Assistant records of a tracked submission address the submission's
-	// response message, not the per-step canonical message.
 	const uiMessageId = (messageId: string): string =>
-		(record.submissionId ? responseIds.get(record.submissionId) : undefined) ?? messageId;
+		responseIds.byMessage.get(messageId) ?? messageId;
 	switch (record.type) {
 		case 'user_message':
 			return [
@@ -390,13 +398,23 @@ function encodeRecord(
 				},
 			];
 		case 'message_metadata': {
-			const messageId = record.submissionId ? responseIds.get(record.submissionId) : undefined;
-			return messageId
-				? [{ type: 'message-metadata', conversationId, messageId, metadata: record.metadata }]
-				: [];
+			if (!record.submissionId) return [];
+			const messageIds = responseIds.bySubmission.get(record.submissionId) ?? [];
+			return [...messageIds].map((messageId) => ({
+				type: 'message-metadata',
+				conversationId,
+				messageId,
+				metadata: record.metadata,
+			}));
 		}
 		case 'message_data_write': {
-			const messageId = record.submissionId ? responseIds.get(record.submissionId) : undefined;
+			if (!record.submissionId) return [];
+			// Named data retains its canonical first-write anchor across steering.
+			const conversation = state.conversations.get(conversationId);
+			const part = conversation?.responseDataParts
+				.get(record.submissionId)
+				?.find((value) => value.name === record.name);
+			const messageId = part?.anchorEntryId ? uiMessageId(part.anchorEntryId) : undefined;
 			return messageId
 				? [{ type: 'data-part', conversationId, messageId, name: record.name, data: record.data }]
 				: [];
