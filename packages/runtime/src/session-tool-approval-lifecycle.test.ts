@@ -8,12 +8,16 @@ import {
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createFlueContext } from './client.ts';
 import { ConversationRecordWriter } from './conversation-writer.ts';
+import { SubmissionAbortedError } from './errors.ts';
 import type { Harness } from './harness.ts';
 import { useAgentFinish } from './hooks/use-agent-finish.ts';
 import { useModel } from './hooks/use-model.ts';
 import { usePersistentState } from './hooks/use-persistent-state.ts';
 import { useResponseFinish } from './hooks/use-response-finish.ts';
+import { useSandbox } from './hooks/use-sandbox.ts';
 import { useTool } from './hooks/use-tool.ts';
+import { instrument } from './instrumentation.ts';
+import { local } from './node/index.ts';
 import { ensureInstanceIdentity, processSubmission } from './runtime/agent-submissions.ts';
 import { InMemoryAttachmentStore } from './runtime/attachment-store.ts';
 import { SqliteConversationStreamStore } from './runtime/conversation-stream-store.ts';
@@ -70,9 +74,11 @@ async function createFixture() {
 	const submissions = createSqlAgentExecutionStoreFromSql(sql, transaction, {
 		toolApprovals: true,
 	});
+	const stream = new SqliteConversationStreamStore(sql, transaction);
+	const path = agentStreamPath('TestAgent', 'instance-1');
 	const writer = await ConversationRecordWriter.create({
-		store: new SqliteConversationStreamStore(sql, transaction),
-		path: agentStreamPath('TestAgent', 'instance-1'),
+		store: stream,
+		path,
 		identity: { agentName: 'TestAgent', instanceId: 'instance-1' },
 		producerId: 'test',
 	});
@@ -80,7 +86,7 @@ async function createFixture() {
 	setProvider(model.provider);
 	let attemptNumber = 0;
 
-	async function attempt(agent: Agent) {
+	async function attempt(agent: Agent, signal?: AbortSignal) {
 		if (attemptNumber === 0) {
 			await ensureInstanceIdentity(writer, agent, undefined);
 			await submissions.admitDirect({
@@ -102,6 +108,7 @@ async function createFixture() {
 		expect(submission).not.toBeNull();
 		if (!submission) throw new Error('Expected a claimable submission.');
 		await processSubmission({
+			signal,
 			submissions,
 			submission,
 			resolveAgent: () => agent,
@@ -127,7 +134,7 @@ async function createFixture() {
 			},
 		});
 		const current = await submissions.getSubmission('submission-1');
-		expect(current?.error).toBeUndefined();
+		if (!signal?.aborted) expect(current?.error).toBeUndefined();
 		return current;
 	}
 
@@ -153,10 +160,144 @@ async function createFixture() {
 		await submissions.markSubmissionCanonicalReady('joined-1');
 	}
 
-	return { model, submissions, writer, attempt, decide, join };
+	return {
+		model,
+		submissions,
+		writer,
+		attempt,
+		decide,
+		join,
+		async records() {
+			return (await stream.read(path)).batches.flatMap((batch) => batch.records);
+		},
+	};
 }
 
 describe('tool approval lifecycle', () => {
+	it.each([false, true])(
+		'settles approval placeholders before an aborted batch continues (unstarted sibling=%s)',
+		async (withUnstartedSibling) => {
+			const fixture = await createFixture();
+			const controller = new AbortController();
+			const started = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const finished = Promise.withResolvers<void>();
+			const guarded = vi.fn(() => ({ output: 'must not run' }));
+			const unstarted = vi.fn(async () => ({ content: [], details: {} }));
+			const observedErrors: unknown[] = [];
+			const dispose = instrument({
+				dispose() {},
+				observe() {},
+				async interceptor(_operation, _context, next) {
+					try {
+						return await next();
+					} catch (error) {
+						observedErrors.push(error);
+						throw error;
+					}
+				},
+			});
+			function TestAgent() {
+				useModel('faux/faux-1', { compaction: false });
+				const [, setPhase] = usePersistentState('phase', 'initial');
+				useTool({
+					name: 'guarded',
+					description: 'Requires an explicit approval.',
+					version: '1',
+					approval: { required: true },
+					run: guarded,
+				});
+				useSandbox({
+					...local(),
+					tools: () => [
+						{
+							name: 'completed',
+							label: 'Completed',
+							description: 'Persist a completed sibling write.',
+							parameters: { type: 'object', properties: {} },
+							executionMode: 'sequential',
+							async execute() {
+								setPhase('completed');
+								return { content: [{ type: 'text', text: 'saved' }], details: {} };
+							},
+						},
+						{
+							name: 'slow',
+							label: 'Slow',
+							description: 'Ignore cancellation and attempt a late write.',
+							parameters: { type: 'object', properties: {} },
+							executionMode: 'sequential',
+							async execute() {
+								setPhase('must not persist');
+								started.resolve();
+								await release.promise;
+								setPhase('late write must not persist');
+								finished.resolve();
+								return { content: [], details: {} };
+							},
+						},
+						{
+							name: 'unstarted',
+							label: 'Unstarted',
+							description: 'Must not execute after cancellation.',
+							parameters: { type: 'object', properties: {} },
+							execute: unstarted,
+						},
+					],
+				});
+				return 'Run the requested tools.';
+			}
+			fixture.model.setResponses([
+				toolRequest(
+					fauxToolCall('completed', {}, { id: 'completed' }),
+					fauxToolCall('guarded', {}, { id: 'guarded' }),
+					fauxToolCall('slow', {}, { id: 'slow' }),
+					...(withUnstartedSibling ? [fauxToolCall('unstarted', {}, { id: 'unstarted' })] : []),
+				),
+			]);
+			try {
+				const running = fixture.attempt(TestAgent, controller.signal);
+				await started.promise;
+				controller.abort(new SubmissionAbortedError());
+				expect(await running).toMatchObject({
+					status: 'settled',
+					error: 'Submission was aborted.',
+				});
+				release.resolve();
+				await finished.promise;
+				expect(guarded).not.toHaveBeenCalled();
+				expect(unstarted).not.toHaveBeenCalled();
+				expect(
+					observedErrors.filter(
+						(error) => error instanceof Error && error.name === 'ConversationRecordInvariantError',
+					),
+				).toEqual([]);
+				expect(await fixture.submissions.listToolApprovals?.('submission-1')).toMatchObject([
+					{ status: 'aborted' },
+				]);
+				const reduced = await fixture.writer.loadReducedState();
+				expect(reduced.state.get('phase')).toBe('completed');
+				const records = await fixture.records();
+				expect(records.filter((record) => record.type === 'tool_outcome')).toHaveLength(
+					withUnstartedSibling ? 4 : 3,
+				);
+				expect(records.filter((record) => record.type === 'tool_results_committed')).toHaveLength(
+					1,
+				);
+				expect(records.filter((record) => record.type === 'submission_settled')).toMatchObject([
+					{ outcome: 'aborted' },
+				]);
+				expect(records.filter((record) => record.type === 'state_write')).toMatchObject([
+					{ value: 'completed' },
+				]);
+			} finally {
+				controller.abort();
+				release.resolve();
+				await dispose();
+			}
+		},
+	);
+
 	it('refreshes instructions, tool availability, and closures after a recovered state write', async () => {
 		const fixture = await createFixture();
 		const readPhase = vi.fn();

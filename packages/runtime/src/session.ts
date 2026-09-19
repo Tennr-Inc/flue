@@ -2709,7 +2709,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 				}
 				case 'turn_end': {
 					const turnId = this.activeTurnId ?? generateTurnId();
-					if (await this.completeAbortedPartialToolBatch(event.toolResults, signal)) {
+					if (await this.completeAbortedUncommittedToolBatch(event.toolResults, signal)) {
 						throw abortErrorFor(signal);
 					}
 					const committedToolResults = event.toolResults.length > 0;
@@ -3398,7 +3398,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		assistantMessageId: string,
 		call: { id: string; name: string },
 	): ConversationRecord {
-		return this.approvalFailureOutcomeRecord(
+		const outcome = this.approvalFailureOutcomeRecord(
 			assistantMessageId,
 			call,
 			JSON.stringify({
@@ -3407,6 +3407,13 @@ export class Session implements FlueSession, AgentSubmissionSession {
 					'Approved tool execution was interrupted before completion. The outcome is unknown; the tool was not executed again.',
 			}),
 		);
+		// Terminal cleanup can run in a fresh Session after this repair commits.
+		// Use the same durable interruption marker as ordinary repaired calls,
+		// so it can recover the unknown-outcome advisory without parsing text.
+		return {
+			...outcome,
+			id: `record_tool_repair_outcome_${encodeCanonicalId(assistantMessageId)}_${encodeCanonicalId(call.id)}`,
+		};
 	}
 
 	private approvalFailureOutcomeRecord(
@@ -4065,12 +4072,13 @@ export class Session implements FlueSession, AgentSubmissionSession {
 
 	/**
 	 * Pi may stop a sequential tool batch after an abort, emitting only the
-	 * results completed before the signal reached the executor. Finish that
-	 * batch before the abort enters Pi's failure-assistant path: canonical tool
-	 * batches commit atomically, and a partial commit would leave the failure
-	 * assistant with no valid parent.
+	 * results completed before the signal reached the executor. Approval-blocked
+	 * placeholders also leave a batch uncommitted, even if Pi reports every call.
+	 * Finish the batch before the abort enters Pi's failure-assistant path:
+	 * canonical tool batches commit atomically, and a partial commit would
+	 * leave the failure assistant with no valid parent.
 	 */
-	private async completeAbortedPartialToolBatch(
+	private async completeAbortedUncommittedToolBatch(
 		toolResults: readonly ToolResultMessage[],
 		signal: AbortSignal,
 	): Promise<boolean> {
@@ -4090,9 +4098,13 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		}
 
 		const calls = request.message.content.filter((block) => block.type === 'toolCall');
+		const hasApprovalPlaceholder = toolResults.some((result) =>
+			this.approvalToolCalls.has(result.toolCallId),
+		);
 		if (
-			toolResults.length >= calls.length ||
-			!this.arePartialToolResultsRecordedInCallOrder(
+			toolResults.length > calls.length ||
+			(toolResults.length === calls.length && !hasApprovalPlaceholder) ||
+			!this.areToolResultsAccountedForInCallOrder(
 				assistantMessageId,
 				calls,
 				toolResults,
@@ -4117,7 +4129,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		return true;
 	}
 
-	private arePartialToolResultsRecordedInCallOrder(
+	private areToolResultsAccountedForInCallOrder(
 		assistantMessageId: string,
 		calls: ReadonlyArray<{ id: string; name: string }>,
 		results: readonly ToolResultMessage[],
@@ -4130,7 +4142,9 @@ export class Session implements FlueSession, AgentSubmissionSession {
 				call?.id === result.toolCallId &&
 				call.name === result.toolName &&
 				(conversation.toolOutcomes.has(toolOutcomeKey(assistantMessageId, result.toolCallId)) ||
-					(pending?.type === 'tool_outcome' && pending.assistantMessageId === assistantMessageId))
+					(pending?.type === 'tool_outcome' && pending.assistantMessageId === assistantMessageId) ||
+					// Pi's approval placeholder has no canonical outcome until settlement.
+					this.approvalToolCalls.has(result.toolCallId))
 			);
 		});
 	}
@@ -4410,11 +4424,16 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		// contract of terminalization, not a caller responsibility: every
 		// terminal path (retry exhaustion, timeout, post-input interruption,
 		// abort) routes through here.
-		await this.settleDanglingConversationState({ submissionId: input.submissionId });
+		const settledTools = await this.settleDanglingConversationState({
+			submissionId: input.submissionId,
+		});
 		// Abort repair can be committed by the attempt's Session before terminal
 		// cleanup opens this fresh one. Recover interrupted IDs from deterministic
 		// repair records rather than relying on in-memory handoff or result text.
-		const interruptedTools = await this.recordedInterruptedTools(input.submissionId);
+		const recordedTools = await this.recordedInterruptedTools(input.submissionId);
+		const interruptedTools = [
+			...new Map([...recordedTools, ...settledTools].map((call) => [call.id, call])).values(),
+		];
 		let body = input.message;
 		if (interruptedTools.length > 0) {
 			const toolList = interruptedTools.map((t) => `  - ${t.name} (${t.id})`).join('\n');
