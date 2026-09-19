@@ -14,6 +14,7 @@
  */
 import type { Ai } from '@cloudflare/workers-types';
 import type {
+	AnthropicEffort,
 	AnthropicOptions,
 	AssistantMessage,
 	Context,
@@ -22,6 +23,7 @@ import type {
 	Provider,
 	ProviderStreams,
 	SimpleStreamOptions,
+	ThinkingLevel,
 	Tool,
 	ToolCall,
 	Usage,
@@ -366,6 +368,8 @@ function isAbortError(error: unknown): boolean {
 interface CloudflareBindingStreamConfig {
 	gateway: CloudflareGatewayOptions | undefined;
 	streamIdleTimeoutMs: number;
+	/** Anthropic prompt-cache retention for the binding's Anthropic path. */
+	cacheRetention: 'none' | 'short' | 'long';
 }
 
 /**
@@ -630,13 +634,14 @@ function streamCloudflareWorkersAi(
 				const delta = choice.delta;
 				if (!delta) continue;
 
-				if (delta.content !== null && delta.content !== undefined && delta.content.length > 0) {
+				const textDelta = normalizeAssistantContent(delta.content);
+				if (textDelta !== undefined && textDelta.length > 0) {
 					const block = ensureTextBlock();
-					block.text += delta.content;
+					block.text += textDelta;
 					stream.push({
 						type: 'text_delta',
 						contentIndex: indexOf(block),
-						delta: delta.content,
+						delta: textDelta,
 						partial: output,
 					});
 				}
@@ -731,6 +736,34 @@ function streamCloudflareWorkersAi(
 	return stream;
 }
 
+/**
+ * Map a thinking level to Anthropic's adaptive-thinking effort. The binding
+ * path calls pi-ai's low-level stream directly, which applies `effort` only
+ * when it is set — pi's `streamSimple` is the only path that maps `reasoning`
+ * to an effort, and this provider does not call it. Mirrors pi's
+ * `mapThinkingLevelToEffort`: a string in the model's `thinkingLevelMap` wins;
+ * otherwise `minimal`/`low` map to `low`, `medium` to `medium`, and everything
+ * else to `high`.
+ */
+function mapThinkingLevelToEffort(
+	model: Model<'anthropic-messages'>,
+	level: ThinkingLevel,
+): AnthropicEffort {
+	const mapped = model.thinkingLevelMap?.[level];
+	if (typeof mapped === 'string') return mapped as AnthropicEffort;
+	switch (level) {
+		case 'minimal':
+		case 'low':
+			return 'low';
+		case 'medium':
+			return 'medium';
+		case 'high':
+			return 'high';
+		default:
+			return 'high';
+	}
+}
+
 function streamCloudflareAnthropicAi(
 	ai: Ai,
 	binding: CloudflareBindingStreamConfig,
@@ -739,16 +772,26 @@ function streamCloudflareAnthropicAi(
 	options?: SimpleStreamOptions,
 ) {
 	warnZeroMetadataGatewayModel(model);
-	const anthropicModel = toAnthropicGatewayModel(model);
+	const anthropicModel = toAnthropicGatewayModel(model, binding.cacheRetention);
 	const client = createAnthropicBindingClient(ai, model, options, binding);
+
+	// pi-ai's low-level stream writes `output_config: { effort }` only when
+	// `effort` is set — the thinking level arrives as `options.reasoning`, which
+	// only its `streamSimple` path maps to an effort. Map it here so
+	// `thinkingLevel` takes effect on adaptive-thinking models.
+	const effort =
+		options?.reasoning && anthropicModel.compat?.forceAdaptiveThinking === true
+			? mapThinkingLevelToEffort(anthropicModel, options.reasoning)
+			: undefined;
 
 	// The lazy shim types options as plain StreamOptions; the impl receives
 	// the Anthropic-specific fields (client, thinkingEnabled) verbatim.
 	const anthropicOptions: AnthropicOptions = {
 		...options,
 		client,
-		cacheRetention: 'none',
+		cacheRetention: binding.cacheRetention,
 		thinkingEnabled: Boolean(options?.reasoning),
+		...(effort ? { effort } : {}),
 		onPayload: async (payload, payloadModel) => {
 			const normalized = normalizeAnthropicGatewayPayload(payload as Record<string, unknown>);
 			const overridden = await options?.onPayload?.(normalized, payloadModel);
@@ -869,9 +912,7 @@ function streamCloudflareResponsesAi(
 				observeResponsesEvents(
 					iterateSseChunks(withStreamIdleDeadline(response.body, binding.streamIdleTimeoutMs)),
 					observed,
-				) as Parameters<
-					typeof processResponsesStream
-				>[0],
+				) as Parameters<typeof processResponsesStream>[0],
 				output,
 				stream,
 				responsesModel,
@@ -1058,13 +1099,25 @@ function unsupportedWireFormatStream(model: Model<Api>) {
 	return stream;
 }
 
-function toAnthropicGatewayModel(model: Model<Api>): Model<'anthropic-messages'> {
+function toAnthropicGatewayModel(
+	model: Model<Api>,
+	cacheRetention: 'none' | 'short' | 'long',
+): Model<'anthropic-messages'> {
+	// The binding dialect forwards `cache_control` on message blocks and tools
+	// to Anthropic, so tool markers are safe to emit when caching is on; the
+	// 1-hour TTL (`supportsLongCacheRetention`) was not verified against the
+	// binding, so 'long' falls back to the 5-minute TTL via pi's own compat
+	// check. `sendSessionAffinityHeaders` is off because flue sends the
+	// affinity header itself (buildExtraHeaders) — and a stable sessionId is
+	// what makes the cache reusable across turns.
+	const caching = cacheRetention !== 'none';
 	return {
 		...model,
 		api: 'anthropic-messages',
 		baseUrl: '',
 		compat: {
-			supportsCacheControlOnTools: false,
+			...model.compat,
+			supportsCacheControlOnTools: caching,
 			supportsEagerToolInputStreaming: false,
 			supportsLongCacheRetention: false,
 			sendSessionAffinityHeaders: false,
@@ -1155,6 +1208,19 @@ async function assertSuccessfulBindingResponse(response: Response): Promise<void
 	});
 }
 
+function normalizeAssistantContent(value: unknown): string | undefined {
+	if (value === null || value === undefined) return undefined;
+	if (typeof value === 'string') return value;
+	const received = Array.isArray(value)
+		? 'an array'
+		: typeof value === 'object'
+			? 'an object'
+			: `a value of type ${typeof value}`;
+	throw new CloudflareAIBindingError({
+		message: `Cloudflare AI binding returned invalid choices[0].delta.content: expected a string, null, or an omitted field; received ${received}.`,
+	});
+}
+
 function pickReasoning(delta: ChatCompletionDelta): { field: string; text: string } | null {
 	for (const field of ['reasoning_content', 'reasoning'] as const) {
 		const value = delta[field];
@@ -1224,6 +1290,16 @@ export interface CloudflareAIBinding {
 	): Promise<Response | Record<string, unknown>>;
 }
 
+/**
+ * Anthropic prompt-cache retention for the binding's Anthropic path
+ * (`anthropic/…` gateway models). The Workers AI binding forwards
+ * `cache_control` on message blocks and tools to Anthropic, so opt-in caching
+ * serves repeated prefixes at the cached input rate instead of full price.
+ * `'long'` requests the 1-hour TTL where the platform supports it. Default
+ * `'none'` keeps the current behavior (no cache markers).
+ */
+export type CloudflareCacheRetention = 'none' | 'short' | 'long';
+
 export interface CloudflareBindingProviderOptions {
 	/** The captured `env.AI` reference. */
 	binding: CloudflareAIBinding;
@@ -1248,6 +1324,15 @@ export interface CloudflareBindingProviderOptions {
 	 * keepalives nor reasoning deltas stream. `0` disables the guard.
 	 */
 	streamIdleTimeoutMs?: number;
+	/**
+	 * Anthropic prompt-cache retention for `anthropic/…` models routed
+	 * through the binding. Default `'none'` matches the current behavior (no
+	 * `cache_control` markers); opt in with `'short'` (5-minute TTL) or
+	 * `'long'` (1-hour TTL where supported) to cache repeated prefixes and
+	 * pay the cached input rate on cache hits. Requires the agent to send a
+	 * stable `sessionId` so the binding can reuse the cache across turns.
+	 */
+	cacheRetention?: CloudflareCacheRetention;
 }
 
 /**
@@ -1271,6 +1356,7 @@ export function cloudflareBindingProvider(options: CloudflareBindingProviderOpti
 	const binding: CloudflareBindingStreamConfig = {
 		gateway,
 		streamIdleTimeoutMs: options.streamIdleTimeoutMs ?? DEFAULT_STREAM_IDLE_TIMEOUT_MS,
+		cacheRetention: options.cacheRetention ?? 'none',
 	};
 	const ai = options.binding as Ai;
 	const stream = (model: Model<Api>, context: Context, streamOptions?: SimpleStreamOptions) =>
@@ -1326,9 +1412,6 @@ function gatewayCatalogModels(): Model<Api>[] {
 					id: `${vendor}/${model.id}`,
 					provider: 'cloudflare',
 					baseUrl: '',
-					// The gateway branches own compat: `toAnthropicGatewayModel`
-					// replaces it, and the binding applies session affinity itself.
-					compat: undefined,
 				},
 			];
 		});

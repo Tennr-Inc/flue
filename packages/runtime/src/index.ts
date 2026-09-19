@@ -1,6 +1,7 @@
 /// <reference path="../types/skill-md.d.ts" />
 /// <reference path="../types/markdown-md.d.ts" />
 
+export { ToolTimeoutError } from './abort.ts';
 // The standard model-facing tools, one factory per tool. Compose them in a
 // SandboxFactory's `tools` list to add, drop, or swap tools without
 // rebuilding the set; omit `tools` entirely for the framework default.
@@ -76,7 +77,13 @@ export { defineSubagent, GeneralSubagent, useSubagent } from './hooks/use-subage
 export { useTool } from './hooks/use-tool.ts';
 export { type FlueInstrumentation, instrument } from './instrumentation.ts';
 export type { JsonValue } from './json-snapshot.ts';
-export type { McpAuth, McpConnection, McpConnectionDefinition, McpTransport } from './mcp.ts';
+export type {
+	McpAuth,
+	McpConnection,
+	McpConnectionDefinition,
+	McpToolAnnotations,
+	McpTransport,
+} from './mcp.ts';
 export { createMcpConnection } from './mcp.ts';
 export type {
 	AgentAppendMessage,
@@ -100,7 +107,7 @@ export {
 	resolveToolApproval,
 	type ToolApprovalResolutionInput,
 } from './runtime/flue-app.ts';
-export { setProvider } from './runtime/providers.ts';
+export { isDynamicModel, setProvider } from './runtime/providers.ts';
 export type { AgentIdentityBinding } from './runtime/registration.ts';
 export { __flueBindAgentModule } from './runtime/registration.ts';
 export { setToolApprovalProvider } from './runtime/tool-approval-provider.ts';

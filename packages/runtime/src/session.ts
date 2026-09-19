@@ -1,4 +1,5 @@
 import type { McpUnavailableConnection } from './mcp-types.ts';
+import { modelContextCompactionFields } from './model-request-info.ts';
 /**
  * Internal session implementation. Not exported publicly — user code receives
  * the facade from `createPublicSession()`, which exposes exactly the
@@ -26,7 +27,7 @@ import type {
 	UserMessage,
 } from '@earendil-works/pi-ai';
 import type * as v from 'valibot';
-import { abandonToolOnAbort, abortErrorFor, createCallHandle } from './abort.ts';
+import { abandonToolOnAbort, abortErrorFor, createCallHandle, ToolTimeoutError } from './abort.ts';
 import {
 	createActivateSkillTool,
 	createBashTool,
@@ -114,6 +115,11 @@ import {
 	redactObservationDetailImages,
 } from './event-redaction.ts';
 import { type FlueExecutionContext, interceptExecution } from './execution-interceptor.ts';
+import {
+	EMPTY_HARNESS_TOOL_LINEAGE,
+	enterHarnessTool,
+	type HarnessToolLineage,
+} from './harness-tool-lineage.ts';
 import { resolveSubagentDefinition } from './hooks/render.ts';
 import type { HookStateBuffer, HookStateWrite } from './hooks/use-persistent-state.ts';
 import { cloneJsonSerializable } from './json-snapshot.ts';
@@ -246,13 +252,6 @@ const MAX_TRANSIENT_MODEL_RETRIES = 3;
 const MAX_AGENT_FINISH_CYCLES = 32;
 const TRANSIENT_MODEL_RETRY_BASE_DELAY_MS = 2_000;
 
-class ToolExecutionTimeoutError extends Error {
-	constructor(timeoutMs: number) {
-		super(`Tool execution timed out after ${timeoutMs}ms.`);
-		this.name = 'ToolExecutionTimeoutError';
-	}
-}
-
 type TurnInputMessage = Extract<
 	FlueEvent,
 	{ type: 'turn_request' }
@@ -286,6 +285,10 @@ function toolResultText(value: AgentToolResult<any>): unknown {
 	const content = value.content;
 	if (content.length === 1 && content[0]?.type === 'text') return content[0].text;
 	return content;
+}
+
+function truncatedToolCallError(toolName: string): string {
+	return `Tool call "${toolName}" was not executed: the response hit the output token limit, so its arguments may be truncated. Re-issue the tool call with complete arguments.`;
 }
 
 type ProviderTextOrImageContent = Exclude<UserMessage['content'], string>[number];
@@ -393,6 +396,7 @@ export type CreateTaskSession = (options: CreateTaskSessionOptions) => Promise<S
 interface CreateActionHarnessOptions {
 	invocationId: string;
 	depth: number;
+	activeHarnessTools: HarnessToolLineage;
 	signal?: AbortSignal;
 	executionContext: FlueExecutionContext;
 	eventCallback?: FlueEventInputCallback;
@@ -420,6 +424,8 @@ interface SessionInitOptions {
 	config: AgentConfig;
 	onAgentEvent?: FlueEventInputCallback;
 	agentTools?: ToolDefinition[];
+	/** Harness tools already active on this delegation branch. */
+	activeHarnessTools?: HarnessToolLineage;
 	/** Optional MCP connections that failed to resolve at initialization. */
 	mcpUnavailable?: McpUnavailableConnection[];
 	delegationDepth?: number;
@@ -744,6 +750,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 	private modelRetryAbortController: AbortController | undefined;
 	private eventCallback: FlueEventInputCallback | undefined;
 	private agentTools: ToolDefinition[];
+	private activeHarnessTools: HarnessToolLineage;
 	/**
 	 * Optional MCP connections that failed to resolve when this submission
 	 * initialized, announced once per session before the model's first turn.
@@ -762,6 +769,8 @@ export class Session implements FlueSession, AgentSubmissionSession {
 	private activeTurnId: string | undefined;
 	/** Per-turn request telemetry, set at `turn_request` and cleared at the turn's end. */
 	private modelRequests = new Map<string, { info: ModelRequestInfo; startedAt: number }>();
+	/** Whether the current effective agent context includes a canonical compaction summary. */
+	private contextCompacted = false;
 	private activeTasks = new Set<Session>();
 	private activeActionHarnesses = new Set<ActionHarness>();
 	private delegationDepth: number;
@@ -2131,6 +2140,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 
 	private modelRequestInfo(
 		model: Model<any> | undefined,
+		purpose: 'agent' | 'compaction' | 'compaction_prefix',
 		options?: SimpleStreamOptions,
 	): ModelRequestInfo {
 		if (!model) throw new Error('[flue] Missing configured model for turn telemetry.');
@@ -2145,6 +2155,10 @@ export class Session implements FlueSession, AgentSubmissionSession {
 			reasoningLevel: options?.reasoning,
 			maxTokens: options?.maxTokens,
 			temperature: options?.temperature,
+			// Persistent context property, not a "just compacted" pulse. Internal
+			// summarization calls never carry it, even when compacting an already
+			// compacted conversation.
+			...modelContextCompactionFields(purpose, this.contextCompacted),
 		};
 	}
 
@@ -2164,7 +2178,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 			description: tool.description,
 			parameters: tool.parameters,
 		}));
-		const request = this.modelRequestInfo(model, options);
+		const request = this.modelRequestInfo(model, purpose, options);
 		this.modelRequests.set(turnId, { info: request, startedAt: Date.now() });
 		this.emit({
 			type: 'turn_request',
@@ -2236,6 +2250,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 			rm: (path, rmOptions) => this.env.rm(path, rmOptions),
 		};
 		this.agentTools = options.agentTools ?? [];
+		this.activeHarnessTools = options.activeHarnessTools ?? EMPTY_HARNESS_TOOL_LINEAGE;
 		this.mcpUnavailable = options.mcpUnavailable ?? [];
 		this.delegationDepth = options.delegationDepth ?? 0;
 		this.createTaskSession = options.createTaskSession;
@@ -2321,7 +2336,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		});
 
 		this.eventCallback = options.onAgentEvent;
-		this.agentLoop.subscribe(async (event) => {
+		this.agentLoop.subscribe(async (event, signal) => {
 			switch (event.type) {
 				case 'agent_start':
 					this.emit({ type: 'agent_start' });
@@ -2392,7 +2407,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 						]);
 					} else if (assistant && aEvent.type === 'text_delta') {
 						const block = assistant.blocks.get(aEvent.contentIndex);
-						if (!block || block.type !== 'text')
+						if (block?.type !== 'text')
 							throw new Error('[flue] Canonical text delta has no started block.');
 						this.enqueueCanonical(
 							[
@@ -2409,7 +2424,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 						);
 					} else if (assistant && aEvent.type === 'text_end') {
 						const block = assistant.blocks.get(aEvent.contentIndex);
-						if (!block || block.type !== 'text')
+						if (block?.type !== 'text')
 							throw new Error('[flue] Canonical text completion has no started block.');
 						const content = aEvent.partial.content[aEvent.contentIndex];
 						await this.flushCanonical();
@@ -2446,7 +2461,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 						this.emit({ type: 'thinking_start', contentIndex: aEvent.contentIndex });
 					} else if (assistant && aEvent.type === 'thinking_delta') {
 						const block = assistant.blocks.get(aEvent.contentIndex);
-						if (!block || block.type !== 'reasoning')
+						if (block?.type !== 'reasoning')
 							throw new Error('[flue] Canonical reasoning delta has no started block.');
 						this.enqueueCanonical(
 							[
@@ -2468,7 +2483,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 						);
 					} else if (assistant && aEvent.type === 'thinking_end') {
 						const block = assistant.blocks.get(aEvent.contentIndex);
-						if (!block || block.type !== 'reasoning')
+						if (block?.type !== 'reasoning')
 							throw new Error('[flue] Canonical reasoning completion has no started block.');
 						const content = aEvent.partial.content[aEvent.contentIndex];
 						await this.flushCanonical();
@@ -2583,7 +2598,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 						}
 						const request =
 							this.modelRequests.get(turnId)?.info ??
-							this.modelRequestInfo(this.agentLoop.state.model);
+							this.modelRequestInfo(this.agentLoop.state.model, 'agent');
 						this.emitTurn(turnId, 'agent', event.message, request);
 						this.modelRequests.delete(turnId);
 					}
@@ -2694,6 +2709,9 @@ export class Session implements FlueSession, AgentSubmissionSession {
 				}
 				case 'turn_end': {
 					const turnId = this.activeTurnId ?? generateTurnId();
+					if (await this.completeAbortedPartialToolBatch(event.toolResults, signal)) {
+						throw abortErrorFor(signal);
+					}
 					const committedToolResults = event.toolResults.length > 0;
 					if (committedToolResults) {
 						const parentId = await this.conversationWriter.getConversationLeaf(this.conversationId);
@@ -2702,7 +2720,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 						const assistantMessageId = this.canonicalToolRequestMessageId;
 						if (!assistantMessageId)
 							throw new Error('[flue] Canonical tool results have no assistant request.');
-						if (this.approvalParked) await this.flushApprovalBatchBeforePark();
+						if (this.approvalParked) await this.flushPendingToolOutcomes();
 						const conversation = await this.requireConversation();
 						const outcomeIds = event.toolResults.map(
 							(toolResult) =>
@@ -2769,10 +2787,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 							},
 						]);
 						this.pendingToolOutcomeRecords.clear();
-						for (const toolResult of event.toolResults) {
-							this.pendingToolPublications.get(toolResult.toolCallId)?.();
-							this.pendingToolPublications.delete(toolResult.toolCallId);
-						}
+						this.publishPendingToolResults(event.toolResults);
 						this.lastCommittedToolBatch = {
 							assistantMessageId,
 							toolCallId: finalToolResult.toolCallId,
@@ -2873,11 +2888,11 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		input: AgentSubmissionInput,
 		options?: ProcessAgentSubmissionOptions,
 	): CallHandle<void> {
-		return createCallHandle(undefined, (signal) =>
-			this.runOperation('prompt', signal, () =>
+		return createCallHandle(undefined, async (signal) => {
+			await this.runOperation('prompt', signal, () =>
 				this.runPersistedSubmissionInput(input, signal, options),
-			),
-		);
+			);
+		});
 	}
 
 	/**
@@ -2923,21 +2938,35 @@ export class Session implements FlueSession, AgentSubmissionSession {
 			}
 			return;
 		}
-		// Subagent recovery (Model B): resolve any unresolved `task` calls in this
-		// batch by resuming their in-flight children in-process, BEFORE the atomic
-		// commit, so the committed outcome is the real child result rather than an
-		// interrupted marker. Sequential and pre-commit by design (see plan §P1.4).
-		const resolvedOutcomes = new Map<string, ConversationRecord>();
-		if (await this.resolveApprovalToolCalls(conversation, partial, signal, resolvedOutcomes))
-			return;
-		for (const [toolCallId, outcome] of await this.resumeUnresolvedTaskCalls(
-			conversation,
-			partial,
-			signal,
-		)) {
-			resolvedOutcomes.set(toolCallId, outcome);
+		// A length-truncated call was deliberately NOT executed by Pi because its
+		// salvaged arguments may be incomplete. Recreate Pi's synthetic failures
+		// during repair; never route these calls through task or durable-tool
+		// recovery, which could execute the unsafe arguments after a restart.
+		let resolvedOutcomes: Map<string, ConversationRecord>;
+		if (partial.assistant.stopReason === 'length') {
+			resolvedOutcomes = new Map(
+				partial.toolCalls.map((toolCall) => [
+					toolCall.id,
+					this.truncatedToolCallOutcomeRecord(partial.entryId, toolCall),
+				]),
+			);
+		} else {
+			// Subagent recovery (Model B): resolve any unresolved `task` calls in this
+			// batch by resuming their in-flight children in-process, BEFORE the atomic
+			// commit, so the committed outcome is the real child result rather than an
+			// interrupted marker. Sequential and pre-commit by design (see plan §P1.4).
+			resolvedOutcomes = new Map<string, ConversationRecord>();
+			if (await this.resolveApprovalToolCalls(conversation, partial, signal, resolvedOutcomes))
+				return;
+			for (const [toolCallId, outcome] of await this.resumeUnresolvedTaskCalls(
+				conversation,
+				partial,
+				signal,
+			)) {
+				resolvedOutcomes.set(toolCallId, outcome);
+			}
+			await this.resumeDurableToolCalls(conversation, partial, signal, resolvedOutcomes);
 		}
-		await this.resumeDurableToolCalls(conversation, partial, signal, resolvedOutcomes);
 		await this.appendRepairedToolResultBatch(
 			partial.entryId,
 			partial.toolCalls,
@@ -3212,7 +3241,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		signal: AbortSignal,
 	): Promise<ConversationRecord> {
 		const toolDef = this.agentTools.find((candidate) => candidate.name === call.name);
-		if (!toolDef || !toolDef.approval?.required) {
+		if (!toolDef?.approval?.required) {
 			return this.approvalFailureOutcomeRecord(
 				partial.entryId,
 				call,
@@ -3322,7 +3351,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 							const invocationSignal = toolSignal ?? signal;
 							const invocationId = toolDef.harness ? generateInvocationId() : undefined;
 							const harness = invocationId
-								? this.createInvocationHarness(invocationId, invocationSignal)
+								? this.createInvocationHarness(invocationId, invocationSignal, toolDef)
 								: undefined;
 							try {
 								const context = createParsedToolContext(
@@ -3408,7 +3437,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		let timedOut = false;
 		const timer = setTimeout(() => {
 			timedOut = true;
-			timeoutController.abort(new ToolExecutionTimeoutError(toolDef.timeoutMs as number));
+			timeoutController.abort(new ToolTimeoutError(toolDef.name, toolDef.timeoutMs as number));
 		}, toolDef.timeoutMs);
 		const effectiveSignal = signal
 			? AbortSignal.any([signal, timeoutController.signal])
@@ -3417,7 +3446,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 			return await abandonToolOnAbort(() => run(effectiveSignal), effectiveSignal);
 		} catch (error) {
 			if (signal?.aborted) throw error;
-			if (timedOut) throw new ToolExecutionTimeoutError(toolDef.timeoutMs);
+			if (timedOut) throw new ToolTimeoutError(toolDef.name, toolDef.timeoutMs);
 			throw error;
 		} finally {
 			clearTimeout(timer);
@@ -3441,10 +3470,26 @@ export class Session implements FlueSession, AgentSubmissionSession {
 			scope.commit();
 			return result;
 		} catch (error) {
-			if (signal?.aborted || error instanceof ToolExecutionTimeoutError) scope.discard();
+			if (signal?.aborted || error instanceof ToolTimeoutError) scope.discard();
 			else scope.commit();
 			throw error;
 		}
+	}
+
+	private truncatedToolCallOutcomeRecord(
+		assistantEntryId: string,
+		toolCall: { id: string; name: string },
+	): ConversationRecord {
+		const key = `${encodeCanonicalId(assistantEntryId)}_${encodeCanonicalId(toolCall.id)}`;
+		return {
+			...this.canonicalEnvelope('tool_outcome', `record_tool_truncated_outcome_${key}`),
+			type: 'tool_outcome',
+			assistantMessageId: assistantEntryId,
+			toolCallId: toolCall.id,
+			toolName: toolCall.name,
+			isError: true,
+			content: [{ type: 'text', text: truncatedToolCallError(toolCall.name) }],
+		};
 	}
 
 	/**
@@ -3567,7 +3612,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 				this.runWithToolTimeout(toolDef, signal, async (toolSignal) => {
 					const invocationId = toolDef.harness ? generateInvocationId() : undefined;
 					harness = invocationId
-						? this.createInvocationHarness(invocationId, toolSignal)
+						? this.createInvocationHarness(invocationId, toolSignal, toolDef)
 						: undefined;
 					const parsed = parseToolInput(toolDef, params, toolSignal, {
 						log,
@@ -3738,14 +3783,14 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		conversation: ReducedConversationState,
 		resolved: Map<string, ConversationRecord>,
 	): Promise<void> {
-		// The commit invariant demands the toolUse assistant still be the leaf
+		// The commit invariant demands the tool-call assistant still be the leaf
 		// (the reducer would reject the commit anyway) — a buried batch cannot
 		// be repaired, and a silent skip here would resume into a turn replay
 		// that re-executes recorded tool calls. `settleTrailingToolBatch`
 		// pre-checks this exact condition before calling.
 		if (conversation.activeLeafId !== assistantEntryId) {
 			throw new Error(
-				'[flue] Cannot repair the trailing tool batch: its toolUse assistant is no longer the conversation leaf — an entry was appended before repair.',
+				'[flue] Cannot repair the trailing tool batch: its tool-call assistant is no longer the conversation leaf — an entry was appended before repair.',
 			);
 		}
 		const finalToolCall = toolCalls.at(-1);
@@ -3843,7 +3888,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		toolCallId: string,
 		record: ConversationRecord | undefined,
 	): void {
-		if (!record || record.type !== 'tool_outcome') return;
+		if (record?.type !== 'tool_outcome') return;
 		this.emit({
 			type: 'tool',
 			toolName: record.toolName,
@@ -4019,6 +4064,85 @@ export class Session implements FlueSession, AgentSubmissionSession {
 	}
 
 	/**
+	 * Pi may stop a sequential tool batch after an abort, emitting only the
+	 * results completed before the signal reached the executor. Finish that
+	 * batch before the abort enters Pi's failure-assistant path: canonical tool
+	 * batches commit atomically, and a partial commit would leave the failure
+	 * assistant with no valid parent.
+	 */
+	private async completeAbortedPartialToolBatch(
+		toolResults: readonly ToolResultMessage[],
+		signal: AbortSignal,
+	): Promise<boolean> {
+		const assistantMessageId = this.canonicalToolRequestMessageId;
+		if (!signal.aborted || !assistantMessageId) return false;
+
+		const conversation = await this.requireConversation();
+		const request = conversation.entries.get(assistantMessageId);
+		if (
+			conversation.activeLeafId !== assistantMessageId ||
+			request?.type !== 'message' ||
+			request.submissionId !== this.activeSubmissionId ||
+			request.message.role !== 'assistant' ||
+			request.message.stopReason !== 'toolUse'
+		) {
+			return false;
+		}
+
+		const calls = request.message.content.filter((block) => block.type === 'toolCall');
+		if (
+			toolResults.length >= calls.length ||
+			!this.arePartialToolResultsRecordedInCallOrder(
+				assistantMessageId,
+				calls,
+				toolResults,
+				conversation,
+			)
+		) {
+			return false;
+		}
+
+		// Unlike upstream, this fork buffers live outcomes until their state can
+		// commit with them. Preserve both before synthesizing interrupted results.
+		await this.flushPendingToolOutcomes();
+		await this.settleTrailingToolBatch({ submissionId: this.activeSubmissionId });
+		// Writes buffered inside the interrupted batch did not reach its normal
+		// commit point and must not leak into Pi's failure-assistant turn.
+		this.hookState?.drain();
+		this.canonicalToolRequestMessageId = undefined;
+		this.lastCommittedToolBatch = undefined;
+		this.activeJoinSource = undefined;
+		this.activeJoinSignal = undefined;
+		this.publishPendingToolResults(toolResults);
+		return true;
+	}
+
+	private arePartialToolResultsRecordedInCallOrder(
+		assistantMessageId: string,
+		calls: ReadonlyArray<{ id: string; name: string }>,
+		results: readonly ToolResultMessage[],
+		conversation: ReducedConversationState,
+	): boolean {
+		return results.every((result, index) => {
+			const call = calls[index];
+			const pending = this.pendingToolOutcomeRecords.get(result.toolCallId);
+			return (
+				call?.id === result.toolCallId &&
+				call.name === result.toolName &&
+				(conversation.toolOutcomes.has(toolOutcomeKey(assistantMessageId, result.toolCallId)) ||
+					(pending?.type === 'tool_outcome' && pending.assistantMessageId === assistantMessageId))
+			);
+		});
+	}
+
+	private publishPendingToolResults(results: readonly ToolResultMessage[]): void {
+		for (const result of results) {
+			this.pendingToolPublications.get(result.toolCallId)?.();
+			this.pendingToolPublications.delete(result.toolCallId);
+		}
+	}
+
+	/**
 	 * Marker-settle the trailing uncommitted tool batch so the conversation can
 	 * come to rest. Recorded outcomes are preserved first-write-wins; every
 	 * unresolved call gets an explicit unknown-outcome error — never a
@@ -4027,7 +4151,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 	 * settled with interrupted markers.
 	 *
 	 * Settleable by construction: `tool_results_committed` is all-or-nothing,
-	 * so a partial batch is always uncommitted and its toolUse assistant is
+	 * so a partial batch is always uncommitted and its tool-call assistant is
 	 * still the active leaf (nothing can follow it until commit), which
 	 * satisfies the commit-parent invariant. Deliberately NOT run at resume
 	 * entry — a resumed attempt's trailing batch is live work that
@@ -4242,6 +4366,40 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		};
 	}
 
+	private async recordedInterruptedTools(
+		submissionId: string,
+	): Promise<ReadonlyArray<InterruptedToolCallRef>> {
+		const conversation = await this.requireConversation();
+		const interrupted: InterruptedToolCallRef[] = [];
+		for (const entry of getActiveConversationPath(conversation)) {
+			if (
+				entry.type !== 'message' ||
+				entry.submissionId !== submissionId ||
+				entry.message.role !== 'assistant'
+			) {
+				continue;
+			}
+			for (const call of entry.message.content) {
+				if (call.type !== 'toolCall') continue;
+				const result = conversation.entries.get(toolResultEntryId(entry.id, call.id));
+				if (result?.type !== 'message' || result.message.role !== 'toolResult') continue;
+				const repair = await this.conversationWriter.getRecord(
+					`record_tool_repair_outcome_${encodeCanonicalId(entry.id)}_${encodeCanonicalId(call.id)}`,
+				);
+				if (
+					repair?.type === 'tool_outcome' &&
+					repair.conversationId === this.conversationId &&
+					repair.toolName === call.name &&
+					repair.isError &&
+					result.message.isError
+				) {
+					interrupted.push({ name: call.name, id: call.id });
+				}
+			}
+		}
+		return interrupted;
+	}
+
 	async recordSubmissionTerminal(
 		input: AgentSubmissionInterruption,
 	): Promise<ReadonlyArray<InterruptedToolCallRef>> {
@@ -4252,9 +4410,11 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		// contract of terminalization, not a caller responsibility: every
 		// terminal path (retry exhaustion, timeout, post-input interruption,
 		// abort) routes through here.
-		const interruptedTools = await this.settleDanglingConversationState({
-			submissionId: input.submissionId,
-		});
+		await this.settleDanglingConversationState({ submissionId: input.submissionId });
+		// Abort repair can be committed by the attempt's Session before terminal
+		// cleanup opens this fresh one. Recover interrupted IDs from deterministic
+		// repair records rather than relying on in-memory handoff or result text.
+		const interruptedTools = await this.recordedInterruptedTools(input.submissionId);
 		let body = input.message;
 		if (interruptedTools.length > 0) {
 			const toolList = interruptedTools.map((t) => `  - ${t.name} (${t.id})`).join('\n');
@@ -4699,8 +4859,8 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		await this.submissionStore?.markToolApprovalProjected?.(approval.proposalId, 'requested');
 	}
 
-	/** Persist an approval-blocked batch's completed ordinary work before parking. */
-	private async flushApprovalBatchBeforePark(): Promise<void> {
+	/** Persist completed outcomes and their state together before parking or abort repair. */
+	private async flushPendingToolOutcomes(): Promise<void> {
 		const records = [...this.pendingToolOutcomeRecords.values(), ...this.drainHookStateRecords()];
 		if (records.length === 0) return;
 		// Conversation append is one SQLite transaction in a Durable Object. A
@@ -4865,7 +5025,11 @@ export class Session implements FlueSession, AgentSubmissionSession {
 	 * Callers must remove it from {@link activeActionHarnesses} and `close()`
 	 * it when the run settles.
 	 */
-	private createInvocationHarness(invocationId: string, signal?: AbortSignal): ActionHarness {
+	private createInvocationHarness(
+		invocationId: string,
+		signal?: AbortSignal,
+		tool?: ToolDefinition,
+	): ActionHarness {
 		if (!this.createActionHarness) {
 			throw new Error('[flue] This session cannot run harness-connected tools.');
 		}
@@ -4875,6 +5039,9 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		const harness = this.createActionHarness({
 			invocationId,
 			depth: this.delegationDepth + 1,
+			activeHarnessTools: tool
+				? enterHarnessTool(this.activeHarnessTools, tool)
+				: this.activeHarnessTools,
 			signal,
 			executionContext: this.executionIdentity,
 			eventCallback: this.eventCallback,
@@ -4967,7 +5134,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 							// never collide with a prior attempt's retained conversations).
 							const invocationId = toolDef.harness ? generateInvocationId() : undefined;
 							const harness = invocationId
-								? this.createInvocationHarness(invocationId, toolSignal)
+								? this.createInvocationHarness(invocationId, toolSignal, toolDef)
 								: undefined;
 							try {
 								const context = harness
@@ -5737,6 +5904,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 			},
 		});
 		this.agentLoop.state.messages = messages;
+		this.contextCompacted = getLatestConversationCompaction(conversation) !== undefined;
 	}
 
 	// ─── Model-turn recovery and compaction ───────────────────────────────────
@@ -5809,11 +5977,15 @@ export class Session implements FlueSession, AgentSubmissionSession {
 				// The turn the previous iteration ran settled. This exits before
 				// the halt checks so a deadline that expired during the final
 				// turn cannot discard its result.
-				if (assistant !== undefined) {
-					await this.checkCompaction(assistant);
-					if (assistant.stopReason === 'error' || assistant.stopReason === 'aborted') {
-						await this.rebuildCanonicalContext();
-					}
+				const settledAssistant =
+					assistant ??
+					(this.agentLoop.state.messages.findLast((message) => message.role === 'assistant') as
+						AssistantMessage | undefined);
+				if (settledAssistant !== undefined) {
+					await this.checkCompaction(settledAssistant);
+				}
+				if (assistant?.stopReason === 'error' || assistant?.stopReason === 'aborted') {
+					await this.rebuildCanonicalContext();
 				}
 				return;
 			}
@@ -5828,7 +6000,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 
 			if (overflow && assistant !== undefined) {
 				overflowRecoveryAttempted = true;
-				this.internalLog('info', '[flue:compaction] Overflow detected, compacting and retrying...');
+				this.internalLog('info', '[flue:compaction] Overflow detected, compacting...');
 				await this.rebuildCanonicalContext();
 				if (!(await this.runCompaction('overflow'))) {
 					if (!turnCompleted && options.resume) {
@@ -5839,6 +6011,10 @@ export class Session implements FlueSession, AgentSubmissionSession {
 					}
 					return;
 				}
+				// A completed assistant remains the canonical leaf after rebuilding,
+				// so it cannot be continued. Preserve its response and the compaction
+				// for future turns; only provider errors need an immediate retry.
+				if (assistant.stopReason !== 'error') return;
 				this.internalLog('info', '[flue:compaction] Retrying after overflow recovery...');
 				start = continueRebuilt;
 			} else if (retryable && assistant !== undefined) {
@@ -5988,7 +6164,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 				return false;
 			}
 			const firstKeptEntry = contextEntries[preparation.firstKeptIndex]?.sourceEntry;
-			if (!firstKeptEntry || firstKeptEntry.type !== 'message') {
+			if (firstKeptEntry?.type !== 'message') {
 				this.internalLog(
 					'info',
 					'[flue:compaction] Nothing to compact (first kept message has no entry)',
@@ -6229,7 +6405,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		input: AgentSubmissionInput,
 		signal: AbortSignal,
 		options?: ProcessAgentSubmissionOptions,
-	): Promise<void> {
+	): Promise<{ text: string } | undefined> {
 		const message = input.message;
 		this.activeAgentInput =
 			message.kind === 'user'
@@ -6322,7 +6498,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 	 * Repair phase of the resume seam: classify the persisted state after the
 	 * input and repair the conversation TAIL — upgrade a continuable aborted
 	 * partial, repair a trailing (partial or unresolved) tool batch — BEFORE
-	 * anything else appends. Repair requires the interrupted toolUse assistant
+	 * anything else appends. Repair requires the interrupted tool-call assistant
 	 * (or aborted partial) to still be the conversation leaf, so at every
 	 * ownership seam the order is converge → repair → only then append/steer/
 	 * drive; structural convergence (`materializeGhostStream`) is the only
@@ -6431,16 +6607,16 @@ export class Session implements FlueSession, AgentSubmissionSession {
 			case 'resume': {
 				// Divergence preserved from before consolidation (see
 				// submission-state.ts): a completed response flagged as silent
-				// overflow is compacted and continued here, while inspection
-				// reports it 'completed'. A completed-terminal-batch response
+				// overflow is compacted and settled here, while inspection reports
+				// it 'completed'. A completed-terminal-batch response
 				// (`terminalToolBatch`) always lands in this break — its trailing
 				// tool batch already ended the turn (live terminate semantics),
 				// so settlement proceeds with no further model call.
 				if (state.kind === 'completed' && !state.overflow) break;
 				// Recovery for the persisted trailing assistant (overflow
-				// compaction, transient-retry backoff) happens inside the turn
-				// loop, which evaluates the resume assistant before its first
-				// `continue()`.
+				// compaction — settling completed responses and retrying provider
+				// errors — or transient-retry backoff) happens inside the turn loop,
+				// which evaluates the resume assistant before any continuation.
 				await this.runModelTurnWithRecovery({
 					start: () => this.agentLoop.continue(),
 					signal: options.signal,
@@ -6564,7 +6740,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		submissionAttempt?: import('./agent-execution-store.ts').SubmissionAttemptRef;
 		joinSource?: SubmissionJoinSource;
 		signal: AbortSignal;
-	}): Promise<void> {
+	}): Promise<{ text: string } | undefined> {
 		return this.withCallOverrides(
 			{
 				tools: [],
@@ -6646,6 +6822,9 @@ export class Session implements FlueSession, AgentSubmissionSession {
 					});
 					if (this.approvalParked) return;
 					await this.flushResponseOutput();
+					// Keep the public submission call void, but return the completed text
+					// through runOperation so terminal telemetry can project agentOutput.
+					return { text: this.getAssistantText() };
 				} finally {
 					// A failed attempt drops its unflushed signal appends (they never
 					// happened, like the state writes and tool batch they rode with)

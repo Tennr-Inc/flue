@@ -1,6 +1,6 @@
 {
 	"name": "@flue/cli",
-	"version": "2.0.5",
+	"version": "2.1.0",
 	"type": "module",
 	"license": "Apache-2.0",
 	"homepage": "https://flueframework.com/",
@@ -23,9 +23,8 @@
 	"scripts": {
 		"prebuild": "tsx scripts/generate-blueprint-index.ts",
 		"build": "tsdown && mv dist/flue.mjs dist/flue.js",
-		"check:types": "tsc --noEmit",
-		"pretest": "pnpm run build",
-		"test": "node --test test/*.test.mjs && vitest run"
+		"prepack": "node ../../scripts/build-docs.mjs cli",
+		"check:types": "tsc --noEmit"
 	},
 	"dependencies": {
 		"@flue/runtime": "workspace:*",

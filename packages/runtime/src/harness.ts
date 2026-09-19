@@ -6,6 +6,7 @@ import { discoverSessionContext } from './context.ts';
 import type { ConversationRecordWriter } from './conversation-writer.ts';
 import { SessionNotFoundError } from './errors.ts';
 import type { FlueExecutionContext } from './execution-interceptor.ts';
+import { EMPTY_HARNESS_TOOL_LINEAGE, type HarnessToolLineage } from './harness-tool-lineage.ts';
 import type { HookStateBuffer } from './hooks/use-persistent-state.ts';
 import type { McpUnavailableConnection } from './mcp-types.ts';
 import type { AgentOutputChannel } from './message-output.ts';
@@ -52,6 +53,8 @@ export interface HarnessOptions {
 	env: Sandbox | undefined;
 	eventCallback?: FlueEventInputCallback;
 	agentTools: ToolDefinition[];
+	/** Harness tools already active on this delegation branch. */
+	activeHarnessTools?: HarnessToolLineage;
 	/** Optional MCP connections that failed to resolve at initialization. */
 	mcpUnavailable?: McpUnavailableConnection[];
 	toolFactory?: SandboxToolFactory;
@@ -135,6 +138,7 @@ export class Harness implements FlueHarness {
 	private config: AgentConfig;
 	private eventCallback: FlueEventInputCallback | undefined;
 	private agentTools: ToolDefinition[];
+	private activeHarnessTools: HarnessToolLineage;
 	private mcpUnavailable: McpUnavailableConnection[];
 	private conversationWriter: ConversationRecordWriter;
 	private attachmentStore: AttachmentStore;
@@ -155,6 +159,7 @@ export class Harness implements FlueHarness {
 		this.config = options.config;
 		this.eventCallback = options.eventCallback;
 		this.agentTools = options.agentTools;
+		this.activeHarnessTools = options.activeHarnessTools ?? EMPTY_HARNESS_TOOL_LINEAGE;
 		this.mcpUnavailable = options.mcpUnavailable ?? [];
 		this.conversationWriter = options.conversationWriter;
 		this.attachmentStore = options.attachmentStore;
@@ -300,6 +305,7 @@ export class Harness implements FlueHarness {
 			config: this.config,
 			onAgentEvent: this.decorateEventCallback(this.eventCallback),
 			agentTools: this.agentTools,
+			activeHarnessTools: this.activeHarnessTools,
 			mcpUnavailable: this.mcpUnavailable,
 			delegationDepth: this.scopeDepth,
 			createTaskSession: (taskOptions) => this.createTaskSession(taskOptions),
@@ -409,6 +415,7 @@ export class Harness implements FlueHarness {
 			},
 			onAgentEvent: eventCallback,
 			agentTools: taskAgent?.tools ?? [],
+			activeHarnessTools: this.activeHarnessTools,
 			delegationDepth: options.depth,
 			createTaskSession: (childOptions) => this.createTaskSession(childOptions),
 			createActionHarness: (actionOptions) => this.createActionHarness(actionOptions),
@@ -472,6 +479,7 @@ export class Harness implements FlueHarness {
 			env: options.env,
 			eventCallback: options.eventCallback ?? this.eventCallback,
 			agentTools: options.tools,
+			activeHarnessTools: options.activeHarnessTools,
 			toolFactory: this.envSlot.toolFactory,
 			conversationWriter: this.conversationWriter,
 			attachmentStore: this.attachmentStore,

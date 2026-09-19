@@ -9,6 +9,7 @@ import type {
 import {
 	agentInputMessage,
 	agentOutputMessage,
+	assertContentBudgetBytes,
 	type ContentLedger,
 	type ContentOption,
 	createContentLedger,
@@ -68,6 +69,15 @@ export interface OpenTelemetryInstrumentationOptions {
 	 * message/stack flow through the same gate and the same pool.
 	 */
 	content?: ContentOption;
+	/**
+	 * Per-span content pool in bytes, defaulting to `CONTENT_BUDGET_BYTES`
+	 * (56 KiB, sized to workerd's 64 KiB span-attribute cap). Raise it to ship
+	 * fuller prompts and tool results to a backend that isn't bound by
+	 * workerd's limits; the per-span pool and the 128-byte sentinel floor still
+	 * apply. Must be a safe integer of at least 128 bytes; invalid values
+	 * throw.
+	 */
+	contentBudgetBytes?: number;
 	resolveRootContext?: (event: FlueObservation, ctx: FlueEventContext) => Context | undefined;
 }
 
@@ -83,6 +93,7 @@ export interface OpenTelemetryInstrumentation {
 export function createOpenTelemetryInstrumentation(
 	options: OpenTelemetryInstrumentationOptions = {},
 ): OpenTelemetryInstrumentation {
+	assertContentBudgetBytes(options.contentBudgetBytes);
 	// No schemaUrl: the GenAI semconv repo has not published one (see
 	// GEN_AI_SEMCONV_REVISION for the pinned upstream revision instead).
 	const tracer = options.tracer ?? trace.getTracerProvider().getTracer('@flue/opentelemetry');
@@ -128,7 +139,7 @@ export function createOpenTelemetryInstrumentation(
 				...(isAgent && event.conversationId ? { [ATTR.conversationId]: event.conversationId } : {}),
 				'flue.operation.kind': event.operationKind,
 			});
-			operations.set(operationKey(event), trackedSpan(span, event));
+			operations.set(operationKey(event), trackedSpan(span, event, options.contentBudgetBytes));
 			return;
 		}
 		if (event.type === 'task_start') {
@@ -151,7 +162,7 @@ export function createOpenTelemetryInstrumentation(
 					...(event.conversationId ? { [ATTR.conversationId]: event.conversationId } : {}),
 				},
 			);
-			const tracked = trackedSpan(span, event);
+			const tracked = trackedSpan(span, event, options.contentBudgetBytes);
 			setContent(
 				tracked,
 				ATTR.inputMessages,
@@ -181,6 +192,7 @@ export function createOpenTelemetryInstrumentation(
 						},
 					),
 					event,
+					options.contentBudgetBytes,
 				),
 			);
 			return;
@@ -220,7 +232,7 @@ export function createOpenTelemetryInstrumentation(
 				},
 			);
 			const tracked: TrackedSpan = {
-				...trackedSpan(span, event),
+				...trackedSpan(span, event, options.contentBudgetBytes),
 				clientAttributes: {
 					[ATTR.operationName]: 'chat',
 					[ATTR.providerName]: request.providerName,
@@ -283,7 +295,7 @@ export function createOpenTelemetryInstrumentation(
 					...(event.origin ? { 'flue.tool.origin': event.origin } : {}),
 				},
 			);
-			const tracked = trackedSpan(span, event);
+			const tracked = trackedSpan(span, event, options.contentBudgetBytes);
 			if (!shell) {
 				setContent(
 					tracked,
@@ -624,10 +636,10 @@ interface TrackedSpan {
 	clientAttributes?: Attributes;
 }
 
-function trackedSpan(span: Span, event: FlueObservation): TrackedSpan {
+function trackedSpan(span: Span, event: FlueObservation, contentBudgetBytes?: number): TrackedSpan {
 	return {
 		span,
-		ledger: createContentLedger(),
+		ledger: createContentLedger(contentBudgetBytes),
 		...(event.operationId ? { operationKey: operationKey(event) } : {}),
 	};
 }

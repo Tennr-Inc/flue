@@ -124,13 +124,50 @@ type ProviderWithDynamicModels = Provider & {
 	[DYNAMIC_MODEL_TEMPLATE]?: DynamicModelTemplate;
 };
 
-/** Zero-metadata Model literal for ids no catalog knows. */
+/**
+ * Marker carried by every model synthesized from a dynamic model template.
+ *
+ * pi-ai's `Model` type has no "unknown metadata" state: `cost` must remain a
+ * zero table (its `calculateCost` dereferences it unconditionally — omitting
+ * it would crash every stream call), and `contextWindow`/`maxTokens` are `0`,
+ * which `shouldCompact` already treats as "unknown". Use {@link isDynamicModel}
+ * to tell "free" apart from "not yet known" when reading cost or budgeting.
+ */
+export const DYNAMIC_MODEL_MARKER = Symbol.for('flue.dynamicModelMarker');
+
+/** True when `model` was synthesized from a dynamic model template. */
+export function isDynamicModel(model: Model<Api>): boolean {
+	return (model as Model<Api> & { [DYNAMIC_MODEL_MARKER]?: true })[DYNAMIC_MODEL_MARKER] === true;
+}
+
+/** One-time per process: the template escape hatch was used. */
+let warnedAboutDynamicModelSynthesis = false;
+function warnDynamicModelSynthesis(providerId: string, modelId: string): void {
+	if (warnedAboutDynamicModelSynthesis) return;
+	warnedAboutDynamicModelSynthesis = true;
+	console.warn(
+		`[flue] Model "${providerId}/${modelId}" is not in the provider's catalog and was ` +
+			`synthesized from a dynamic model template. Its cost reads as $0 and it has no known ` +
+			`context window — detect such models with isDynamicModel() from "@flue/runtime".`,
+	);
+}
+
+/** Reset the one-time dynamic-model warning guard. Test-only. */
+export function resetDynamicModelWarnForTests(): void {
+	warnedAboutDynamicModelSynthesis = false;
+}
+
+/**
+ * Zero-metadata Model literal for ids no catalog knows. Carries the
+ * {@link DYNAMIC_MODEL_MARKER} so consumers can tell "free" (real zero-cost
+ * models) from "unknown" (synthesized) metadata.
+ */
 function zeroMetadataModel(
 	providerId: string,
 	modelId: string,
 	template: DynamicModelTemplate,
 ): Model<Api> {
-	return {
+	const model: Model<Api> = {
 		id: modelId,
 		name: modelId,
 		api: template.api,
@@ -143,6 +180,8 @@ function zeroMetadataModel(
 		contextWindow: 0,
 		maxTokens: 0,
 	};
+	(model as Model<Api> & { [DYNAMIC_MODEL_MARKER]: true })[DYNAMIC_MODEL_MARKER] = true;
+	return model;
 }
 
 // ─── Model resolution ───────────────────────────────────────────────────────
@@ -191,7 +230,10 @@ export function resolveModel(model: string): Model<Api> {
 	if (resolved) return resolved;
 
 	const template = (provider as ProviderWithDynamicModels)[DYNAMIC_MODEL_TEMPLATE];
-	if (template) return zeroMetadataModel(providerId, modelId, template);
+	if (template) {
+		warnDynamicModelSynthesis(providerId, modelId);
+		return zeroMetadataModel(providerId, modelId, template);
+	}
 
 	throw new Error(
 		`[flue] Unknown model ID "${modelId}" for provider "${providerId}". ` +

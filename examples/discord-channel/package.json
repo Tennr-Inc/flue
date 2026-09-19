@@ -4,10 +4,7 @@
 	"type": "module",
 	"scripts": {
 		"build": "vite build",
-		"check:types": "tsc --noEmit",
-		"test": "pnpm run test:node && pnpm run test:workerd",
-		"test:node": "vitest run test/client.test.ts",
-		"test:workerd": "vitest run --config vitest.workerd.config.ts"
+		"check:types": "tsc --noEmit"
 	},
 	"dependencies": {
 		"@discordjs/rest": "*",

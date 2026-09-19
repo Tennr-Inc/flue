@@ -363,7 +363,7 @@ interface ModelRequestInfo {
 - `api` — the wire API the provider speaks.
 - `serverAddress`, `serverPort` — parsed from the provider endpoint when available.
 - `reasoningLevel`, `maxTokens`, `temperature` — per-call settings, present when set.
-- `contextCompacted` — declared in the format for turns whose context was compacted; the current runtime does not populate it.
+- `contextCompacted` — `true` when an agent turn's effective context includes a canonical compaction summary. It remains true on later agent turns while that compacted view is in use; it is absent before compaction and on the internal `compaction` / `compaction_prefix` summarization turns. Never emitted as `false`.
 
 `LlmMessage` (union of `LlmUserMessage`, `LlmAssistantMessage`, `LlmToolResultMessage`, built from `LlmTextContent`, `LlmThinkingContent`, `LlmImageContent`, `LlmToolCall`) and `LlmTool` are exported from `@flue/runtime`. Image blocks in `turn_request` messages carry [`IMAGE_DATA_OMITTED`](#image_data_omitted) instead of bytes. Internal `signal` messages are rendered into user-role text before they appear in `turn_request` input.
 

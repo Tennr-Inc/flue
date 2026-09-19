@@ -66,17 +66,19 @@ export type ContentOption =
 	| false
 	| {
 			transform?: ContentTransform;
-			/** Per-attribute UTF-8 byte limit, clamped to [128, CONTENT_BUDGET_BYTES]. The shared ledger may impose a tighter limit. */
+			/** Per-attribute UTF-8 byte limit, floored at 128 bytes. The shared span ledger may impose a tighter limit. */
 			maxBytes?: number;
 	  };
 
 /**
- * 56 KiB — the per-span content pool, and the ceiling for any single
- * serialized content attribute. workerd caps a span's *total* attribute
+ * 56 KiB — the default per-span content pool and per-attribute ceiling. workerd caps a span's *total* attribute
  * bytes at 64 KiB and silently drops every write after the first overflow,
  * so content shares one pool per span; the 8 KiB left over is slack for the
  * operational attributes (usage, ids, error class) that must always land.
- * Adopted by both backends so the payload contract is identical everywhere.
+ * Adopted by both backends so the payload contract is identical
+ * everywhere; each backend's options accept a `contentBudgetBytes` override
+ * for hosts that don't conform to workerd's span limits (e.g. to ship full
+ * prompts and tool results to a non-workerd observability backend).
  */
 export const CONTENT_BUDGET_BYTES = 57_344;
 
@@ -93,8 +95,10 @@ export interface ContentAttributeOptions {
 	/** Emit string content as-is instead of JSON-encoding it (tool payloads, descriptions, exception text). */
 	rawString?: boolean;
 	/**
-	 * Tighter budget for this attribute, clamped to
-	 * [128, `CONTENT_BUDGET_BYTES`]. Ledger draws pass the pool remainder here.
+	 * Tighter budget for this attribute, floored at 128 bytes. Ledger draws
+	 * pass the pool remainder here; the pool (default `CONTENT_BUDGET_BYTES`,
+	 * overridable per backend) is the ceiling, so a raised pool allows larger
+	 * single attributes.
 	 */
 	maxBytes?: number;
 	traceId?: string;
@@ -130,7 +134,7 @@ export function contentAttribute(
 		if (value === undefined) return {};
 	}
 	const objectShaped = isPlainObject(value);
-	const budget = Math.min(clampBudget(options.maxBytes), clampBudget(policy?.maxBytes));
+	const budget = Math.min(clampBudget(options.maxBytes), clampBudget(policy?.maxBytes, Infinity));
 	let serialized = serialize(value, options);
 	if (serialized === undefined) return failureAttribute(CONTENT_UNSERIALIZABLE, options);
 	if (ENCODER.encode(serialized).byteLength > budget) {
@@ -140,10 +144,10 @@ export function contentAttribute(
 	return { value: serialized, objectShaped };
 }
 
-function clampBudget(maxBytes: number | undefined): number {
+function clampBudget(maxBytes: number | undefined, fallback = CONTENT_BUDGET_BYTES): number {
 	return typeof maxBytes === 'number' && Number.isFinite(maxBytes)
-		? Math.min(Math.max(Math.floor(maxBytes), MIN_BUDGET_BYTES), CONTENT_BUDGET_BYTES)
-		: CONTENT_BUDGET_BYTES;
+		? Math.max(Math.floor(maxBytes), MIN_BUDGET_BYTES)
+		: fallback;
 }
 
 function failureAttribute(text: string, options: ContentAttributeOptions): ContentAttributeResult {
@@ -172,14 +176,32 @@ const INPUT_CONTENT_TYPES: ReadonlySet<GenAIContentType> = new Set([
  * a pool too dry for real content still emits the in-band truncation
  * sentinels at the 128-byte floor, and that overshoot (bounded by the
  * handful of content attributes a span carries) lands in the operational
- * slack above `CONTENT_BUDGET_BYTES`.
+ * slack above `CONTENT_BUDGET_BYTES`. The pool defaults to
+ * `CONTENT_BUDGET_BYTES`; backends thread a configurable `contentBudgetBytes`
+ * through when their host does not need workerd's span limits.
  */
 export interface ContentLedger {
 	remaining: number;
 }
 
-export function createContentLedger(): ContentLedger {
-	return { remaining: CONTENT_BUDGET_BYTES };
+export function assertContentBudgetBytes(
+	budgetBytes: unknown,
+): asserts budgetBytes is number | undefined {
+	if (budgetBytes === undefined) return;
+	if (
+		typeof budgetBytes !== 'number' ||
+		!Number.isSafeInteger(budgetBytes) ||
+		budgetBytes < MIN_BUDGET_BYTES
+	) {
+		throw new TypeError(
+			`contentBudgetBytes must be a safe integer of at least ${MIN_BUDGET_BYTES} bytes; got ${String(budgetBytes)}.`,
+		);
+	}
+}
+
+export function createContentLedger(budgetBytes?: number): ContentLedger {
+	assertContentBudgetBytes(budgetBytes);
+	return { remaining: budgetBytes === undefined ? CONTENT_BUDGET_BYTES : budgetBytes };
 }
 
 export interface ContentDrawOptions extends Omit<ContentAttributeOptions, 'maxBytes'> {

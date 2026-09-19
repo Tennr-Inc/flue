@@ -1,6 +1,6 @@
 {
 	"name": "@flue/sdk",
-	"version": "2.0.5",
+	"version": "2.1.0",
 	"type": "module",
 	"license": "Apache-2.0",
 	"homepage": "https://flueframework.com/",
@@ -23,6 +23,7 @@
 	],
 	"scripts": {
 		"build": "tsdown",
+		"prepack": "node ../../scripts/build-docs.mjs sdk",
 		"check:types": "tsc --noEmit",
 		"test": "vitest run"
 	},

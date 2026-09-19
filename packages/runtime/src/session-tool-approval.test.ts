@@ -399,12 +399,11 @@ describe('approved tool batch repair', () => {
 			pendingToolOutcomeRecords,
 			drainHookStateRecords: vi.fn(() => [stateWrite]),
 		};
-		const flushApprovalBatchBeforePark = Reflect.get(
-			Session.prototype,
-			'flushApprovalBatchBeforePark',
-		) as (this: typeof fakeSession) => Promise<void>;
+		const flushPendingToolOutcomes = Reflect.get(Session.prototype, 'flushPendingToolOutcomes') as (
+			this: typeof fakeSession,
+		) => Promise<void>;
 
-		await flushApprovalBatchBeforePark.call(fakeSession);
+		await flushPendingToolOutcomes.call(fakeSession);
 
 		expect(appendCanonical).toHaveBeenCalledTimes(1);
 		expect(appendCanonical).toHaveBeenCalledWith([outcome, stateWrite]);

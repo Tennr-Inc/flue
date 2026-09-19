@@ -213,19 +213,50 @@ export function classifyConversationSubmission(
 	});
 }
 
+/**
+ * Completed model errors stay visible until the same submission starts a
+ * replacement step. Once replaced, keep the first step's response shell (its
+ * id is the stable live-stream target) but omit the superseded model content.
+ */
+export function supersededAssistantErrorEntryIds(
+	conversation: ReducedConversationState,
+): ReadonlySet<string> {
+	const path = getActiveConversationPath(conversation);
+	const laterSubmissions = new Set(
+		[...conversation.inProgressMessages.values()].flatMap((message) =>
+			message.submissionId ? [message.submissionId] : [],
+		),
+	);
+	const superseded = new Set<string>();
+	for (let index = path.length - 1; index >= 0; index--) {
+		const entry = path[index];
+		if (entry?.type !== 'message' || entry.message.role !== 'assistant') continue;
+		if (
+			entry.message.stopReason === 'error' &&
+			entry.submissionId &&
+			laterSubmissions.has(entry.submissionId)
+		) {
+			superseded.add(entry.id);
+		}
+		if (entry.submissionId) laterSubmissions.add(entry.submissionId);
+	}
+	return superseded;
+}
+
 export function projectConversationUi(
 	conversation: ReducedConversationState,
 	streamOffset: string,
 ): ConversationUiSnapshot {
 	const messages: ConversationUiMessage[] = [];
 	const byId = new Map<string, ConversationUiMessage>();
+	const supersededErrors = supersededAssistantErrorEntryIds(conversation);
 	// One UI message per assistant response (the UIMessage ecosystem shape):
 	// every assistant step of a tracked submission folds into the submission's
 	// first assistant message, parts accumulating across steps in record order.
 	const responseBySubmission = new Map<string, ConversationUiMessage>();
 	for (const entry of getActiveConversationPath(conversation)) {
 		if (entry.type !== 'message') continue;
-		const projected = projectCompletedMessage(entry);
+		const projected = projectCompletedMessage(entry, supersededErrors.has(entry.id));
 		if (projected) {
 			if (projected.role === 'assistant' && projected.submissionId) {
 				const open = responseBySubmission.get(projected.submissionId);
@@ -384,7 +415,10 @@ export function getLatestConversationCompaction(
 	);
 }
 
-function projectCompletedMessage(entry: ReducedMessageEntry): ConversationUiMessage | undefined {
+function projectCompletedMessage(
+	entry: ReducedMessageEntry,
+	omitAssistantContent = false,
+): ConversationUiMessage | undefined {
 	const message = entry.message;
 	if (message.role === 'user') {
 		const parts: ConversationUiPart[] = [];
@@ -435,19 +469,23 @@ function projectCompletedMessage(entry: ReducedMessageEntry): ConversationUiMess
 		display: 'visible',
 		submissionId: entry.submissionId,
 		...(entry.turnId ? { turnId: entry.turnId } : {}),
-		parts: message.content.map((block): ConversationUiPart => {
-			if (block.type === 'text') return { type: 'text', text: block.text, state: 'done' };
-			if (block.type === 'thinking') {
-				return { type: 'reasoning', text: block.thinking, state: 'done' };
-			}
-			return {
-				type: 'dynamic-tool',
-				toolCallId: block.id,
-				toolName: block.name,
-				input: block.arguments,
-				state: 'input-available',
-			};
-		}),
+		parts: omitAssistantContent
+			? []
+			: message.content.map((block): ConversationUiPart => {
+					if (block.type === 'text') {
+						return { type: 'text', text: block.text, state: 'done' };
+					}
+					if (block.type === 'thinking') {
+						return { type: 'reasoning', text: block.thinking, state: 'done' };
+					}
+					return {
+						type: 'dynamic-tool',
+						toolCallId: block.id,
+						toolName: block.name,
+						input: block.arguments,
+						state: 'input-available',
+					};
+				}),
 	};
 }
 

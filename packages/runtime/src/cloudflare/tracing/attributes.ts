@@ -48,7 +48,9 @@ export const FLUE_ATTR = {
 	 */
 	instanceId: 'flue.instance.id',
 	submissionId: 'flue.submission.id',
+	operationId: 'flue.operation.id',
 	operationKind: 'flue.operation.kind',
+	turnId: 'flue.turn.id',
 	taskId: 'flue.task.id',
 	toolOrigin: 'flue.tool.origin',
 	turnPurpose: 'flue.turn.purpose',

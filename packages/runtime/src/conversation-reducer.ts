@@ -339,7 +339,9 @@ export interface ReducedContextEntry {
  * against from-scratch folds at every batch boundary, so shape drift without
  * a matching codec change fails CI.
  */
-export const REDUCED_STATE_FORMAT = 3;
+// Version 3 was independently used by the fork (approvals) and upstream
+// (truncated tool batches). Rebuild checkpoints for the combined semantics.
+export const REDUCED_STATE_FORMAT = 4;
 
 export function createReducedInstanceState(): ReducedInstanceState {
 	return {
@@ -707,9 +709,9 @@ export function applyConversationRecord(
 			if (
 				assistant?.type !== 'message' ||
 				assistant.message.role !== 'assistant' ||
-				assistant.message.stopReason !== 'toolUse'
+				!isToolBatchAssistant(assistant.message)
 			) {
-				fail(record, `Committed tool results require a completed tool-use assistant.`);
+				fail(record, `Committed tool results require a completed tool-call assistant.`);
 			}
 			if (
 				record.parentId !== record.assistantMessageId ||
@@ -1175,7 +1177,7 @@ function pathToContextEntries(
 	let index = 0;
 	while (index < path.length) {
 		const entry = path[index];
-		if (!entry || entry.type !== 'message') {
+		if (entry?.type !== 'message') {
 			index += 1;
 			continue;
 		}
@@ -1280,11 +1282,11 @@ function assertEntryAppend(
 }
 
 /**
- * Whether the active leaf is a toolUse assistant whose result batch has not
- * committed — held from the moment such an assistant entry commits (it
- * becomes the leaf) until its own `tool_results_committed` moves the leaf to
- * the batch's last toolResult entry. While held, nothing may advance the
- * conversation: an entry appended on the toolUse leaf would bury the
+ * Whether the active leaf is an assistant whose result batch has not committed
+ * — held from the moment an assistant with tool calls commits (it becomes the
+ * leaf) until its own `tool_results_committed` moves the leaf to the batch's
+ * last toolResult entry. While held, nothing may advance the conversation: an
+ * entry appended on the assistant leaf would bury the
  * uncommitted batch mid-history, where the context builder silently drops it
  * and repair can no longer commit it (the commit invariant requires the
  * assistant to still be the leaf). `tool_outcome` records and all non-entry
@@ -1298,8 +1300,22 @@ function hasUncommittedToolBatchAtLeaf(conversation: ReducedConversationState): 
 	return (
 		leaf?.type === 'message' &&
 		leaf.message.role === 'assistant' &&
-		leaf.message.stopReason === 'toolUse' &&
-		leaf.message.content.some((block) => block.type === 'toolCall')
+		isToolBatchAssistant(leaf.message)
+	);
+}
+
+/**
+ * Pi drives tool batches from assistant content. `length` is the important
+ * non-`toolUse` case: Pi safely fails its potentially truncated calls and
+ * sends those synthetic results back to the model. Error and aborted messages
+ * terminate before Pi can produce a result batch.
+ */
+function isToolBatchAssistant(message: AssistantMessage): boolean {
+	return (
+		(message.stopReason === 'toolUse' ||
+			message.stopReason === 'length' ||
+			message.stopReason === 'stop') &&
+		message.content.some((block) => block.type === 'toolCall')
 	);
 }
 

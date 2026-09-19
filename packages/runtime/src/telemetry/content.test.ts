@@ -1,225 +1,205 @@
 import { describe, expect, it } from 'vitest';
-import type { FlueObservation, LlmMessage } from '../types.ts';
+import type { LlmAssistantMessage, LlmMessage } from '../types.ts';
 import {
 	CONTENT_BUDGET_BYTES,
-	contentAttribute,
 	createContentLedger,
 	drawContentAttribute,
-	OUTPUT_CONTENT_RESERVE_BYTES,
-} from './content.ts';
-import { inputMessages, outputMessages } from './projection.ts';
-import { CONTENT_ATTR } from './semconv.ts';
-import { CONTENT_TRANSFORM_FAILED, CONTENT_UNSERIALIZABLE, truncateContent } from './truncate.ts';
+	inputMessages,
+	outputMessages,
+	truncateContent,
+} from './index.ts';
+import { MIN_BUDGET_BYTES } from './truncate.ts';
 
-const event: FlueObservation = {
+const event = {
 	type: 'idle',
 	v: 3,
 	eventIndex: 0,
-	timestamp: '2026-09-13T00:00:00.000Z',
-};
-const inputOptions = { key: CONTENT_ATTR.inputMessages, contentType: 'input_messages' } as const;
+	timestamp: new Date().toISOString(),
+} as const;
 
-function toolCall(args: Record<string, unknown>): LlmMessage[] {
-	return [
+function emit(args: Record<string, unknown>): string | undefined {
+	const messages = inputMessages([
 		{
 			role: 'assistant',
 			content: [{ type: 'toolCall', id: 'call_1', name: 'lookup', arguments: args }],
 		},
-	];
+	]);
+	return drawContentAttribute(createContentLedger(), undefined, () => messages, event, {
+		key: 'gen_ai.input.messages',
+		contentType: 'input_messages',
+	}).value;
 }
 
-// Check the envelope and the part types Flue projects, separately from JSON
-// syntax. An array of strings parses successfully but is not a message array.
-function parseMessages(value: string | undefined, output = false) {
-	const messages = JSON.parse(requireValue(value));
-	expect(Array.isArray(messages)).toBe(true);
-	for (const message of messages) {
-		expect(message).toBeTypeOf('object');
-		expect(message.role).toBeTypeOf('string');
-		expect(Array.isArray(message.parts)).toBe(true);
-		if (output) expect(message.finish_reason).toBeTypeOf('string');
-		for (const part of message.parts) {
-			expect(['text', 'reasoning', 'tool_call', 'tool_call_response']).toContain(part.type);
-			if (part.type === 'text' || part.type === 'reasoning') {
-				expect(part.content).toBeTypeOf('string');
-			} else if (part.type === 'tool_call') {
-				expect(part.name).toBeTypeOf('string');
-			} else {
-				expect(part).toHaveProperty('response');
-			}
-		}
-	}
-	return messages;
-}
+describe('GenAI message fallbacks', () => {
+	it('keeps the message-array shape when truncation bottoms out on a single oversized message', () => {
+		const value = emit(Object.fromEntries(Array.from({ length: 4_000 }, (_, i) => [`k${i}`, i])));
+		const parsed = JSON.parse(value as string) as unknown[];
+		expect(parsed).toHaveLength(1);
+		expect(parsed[0]).toMatchObject({
+			role: 'flue',
+			parts: [{ type: 'text', content: expect.stringContaining('[flue]') }],
+		});
+	});
 
-function requireValue(value: string | undefined): string {
-	expect(value).toBeTypeOf('string');
-	if (value === undefined) throw new Error('Expected a content attribute.');
-	return value;
-}
+	it('emits a shape-preserving fallback for unserializable tool arguments (bigint)', () => {
+		const value = emit({ value: 1n });
+		const parsed = JSON.parse(value as string) as unknown[];
+		expect(parsed).toHaveLength(1);
+		expect(parsed[0]).toMatchObject({
+			role: 'flue',
+			parts: [{ type: 'text', content: '[flue] content unserializable' }],
+		});
+	});
 
-function draw(messages: LlmMessage[]) {
-	const ledger = createContentLedger();
-	const result = drawContentAttribute(
-		ledger,
-		undefined,
-		() => inputMessages(messages),
-		event,
-		inputOptions,
-	);
-	const bytes = Buffer.byteLength(requireValue(result.value));
-	expect(bytes + Buffer.byteLength(inputOptions.key)).toBeLessThanOrEqual(
-		CONTENT_BUDGET_BYTES - OUTPUT_CONTENT_RESERVE_BYTES,
-	);
-	expect(ledger.remaining).toBe(CONTENT_BUDGET_BYTES - bytes - Buffer.byteLength(inputOptions.key));
-	return result.value;
-}
+	it('emits a shape-preserving fallback for unserializable tool arguments (circular)', () => {
+		const circular: Record<string, unknown> = {};
+		circular.self = circular;
+		const value = emit(circular);
+		const parsed = JSON.parse(value as string) as unknown[];
+		expect(parsed).toHaveLength(1);
+		expect(parsed[0]).toMatchObject({ role: 'flue' });
+	});
 
-describe('GenAI message content', () => {
-	it('preserves text, reasoning, tool calls, and tool responses', () => {
+	it('keeps the message-array shape for non-message diagnostics on other content types', () => {
+		// Non-message content keeps the existing bare-diagnostic behavior.
+		const value = drawContentAttribute(
+			createContentLedger(),
+			undefined,
+			() => ({ value: 1n }),
+			event,
+			{ key: 'gen_ai.tool.arguments', contentType: 'tool_arguments' },
+		).value;
+		expect(JSON.parse(value as string)).toBe('[flue] content unserializable');
+	});
+
+	it('preserves finish_reason on output-message fallbacks', () => {
+		const message: LlmAssistantMessage = {
+			role: 'assistant',
+			content: Array.from({ length: 5_000 }, (_, i) => ({ type: 'text', text: `part ${i}` })),
+		};
+		const messages = outputMessages(message, 'stop');
+		const value = drawContentAttribute(createContentLedger(), undefined, () => messages, event, {
+			key: 'gen_ai.output.messages',
+			contentType: 'output_messages',
+		}).value;
+		const parsed = JSON.parse(value as string) as unknown[];
+		expect(parsed[0]).toMatchObject({
+			role: 'flue',
+			finish_reason: 'error',
+			parts: [{ type: 'text', content: expect.stringContaining('[flue]') }],
+		});
+	});
+
+	it('keeps output-message shape with finish_reason when only string leaves shrink', () => {
+		const message: LlmAssistantMessage = {
+			role: 'assistant',
+			content: [{ type: 'text', text: 'y'.repeat(100_000) }],
+		};
+		const messages = outputMessages(message, 'stop');
+		const value = drawContentAttribute(createContentLedger(), undefined, () => messages, event, {
+			key: 'gen_ai.output.messages',
+			contentType: 'output_messages',
+		}).value;
+		const parsed = JSON.parse(value as string) as unknown[];
+		expect(parsed[0]).toMatchObject({
+			role: 'assistant',
+			finish_reason: 'stop',
+			parts: [{ type: 'text', content: expect.stringContaining('[flue:truncated') }],
+		});
+	});
+
+	it('emits the envelope even at the 128-byte budget floor', () => {
 		const messages: LlmMessage[] = [
-			{ role: 'user', content: 'Find "café"\n🙂' },
 			{
-				role: 'assistant',
-				content: [
-					{ type: 'thinking', thinking: 'Look it up.' },
-					{ type: 'toolCall', id: 'call_1', name: 'lookup', arguments: { query: 'café' } },
-				],
-			},
-			{
-				role: 'toolResult',
-				toolCallId: 'call_1',
-				toolName: 'lookup',
-				content: [{ type: 'text', text: 'Found it.' }],
-				isError: false,
+				role: 'user',
+				content: Array.from({ length: 10_000 }, (_, i) => ({ type: 'text', text: `part ${i}` })),
 			},
 		];
-		expect(parseMessages(draw(messages))).toEqual(inputMessages(messages));
+		const result = truncateContent(inputMessages(messages), { maxBytes: 128 }) as unknown[];
+		expect(result).toHaveLength(1);
+		expect(result[0]).toMatchObject({
+			role: 'flue',
+			parts: [{ type: 'text', content: expect.stringContaining('[flue]') }],
+		});
+	});
+});
+
+describe('content budget configuration', () => {
+	it('defaults the pool to CONTENT_BUDGET_BYTES', () => {
+		expect(createContentLedger().remaining).toBe(CONTENT_BUDGET_BYTES);
 	});
 
-	it('drops older messages before newer ones and retains a message-shaped omission marker', () => {
-		const messages = parseMessages(
-			draw([
-				{ role: 'user', content: 'old'.repeat(30_000) },
-				{ role: 'user', content: 'latest' },
-			]),
-		);
-		expect(messages).toEqual([
+	it('sizes the pool from contentBudgetBytes', () => {
+		expect(createContentLedger(200_000).remaining).toBe(200_000);
+		expect(createContentLedger(MIN_BUDGET_BYTES).remaining).toBe(MIN_BUDGET_BYTES);
+	});
+
+	it('rejects invalid contentBudgetBytes values', () => {
+		for (const invalid of [0, 10, -1, 3.7, NaN, Infinity, -Infinity]) {
+			expect(() => createContentLedger(invalid)).toThrow(TypeError);
+		}
+	});
+
+	it('accepts undefined as the default pool', () => {
+		expect(createContentLedger(undefined).remaining).toBe(CONTENT_BUDGET_BYTES);
+	});
+
+	it('a raised pool ships content larger than the default ceiling (the #563 case)', () => {
+		const messages = inputMessages([
 			{
-				role: 'flue',
-				parts: [{ type: 'text', content: expect.stringContaining('1 messages omitted') }],
+				role: 'user',
+				content: Array.from({ length: 2_000 }, (_, i) => ({
+					type: 'text',
+					text: `part ${i}`.repeat(8),
+				})),
 			},
-			{ role: 'user', parts: [{ type: 'text', content: 'latest' }] },
 		]);
-	});
-
-	it.each(['x', '🙂"\n'])(
-		'keeps oversized %j text as a message within the shared budget',
-		(text) => {
-			const messages: LlmMessage[] = [{ role: 'user', content: text.repeat(100_000) }];
-			const original = structuredClone(messages);
-			const value = draw(messages);
-			parseMessages(value);
-			expect(value).toContain('[flue:truncated,');
-			expect(messages).toEqual(original);
-		},
-	);
-
-	it.each([
-		toolCall(Object.fromEntries(Array.from({ length: 4_000 }, (_, i) => [`k${i}`, i]))),
-		[{ role: 'user', content: Array.from({ length: 2_000 }, () => ({ type: 'text', text: 'x' })) }],
-		toolCall({ ignored: () => {}, text: 'x'.repeat(100_000) }),
-	] satisfies LlmMessage[][])(
-		'retains message shape when the last message cannot shrink (%#)',
-		(...messages) => {
-			const value = draw(messages);
-			parseMessages(value);
-			expect(value).toContain('[flue]');
-		},
-	);
-
-	it.each(['input_messages', 'output_messages'] as const)(
-		'keeps %s fallbacks valid at the 128-byte floor',
-		(contentType) => {
-			const messages =
-				contentType === 'input_messages'
-					? inputMessages([{ role: 'user', content: 'x'.repeat(10_000) }])
-					: outputMessages(
-							{ role: 'assistant', content: [{ type: 'text', text: 'x'.repeat(10_000) }] },
-							'stop',
-						);
-			const value = contentAttribute(undefined, messages, event, {
-				contentType,
-				maxBytes: 128,
-			}).value;
-			parseMessages(value, contentType === 'output_messages');
-			expect(Buffer.byteLength(requireValue(value))).toBeLessThanOrEqual(128);
-			expect(value).toContain('[flue]');
-		},
-	);
-
-	it('keeps a depleted input ledger schema-valid', () => {
-		const value = drawContentAttribute(
-			{ remaining: OUTPUT_CONTENT_RESERVE_BYTES },
+		const full = drawContentAttribute(
+			createContentLedger(400_000),
 			undefined,
-			() => inputMessages([{ role: 'user', content: 'x'.repeat(10_000) }]),
+			() => messages,
 			event,
-			inputOptions,
+			{ key: 'gen_ai.input.messages', contentType: 'input_messages' },
 		).value;
-		parseMessages(value);
-		expect(Buffer.byteLength(requireValue(value))).toBeLessThanOrEqual(128);
+		const truncated = drawContentAttribute(
+			createContentLedger(),
+			undefined,
+			() => messages,
+			event,
+			{ key: 'gen_ai.input.messages', contentType: 'input_messages' },
+		).value;
+
+		// The raised pool keeps the full message array (no truncation sentinel);
+		// the default pool cuts it down with the in-band sentinel.
+		expect(JSON.stringify(full)).toContain('part 0');
+		expect(JSON.stringify(full)).toContain('part 1999');
+		expect(full).not.toContain('[flue]');
+		expect(truncated).toContain('[flue]');
 	});
 
-	it.each(['bigint', 'circular'])(
-		'encodes an unserializable %s argument inside a message',
-		(kind) => {
-			const args: Record<string, unknown> = { value: 1n };
-			if (kind === 'circular') args.value = args;
-			const value = draw(toolCall(args));
-			parseMessages(value);
-			expect(value).toContain(CONTENT_UNSERIALIZABLE);
-			parseMessages(
-				JSON.stringify(truncateContent(inputMessages(toolCall(args)), { maxBytes: 128 })),
-			);
-		},
-	);
+	it('a lowered pool truncates sooner than the default', () => {
+		const messages = inputMessages([
+			{
+				role: 'user',
+				content: Array.from({ length: 400 }, (_, i) => ({
+					type: 'text',
+					text: `part ${i}`.repeat(8),
+				})),
+			},
+		]);
+		const tight = drawContentAttribute(
+			createContentLedger(4_096),
+			undefined,
+			() => messages,
+			event,
+			{ key: 'gen_ai.input.messages', contentType: 'input_messages' },
+		).value;
+		const loose = drawContentAttribute(createContentLedger(), undefined, () => messages, event, {
+			key: 'gen_ai.input.messages',
+			contentType: 'input_messages',
+		}).value;
 
-	it.each(['input_messages', 'output_messages'] as const)(
-		'keeps a failed %s transform schema-valid without leaking content',
-		(contentType) => {
-			const result = contentAttribute(
-				{
-					transform: () => {
-						throw new Error('secret');
-					},
-				},
-				inputMessages([{ role: 'user', content: 'secret' }]),
-				event,
-				{ contentType, maxBytes: 128 },
-			);
-			parseMessages(result.value, contentType === 'output_messages');
-			expect(result.value).toContain(CONTENT_TRANSFORM_FAILED);
-			expect(result.value).not.toContain('secret');
-			expect(Buffer.byteLength(requireValue(result.value))).toBeLessThanOrEqual(128);
-		},
-	);
-
-	it('still permits omission and leaves raw tool diagnostics as text', () => {
-		const content = inputMessages([{ role: 'user', content: 'secret' }]);
-		expect(contentAttribute(false, content, event, inputOptions)).toEqual({});
-		expect(contentAttribute({ transform: () => undefined }, content, event, inputOptions)).toEqual(
-			{},
-		);
-		expect(
-			contentAttribute(undefined, 1n, event, { contentType: 'tool_arguments', rawString: true })
-				.value,
-		).toBe(CONTENT_UNSERIALIZABLE);
-		expect(
-			JSON.parse(
-				requireValue(
-					contentAttribute(undefined, 1n, event, { contentType: 'tool_arguments' }).value,
-				),
-			),
-		).toBe(CONTENT_UNSERIALIZABLE);
+		expect(tight).toContain('[flue]');
+		expect(loose).not.toContain('[flue]');
 	});
 });

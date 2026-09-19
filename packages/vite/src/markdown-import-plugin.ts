@@ -28,6 +28,8 @@ import { parserLangForFile } from './agent-scan.ts';
 import { canonicalizePath, isWithinDirectory } from './paths.ts';
 
 const MARKDOWN_MODULE_PREFIX = '\0flue-markdown:';
+/** Virtual registry owned by the Agents SDK's `agents()` Vite plugin. */
+const AGENTS_SKILLS_VIRTUAL_PREFIX = '\0agents:skills:';
 const SKILL_MODULE_PREFIX = '\0flue-skill:';
 const ENCODED_SKILL_MODULE_PREFIX = '__x00__flue-skill:';
 const PACKAGED_FILE_WARNING_BYTES = 1024 * 1024;
@@ -146,6 +148,10 @@ export function markdownImportPlugin(): Plugin {
 				);
 			}
 			if (!importer) return null;
+			// The Agents SDK builds its own virtual skill registry by reading
+			// SKILL.md files. Those edges belong to that plugin, not Flue's static
+			// JS/TS import transform.
+			if (importer.startsWith(AGENTS_SKILLS_VIRTUAL_PREFIX)) return null;
 			if (isSkillMarkdownPath(source)) {
 				// The transform packages these automatically; reaching raw
 				// resolution means the importer was outside the transform's

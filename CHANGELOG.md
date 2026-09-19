@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.0.6 - 2026-09-14
+
+### Fixes & Other Changes
+
+- **Published packages once again include the bundled Flue documentation.** The 2.0.4 and 2.0.5 releases omitted the generated `docs/` directories from `@flue/cli`, `@flue/runtime`, and `@flue/sdk`, causing commands such as `flue docs read guide/sandboxes` to fail. Package documentation can now be prepared explicitly with `pnpm build:docs` before publishing.
+
 ## 2.0.5 - 2026-09-11
 
 ### Fixes & Other Changes

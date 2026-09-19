@@ -1,0 +1,15 @@
+{
+	"$schema": "https://unpkg.com/@changesets/config@4.0.1/schema.json",
+	"changelog": "./.changeset/changelog.mjs",
+	"commit": false,
+	"fixed": [["@flue/*"]],
+	"access": "public",
+	"baseBranch": "main",
+	"updateInternalDependencies": "patch",
+	"ignore": [],
+	"bumpVersionsWithWorkspaceProtocolOnly": false,
+	"privatePackages": {
+		"version": false,
+		"tag": false
+	}
+}

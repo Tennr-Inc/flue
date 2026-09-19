@@ -1,5 +1,5 @@
 import type * as v from 'valibot';
-import type { JsonValue } from './json-snapshot.ts';
+import type { McpToolAnnotations } from './mcp-types.ts';
 import type { ToolApprovalPolicy } from './tool-approval.ts';
 import type { FlueHarness, FlueLogger } from './types.ts';
 
@@ -66,6 +66,20 @@ export type ToolContext<
 	([D] extends [true] ? { readonly step: ToolStep } : Record<never, never>);
 
 /**
+ * A JSON-serializable tool output before the runtime snapshots it. Object
+ * properties may be undefined because JSON.stringify omits them — notably,
+ * TypeScript represents keys absent from one member of an inferred object
+ * union as optional undefined properties. Undefined remains invalid in arrays.
+ */
+type ToolRunOutputValue =
+	| null
+	| boolean
+	| number
+	| string
+	| readonly ToolRunOutputValue[]
+	| { [key: string]: ToolRunOutputValue | undefined };
+
+/**
  * The canonical `run` return shape: `output` is the tool's result value
  * (validated against the declared `output` schema, and what the model sees
  * serialized as JSON), and `terminate: true` ends the agent's turn after the
@@ -76,7 +90,7 @@ export type ToolContext<
  */
 export type ToolRunEnvelope<S extends ToolOutputSchema | undefined> = S extends ToolOutputSchema
 	? { output: v.InferInput<S>; terminate?: boolean }
-	: { output?: JsonValue; terminate?: boolean };
+	: { output?: ToolRunOutputValue | undefined; terminate?: boolean };
 
 // Bare-string sugar: `return 'text'` means `return { output: 'text' }`. The
 // string arm exists only where a string is a valid output to begin with (no
@@ -104,8 +118,6 @@ export interface ToolDefinition<
 	readonly output: TOutput;
 	/** Require a persisted host decision before `run` is entered. */
 	readonly approval?: ToolApprovalPolicy;
-	/** Maximum execution time for this tool invocation, independent of approval wait. */
-	readonly timeoutMs?: number;
 	/**
 	 * Connect this tool to the agent's runtime: `run` receives `harness`,
 	 * the one interface to the agent's environment (`harness.sandbox`, the
@@ -123,6 +135,25 @@ export interface ToolDefinition<
 	 * settled with an unknown-outcome error like ordinary tools.
 	 */
 	readonly durable?: TDurable;
+	/**
+	 * Optional bound on one call's execution, in milliseconds, excluding approval wait. The harness
+	 * races `run` against the deadline: on expiry it aborts the tool's
+	 * `context.signal`, settles the call with a `ToolTimeoutError` (surfaced
+	 * to the model as the tool's error result — the conversation continues),
+	 * and discards the abandoned run's late settlement. The submission's
+	 * durability timeout remains the outer backstop; this bound just stops
+	 * one hung call from consuming it.
+	 */
+	readonly timeoutMs?: number;
+	/**
+	 * MCP-compatible tool annotations. `createMcpConnection` copies these from
+	 * the server's `tools/list` entry; hand-written wrappers can preserve them.
+	 * Application code can inspect `readOnlyHint`, `destructiveHint`,
+	 * `idempotentHint`, and `openWorldHint` when gating calls. The runtime
+	 * ignores the field, and server-supplied hints are untrusted unless the
+	 * server itself is trusted.
+	 */
+	readonly annotations?: Readonly<McpToolAnnotations>;
 	// `| void` only for the no-`output`-schema case, where an undefined
 	// output is already an allowed result — a bare `() => sideEffect()` with
 	// no return statement is the same value at runtime, so nothing is lost by

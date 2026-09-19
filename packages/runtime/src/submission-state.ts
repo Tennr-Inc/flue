@@ -78,9 +78,10 @@ export function isRenderNarration(entry: CanonicalSubmissionEntry): boolean {
  *
  * - `input_only` — the input was applied but no assistant response was
  *   persisted; start the first turn.
- * - `tool_results` — a toolUse response whose persisted tool results form a
- *   complete batch; continue the loop from the results.
- * - `tool_results_partial` — the trailing toolUse turn carries an
+ * - `tool_results` — an assistant tool-call response whose persisted tool
+ *   results form a complete batch; continue the loop from the results. This
+ *   includes Pi's synthetic failures for a length-truncated tool call.
+ * - `tool_results_partial` — the trailing tool-call turn carries an
  *   incomplete tool-result batch (the turn was interrupted mid-batch, e.g.
  *   graceful shutdown broke the tool loop after some calls completed). An
  *   incomplete batch is excluded from model context, so a plain resume
@@ -123,9 +124,10 @@ export type SubmissionState =
 	 */
 	| { kind: 'advanced_past_input' }
 	/**
-	 * The last assistant response is canonical (stopReason stop/length), OR —
-	 * with `terminalToolBatch: true` — a toolUse response whose complete
-	 * trailing tool batch unanimously carries the durable terminate flag: the
+	 * The last assistant response is canonical (stopReason stop/length with no
+	 * pending tool batch), OR — with `terminalToolBatch: true` — a tool-call
+	 * response whose complete trailing batch unanimously carries the durable
+	 * terminate flag: the
 	 * engine would have ended the turn after that batch (see
 	 * `shouldTerminateToolBatch` in pi-agent-core), so the submission settles
 	 * with no further model call, converging on the live terminate outcome.
@@ -138,7 +140,7 @@ export type SubmissionState =
 			overflow: boolean;
 			terminalToolBatch?: true;
 	  }
-	/** A toolUse response with no persisted tool results. */
+	/** An assistant tool-call response with no persisted tool results. */
 	| { kind: 'tool_use_unresolved'; assistant: AssistantMessage }
 	/** A non-retryable error response. */
 	| { kind: 'terminal_error'; reason: string }
@@ -220,6 +222,37 @@ export function classifySubmissionState(
 		};
 	}
 	const overflow = isAssistantContextOverflow(assistant, opts.contextWindow);
+	// Pi drives tool batches from assistant content, not only from `toolUse`.
+	// In particular, a `length` response with tool calls produces safe synthetic
+	// error results and continues so the model can retry with complete arguments.
+	if (isToolBatchAssistant(assistant)) {
+		if (
+			following.some((entry) => entry.type === 'message' && entry.message.role === 'toolResult')
+		) {
+			if (findTrailingPartialToolBatch(following)) {
+				return {
+					kind: 'resume',
+					mode: 'tool_results_partial',
+					assistant,
+					consecutiveRetryableErrors: countConsecutiveRetryableModelErrors(following),
+				};
+			}
+			// A complete trailing batch that unanimously terminates is a FINISHED
+			// response, not a resume: the live engine ends the loop after such a
+			// batch, so driving another model turn here would diverge from the
+			// no-crash outcome.
+			if (isTerminalTrailingToolBatch(following, assistantIndex, assistant)) {
+				return { kind: 'completed', assistant, overflow, terminalToolBatch: true };
+			}
+			return {
+				kind: 'resume',
+				mode: 'tool_results',
+				assistant,
+				consecutiveRetryableErrors: countConsecutiveRetryableModelErrors(following),
+			};
+		}
+		return { kind: 'tool_use_unresolved', assistant };
+	}
 	if (isCompletedAssistantResponse(assistant)) {
 		return { kind: 'completed', assistant, overflow };
 	}
@@ -249,34 +282,6 @@ export function classifySubmissionState(
 			assistant,
 			consecutiveRetryableErrors: countConsecutiveRetryableModelErrors(following),
 		};
-	}
-	if (assistant.stopReason === 'toolUse') {
-		if (
-			following.some((entry) => entry.type === 'message' && entry.message.role === 'toolResult')
-		) {
-			if (findTrailingPartialToolBatch(following)) {
-				return {
-					kind: 'resume',
-					mode: 'tool_results_partial',
-					assistant,
-					consecutiveRetryableErrors: countConsecutiveRetryableModelErrors(following),
-				};
-			}
-			// A complete trailing batch that unanimously terminates is a FINISHED
-			// response, not a resume: the live engine ends the loop after such a
-			// batch, so driving another model turn here would diverge from the
-			// no-crash outcome.
-			if (isTerminalTrailingToolBatch(following, assistantIndex, assistant)) {
-				return { kind: 'completed', assistant, overflow, terminalToolBatch: true };
-			}
-			return {
-				kind: 'resume',
-				mode: 'tool_results',
-				assistant,
-				consecutiveRetryableErrors: countConsecutiveRetryableModelErrors(following),
-			};
-		}
-		return { kind: 'tool_use_unresolved', assistant };
 	}
 	if (assistant.stopReason === 'aborted') {
 		// A turn interrupted mid-tool-batch leaves a trailing aborted
@@ -374,7 +379,7 @@ function isTerminalTrailingToolBatch(
 }
 
 export interface TrailingPartialToolBatch {
-	/** History entry id of the toolUse assistant whose batch is incomplete. */
+	/** History entry id of the tool-call assistant whose batch is incomplete. */
 	entryId: string;
 	assistant: AssistantMessage;
 	/** The turn's full tool-call set, in original call order. */
@@ -382,9 +387,9 @@ export interface TrailingPartialToolBatch {
 }
 
 /**
- * Locate the trailing toolUse turn whose persisted tool-result batch is
+ * Locate the trailing tool-call turn whose persisted tool-result batch is
  * incomplete — the persistence shape left behind when an abort breaks the
- * tool loop mid-batch. The toolUse assistant is either the last assistant in
+ * tool loop mid-batch. The tool-call assistant is either the last assistant in
  * `following`, or the second-to-last when the final entry is the aborted
  * partial of the next turn the abort also cut short.
  *
@@ -436,7 +441,7 @@ export function findTrailingPartialToolBatch(
 		return undefined;
 	}
 	const assistant = assistantEntry.message as AssistantMessage;
-	if (assistant.stopReason !== 'toolUse') return undefined;
+	if (!isToolBatchAssistant(assistant)) return undefined;
 	const toolCalls = assistant.content.flatMap((content) =>
 		content.type === 'toolCall'
 			? [{ type: 'toolCall' as const, id: content.id, name: content.name }]
@@ -466,6 +471,14 @@ export function isRetryableModelError(message: AssistantMessage): boolean {
 	// stay terminal.
 	return /overloaded|rate.?limit|too many requests|429|500|502|503|504|service.?unavailable|server.?error|network.?error|connection.?(?:reset|refused|lost|error)|socket hang up|fetch failed|timed? out|timeout|terminated|provider finish_reason:\s*error(?![-\w])/i.test(
 		message.errorMessage,
+	);
+}
+
+function isToolBatchAssistant(message: AssistantMessage): boolean {
+	return (
+		message.stopReason === 'toolUse' ||
+		((message.stopReason === 'length' || message.stopReason === 'stop') &&
+			message.content.some((block) => block.type === 'toolCall'))
 	);
 }
 

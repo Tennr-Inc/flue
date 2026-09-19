@@ -11,6 +11,7 @@
  * message/event types and must version atomically with them.
  */
 export {
+	assertContentBudgetBytes,
 	CONTENT_BUDGET_BYTES,
 	type ContentAttributeOptions,
 	type ContentAttributeResult,

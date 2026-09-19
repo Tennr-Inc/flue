@@ -1,9 +1,11 @@
+import { composeTimeoutSignal, raceToolWithDeadline } from './abort.ts';
 import {
 	ToolInputValidationError,
 	ToolOutputSerializationError,
 	ToolOutputValidationError,
 } from './errors.ts';
 import { cloneJsonSerializable } from './json-snapshot.ts';
+import type { McpToolAnnotations } from './mcp-types.ts';
 import { generateToolCallId } from './runtime/ids.ts';
 import { isTopLevelObjectSchema, isValibotSchema, parseValibot } from './schema.ts';
 import type { ToolApprovalPolicy } from './tool-approval.ts';
@@ -29,9 +31,16 @@ export function defineTool<
 	input?: TInput;
 	output?: TOutput;
 	approval?: ToolApprovalPolicy;
-	timeoutMs?: number;
 	harness?: THarness;
 	durable?: TDurable;
+	timeoutMs?: number;
+	/**
+	 * MCP tool annotations, when adapting a tool from an MCP connection or
+	 * mirroring one in a wrapper. The runtime ignores the field; application
+	 * code reads the hints (`readOnlyHint`, `destructiveHint`, ...) to gate
+	 * calls.
+	 */
+	annotations?: McpToolAnnotations;
 	run: ToolDefinition<TInput, TOutput, THarness, TDurable>['run'];
 }): ToolDefinition<TInput, TOutput, THarness, TDurable> {
 	assertToolDefinition(options, 'defineTool()');
@@ -42,9 +51,12 @@ export function defineTool<
 		input: options.input as TInput,
 		output: options.output as TOutput,
 		...(options.approval ? { approval: freezeApproval(options.approval) } : {}),
-		...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
 		harness: options.harness as THarness,
 		durable: options.durable as TDurable,
+		...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+		...(options.annotations === undefined
+			? {}
+			: { annotations: Object.freeze({ ...options.annotations }) }),
 		run: options.run,
 	});
 }
@@ -56,13 +68,22 @@ const TOOL_DEFINITION_FIELDS = new Set([
 	'input',
 	'output',
 	'approval',
-	'timeoutMs',
 	'harness',
 	'durable',
+	'timeoutMs',
+	'annotations',
 	'run',
 ]);
 const TOOL_APPROVAL_FIELDS = new Set(['required', 'expiresInMs', 'presentation']);
 const TOOL_APPROVAL_PRESENTATION_FIELDS = new Set(['title', 'description']);
+
+const MCP_ANNOTATION_FIELDS = new Set([
+	'title',
+	'readOnlyHint',
+	'destructiveHint',
+	'idempotentHint',
+	'openWorldHint',
+]);
 
 export function assertToolDefinition(
 	value: unknown,
@@ -139,6 +160,33 @@ export function assertToolDefinition(
 				assertString(presentation.title, `${label} approval.presentation.title`);
 			if (presentation.description !== undefined)
 				assertString(presentation.description, `${label} approval.presentation.description`);
+		}
+	}
+	if (tool.annotations !== undefined) {
+		const annotations = tool.annotations;
+		if (typeof annotations !== 'object' || annotations === null || Array.isArray(annotations)) {
+			throw new Error(`[flue] ${label} annotations must be an object.`);
+		}
+		for (const key of Object.keys(annotations)) {
+			if (!MCP_ANNOTATION_FIELDS.has(key)) {
+				throw new Error(
+					`[flue] ${label} annotations received unknown field "${key}". Accepted fields: ${[...MCP_ANNOTATION_FIELDS].join(', ')}.`,
+				);
+			}
+		}
+		const typed = annotations as Partial<McpToolAnnotations>;
+		if (typed.title !== undefined && typeof typed.title !== 'string') {
+			throw new Error(`[flue] ${label} annotations.title must be a string.`);
+		}
+		for (const hint of [
+			'readOnlyHint',
+			'destructiveHint',
+			'idempotentHint',
+			'openWorldHint',
+		] as const) {
+			if (typed[hint] !== undefined && typeof typed[hint] !== 'boolean') {
+				throw new Error(`[flue] ${label} annotations.${hint} must be a boolean.`);
+			}
 		}
 	}
 	if (typeof tool.run !== 'function') {
@@ -387,10 +435,22 @@ export async function validateAndRunTool<TTool extends ToolDefinition>(
 			`[flue] Tool "${tool.name}" declares \`harness: true\` and can only run inside an agent session — a standalone run has no harness.`,
 		);
 	}
-	const parsed = parseToolInput(tool, data, signal);
+	// The merged signal carries the per-tool deadline (when declared) so the
+	// tool's `context.signal` aborts on expiry; the race settles the deadline
+	// with a distinguishable ToolTimeoutError like the harness path does.
+	const { mergedSignal } = composeTimeoutSignal(tool.timeoutMs, signal);
+	const parsed = parseToolInput(tool, data, mergedSignal);
 	// `terminate` is a turn-loop concern; a standalone run has no turn to end,
 	// so only the resolved output survives here.
-	return resolveToolRun(tool, await tool.run(parsed.context)).output;
+	return resolveToolRun(
+		tool,
+		await raceToolWithDeadline(
+			() => tool.run(parsed.context),
+			mergedSignal,
+			tool.timeoutMs,
+			tool.name,
+		),
+	).output;
 }
 
 function assertNonEmptyString(value: unknown, label: string): asserts value is string {

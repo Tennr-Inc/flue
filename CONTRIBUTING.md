@@ -61,3 +61,59 @@ Here, “junior” is relative to experience with the project and the problem be
 Flue does not have a formal co-lead today. We are still figuring out how to identify that person, how the role should work, and whether one co-lead is even the right model across every area of the project. For now, this describes the organization we are working toward rather than one we have already solved.
 
 This is the experiment behind how Flue is built: keep the team responsible for decisions small, use agents to increase what that team can execute, and make it easy for everyone else to contribute the information that guides those decisions.
+
+## Publishing
+
+Flue's public packages are versioned and published together with [Changesets](https://changesets.dev/), configured in `.changeset/config.json`. If you add a new public package, add it to the fixed group in that file.
+
+Changes merged to `main` with changesets are collected into the `Version Packages` pull request. Merging that pull request runs the Release workflow, which builds and publishes every public package.
+
+To publish manually, first confirm that the working tree is clean, run `pnpm changeset version`, then review and commit the generated version and changelog changes. Build the packages and prepare the documentation bundled with `@flue/cli`, `@flue/runtime`, and `@flue/sdk`:
+
+```sh
+pnpm run build && pnpm run build:docs
+```
+
+Always run both commands before publishing. Each of the three documentation packages also prepares its own docs through a `prepack` lifecycle script. The lifecycle hook is a safety net, not a replacement for preparing and verifying the complete release first.
+
+Publish every changed public package and create its git tag from the repository root:
+
+```sh
+pnpm changeset publish
+```
+
+Do not use `npm publish`. Changesets detects pnpm and uses it to replace internal `workspace:` dependency specifiers with the release version while packing. If publishing stops partway through, do not immediately rerun the command: first determine which versions reached the registry.
+
+After publishing, allow time for every package to become visible on the npm registry, then verify the release version and bundled documentation. Replace `<version>` below with the version just published:
+
+```sh
+npm view @flue/cli@<version> version
+npm view @flue/runtime@<version> version
+npm view @flue/sdk@<version> version
+pnpm test:package-docs --version <version>
+```
+
+The package documentation smoke test installs the published packages into a clean temporary npm project, confirms that `@flue/cli`, `@flue/runtime`, and `@flue/sdk` contain their docs trees, and runs `flue docs read guide/sandboxes` through the installed CLI. The same command can inspect any existing live release by naming its version, for example:
+
+```sh
+pnpm test:package-docs --version 2.0.6
+```
+
+Run the test without `--version` to pack and test the current local packages before publishing:
+
+```sh
+pnpm test:package-docs
+```
+
+Check every published package for unresolved workspace dependency specifiers and confirm its `latest` dist-tag points to the release.
+
+Finally, tag the release commit and push the tag. The release commit is the `v<version>` version-bump commit (it bumps every public package and adds the `CHANGELOG.md` entry) that was created before publishing. Use a lightweight tag matching the convention of prior releases (e.g. `v2.0.3`), not an annotated tag:
+
+```sh
+git tag v2.0.6
+# confirm it points at the version-bump commit:
+git rev-parse v2.0.6
+git push origin v2.0.6
+```
+
+Tagging is part of the release, not an afterthought: the `v<version>` tag is how consumers and tooling locate a release in git history, and it is easy to miss if it is not written down here.

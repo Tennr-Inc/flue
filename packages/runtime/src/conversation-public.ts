@@ -3,6 +3,7 @@ import {
 	type ConversationUiSnapshot,
 	classifySignal,
 	projectConversationUi,
+	supersededAssistantErrorEntryIds,
 } from './conversation-projections.ts';
 import type { ConversationRecord, SubmissionSettledRecord } from './conversation-records.ts';
 import type { ReducedConversationState, ReducedInstanceState } from './conversation-reducer.ts';
@@ -249,7 +250,7 @@ export function projectAgentConversationBatch(options: {
 
 	// A reset subsumes the whole batch: a fresh snapshot already reflects every
 	// record in it, so emitting per-record chunks too would double-apply.
-	if (relevant.some(requiresSnapshotReset)) {
+	if (relevant.some((record) => requiresSnapshotReset(record, options.state))) {
 		const snapshot = projectAgentConversationSnapshot(options.state);
 		return snapshot
 			? withPositions(
@@ -302,15 +303,29 @@ function withPositions(
 	return bodies.map((body, index) => ({ ...body, position: { batch, index } }));
 }
 
-function requiresSnapshotReset(record: ConversationRecord): boolean {
-	return (
+function requiresSnapshotReset(record: ConversationRecord, state: ReducedInstanceState): boolean {
+	if (
 		record.type === 'conversation_created' ||
 		record.type === 'compaction' ||
-		// Approval chunks were added after the 2.0.3 SDK's strict updates
-		// validator. A reset is understood by both generations; new clients read
-		// toolApprovals from it while old clients safely ignore the extra field.
+		// Older SDKs understand resets but not approval-specific chunks.
 		record.type === 'tool_approval_requested' ||
 		record.type === 'tool_approval_decided'
+	)
+		return true;
+	if (record.type !== 'assistant_message_started' || !record.submissionId) return false;
+	// A live client already rendered the failed step's partial parts onto the
+	// response id. Starting its replacement must retract those parts before new
+	// deltas target that same stable id; the snapshot projection supplies the
+	// corrected response shell.
+	const conversation = state.conversations.get(record.conversationId);
+	if (!conversation) return false;
+	const superseded = supersededAssistantErrorEntryIds(conversation);
+	return getActiveConversationPath(conversation).some(
+		(entry) =>
+			entry.type === 'message' &&
+			entry.message.role === 'assistant' &&
+			entry.submissionId === record.submissionId &&
+			superseded.has(entry.id),
 	);
 }
 

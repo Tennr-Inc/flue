@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import type { FlueObservation } from '../types.ts';
-import { contentAttribute, drawContentAttribute, OUTPUT_CONTENT_RESERVE_BYTES } from './content.ts';
+import {
+	contentAttribute,
+	createContentLedger,
+	drawContentAttribute,
+	OUTPUT_CONTENT_RESERVE_BYTES,
+} from './content.ts';
 import {
 	inputMessages,
 	outputMessages,
@@ -115,8 +120,21 @@ describe.each(kinds)('%s structural content budgeting', (kind) => {
 		parseArray(value, kind, 128);
 	});
 
+	it('keeps the receiver cap when a backend raises its span budget', () => {
+		const ledger = createContentLedger(400_000);
+		const value = drawContentAttribute(ledger, { maxBytes: 25_000 }, () => schemas[kind], event, {
+			contentType: kind,
+			key: 'gen_ai.test',
+		}).value;
+		parseArray(value, kind, 25_000);
+		if (value === undefined) throw new Error('Expected bounded content.');
+		expect(ledger.remaining).toBe(
+			400_000 - Buffer.byteLength('gen_ai.test') - Buffer.byteLength(value),
+		);
+	});
+
 	it('honors a receiver byte cap after one transform and within the ledger allowance', () => {
-		for (const allowance of [512, 57_344]) {
+		for (const allowance of [512, 57_344, 400_000]) {
 			let transforms = 0;
 			const value = contentAttribute(
 				{

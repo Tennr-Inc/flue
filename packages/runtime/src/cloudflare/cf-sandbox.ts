@@ -3,7 +3,7 @@ import { decodeBase64, encodeBase64 } from '../base64.ts';
 import { SandboxDiedError } from '../errors.ts';
 import type { SandboxDriver } from '../sandbox.ts';
 import { sandboxFromDriver } from '../sandbox.ts';
-import type { SandboxFactory, Sandbox } from '../types.ts';
+import type { Sandbox, SandboxFactory } from '../types.ts';
 
 /**
  * Minimal structural surface of a `@cloudflare/sandbox` Durable Object stub
@@ -171,10 +171,7 @@ function raceContainerDeath<T>(
 
 // Module-private: only cloudflareSandbox() above uses it, and the entry-point
 // tests assert it stays off the cloudflare and internal barrels.
-function cfSandboxToSandbox(
-	sandbox: CloudflareSandboxStub,
-	cwd: string = '/workspace',
-): Sandbox {
+function cfSandboxToSandbox(sandbox: CloudflareSandboxStub, cwd: string = '/workspace'): Sandbox {
 	// Every container call goes through the death detector so a call that is
 	// in flight when the container dies settles instead of hanging forever.
 	const guarded = <T>(operation: string, rpc: Promise<T>): Promise<T> =>
@@ -226,16 +223,15 @@ function cfSandboxToSandbox(
 		},
 
 		async readdir(path: string): Promise<string[]> {
-			// NUL-separated `find` includes dotfiles (unlike plain `ls`) and
-			// survives filenames containing newlines.
+			// Newline-separated `find` includes dotfiles (unlike plain `ls`).
 			const result = await guarded(
 				'readdir',
-				sandbox.exec(`find ${shellQuote(path)} -mindepth 1 -maxdepth 1 -printf '%f\\0'`),
+				sandbox.exec(`find ${shellQuote(path)} -mindepth 1 -maxdepth 1 -printf '%f\\n'`),
 			);
 			if (!result.success) {
 				throw new Error(`readdir failed for ${path}: ${result.stderr}`);
 			}
-			return result.stdout.split('\0').filter((s: string) => s.length > 0);
+			return result.stdout.split('\n').filter((s: string) => s.length > 0);
 		},
 
 		async exists(path: string): Promise<boolean> {

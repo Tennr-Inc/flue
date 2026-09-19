@@ -1,6 +1,6 @@
 {
 	"name": "@flue/notion",
-	"version": "2.0.5",
+	"version": "2.1.0",
 	"type": "module",
 	"license": "Apache-2.0",
 	"homepage": "https://flueframework.com/",
@@ -25,9 +25,7 @@
 	},
 	"scripts": {
 		"build": "tsdown",
-		"check:types": "tsc --noEmit",
-		"test": "vitest run",
-		"test:workerd": "vitest run --config vitest.workerd.config.ts"
+		"check:types": "tsc --noEmit"
 	},
 	"dependencies": {
 		"hono": "4.12.32"

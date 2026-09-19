@@ -681,8 +681,10 @@ function unwrapExpression(node: unknown): unknown {
  * from the filename argument and otherwise parses in JS mode, rejecting
  * TypeScript-only syntax in agent modules.
  */
-export function parserLangForFile(filePath: string): 'ts' | 'js' {
-	return /\.(?:ts|mts|cts)$/.test(filePath) ? 'ts' : 'js';
+export function parserLangForFile(filePath: string): 'ts' | 'tsx' | 'js' | 'jsx' {
+	if (/\.tsx$/i.test(filePath)) return 'tsx';
+	if (/\.jsx$/i.test(filePath)) return 'jsx';
+	return /\.(?:ts|mts|cts)$/i.test(filePath) ? 'ts' : 'js';
 }
 
 async function scanAgentModuleFile(filePath: string): Promise<AgentModuleScan> {

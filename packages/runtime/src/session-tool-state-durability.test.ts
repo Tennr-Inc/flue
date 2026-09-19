@@ -311,6 +311,44 @@ describe('tool outcome and persistent-state durability', () => {
 		).toMatchObject([{ isError: false, output: 'requested' }]);
 	});
 
+	it('repairs a truncated approval-gated durable call without approving or running incomplete arguments', async () => {
+		const fixture = await createFixture();
+		const run = vi.fn(() => ({ output: 'must not execute' }));
+		function TestAgent() {
+			useModel('faux/faux-1', { compaction: false });
+			useTool({
+				name: 'guarded',
+				description: 'Requires complete arguments and approval.',
+				version: '1',
+				approval: { required: true },
+				durable: true,
+				run,
+			});
+			return 'Call guarded.';
+		}
+		fixture.model.setResponses([
+			fauxAssistantMessage([fauxToolCall('guarded', {}, { id: 'truncated' })], {
+				stopReason: 'length',
+			}),
+		]);
+		fixture.inject('before');
+		await expect(fixture.attempt(TestAgent)).rejects.toBe(fixture.crash);
+		await fixture.reopen();
+		fixture.model.setResponses([fauxAssistantMessage('Recovered safely.')]);
+		expect(await fixture.attempt(TestAgent)).toMatchObject({ status: 'settled' });
+		expect(run).not.toHaveBeenCalled();
+		const records = await fixture.records();
+		expect(records.filter((record) => record.type === 'tool_approval_requested')).toEqual([]);
+		expect(records.filter((record) => record.type === 'tool_outcome')).toMatchObject([
+			{
+				toolCallId: 'truncated',
+				isError: true,
+				content: [{ type: 'text', text: expect.stringContaining('truncated') }],
+			},
+		]);
+		expect(records.filter((record) => record.type === 'tool_results_committed')).toHaveLength(1);
+	});
+
 	it('commits parallel success and error writes in setter order while discarding a timed-out sibling', async () => {
 		const fixture = await createFixture();
 		const abandoned = Promise.withResolvers<void>();

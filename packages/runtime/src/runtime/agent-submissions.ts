@@ -505,9 +505,32 @@ export async function reconcileInterruptedSubmission(
 	// requeue branches — exhausting either must never discard (or append a
 	// contradictory interruption advisory over) work that already completed.
 	const ctx = createContext(input.submissionId);
-	const state = (await createAgentSubmissionSessionHandler(agent, input, (s) =>
-		s.inspectSubmissionInput(input),
-	)(ctx)) as AgentSubmissionInspection;
+	let state: AgentSubmissionInspection;
+	try {
+		state = (await createAgentSubmissionSessionHandler(agent, input, (s) =>
+			s.inspectSubmissionInput(input),
+		)(ctx)) as AgentSubmissionInspection;
+	} catch (renderError) {
+		// A throwing render (e.g. a failing sandbox factory) never consumes an
+		// attempt or reaches the timeout check, so the submission used to retry
+		// forever on every wake. Past the deadline, settle it as timed out;
+		// before it, rethrow to keep the existing defer-and-wake behavior.
+		if (submission.timeoutAt > 0 && Date.now() >= submission.timeoutAt) {
+			await failInterruptedSubmission(
+				submissions,
+				submission,
+				attempt,
+				agent,
+				'exceeded_timeout',
+				() => new SubmissionTimeoutError(),
+				createContext,
+				conversationWriter,
+				emitCoordinatorEvent,
+			);
+			return undefined;
+		}
+		throw renderError;
+	}
 	if (state === 'completed') {
 		await settleJoinedSubmissions(
 			submissions,

@@ -56,6 +56,7 @@ import type { FlueObservationSubscriber } from '../../observation.ts';
 import {
 	agentInputMessage,
 	agentOutputMessage,
+	assertContentBudgetBytes,
 	CONTENT_ATTR,
 	type ContentLedger,
 	type ContentOption,
@@ -78,6 +79,17 @@ export interface CloudflareTracingOptions {
 	 * content on with the safety-net truncation alone.
 	 */
 	content?: ContentOption;
+	/**
+	 * Per-span content pool in bytes, defaulting to `CONTENT_BUDGET_BYTES`
+	 * (56 KiB, sized to workerd's 64 KiB span-attribute cap). On this backend
+	 * it is a tightening control only: workerd's span cap is a platform limit
+	 * no setting raises, so a value above the default does not ship fuller
+	 * content — the oversized write is silently dropped and can suppress the
+	 * usage, finish, and error attributes written after it. Raise the pool on
+	 * the OpenTelemetry adapter instead, for a backend without that cap. Must
+	 * be a safe integer of at least 128 bytes; invalid values throw.
+	 */
+	contentBudgetBytes?: number;
 }
 
 /**
@@ -158,6 +170,7 @@ function bindPlatformTracing(): PlatformTracing {
 export function createCloudflareTracing(
 	options: CloudflareTracingOptions = {},
 ): FlueInstrumentation {
+	assertContentBudgetBytes(options.contentBudgetBytes);
 	const platform = bindPlatformTracing();
 	const content = options.content;
 	const pending = new Map<string, PendingSpan>();
@@ -175,7 +188,7 @@ export function createCloudflareTracing(
 			const tracked: TrackedSpan = {
 				span: opened,
 				ended: false,
-				ledger: createContentLedger(),
+				ledger: createContentLedger(options.contentBudgetBytes),
 				operationKey: owner,
 				submissionId: span.submissionId,
 			};
@@ -261,7 +274,7 @@ export function createCloudflareTracing(
 	): void {
 		platform.startActiveSpan('submission_recovery', (span) => {
 			writeAttributes(
-				{ span, ended: false, ledger: createContentLedger() },
+				{ span, ended: false, ledger: createContentLedger(options.contentBudgetBytes) },
 				{
 					[FLUE_ATTR.submissionId]: event.submissionId,
 					[FLUE_ATTR.recoveryOperation]: event.operation,
@@ -319,6 +332,7 @@ export function createCloudflareTracing(
 					[FLUE_ATTR.instanceId]: event.instanceId,
 					[ATTR.conversationId]: event.conversationId,
 					[FLUE_ATTR.submissionId]: event.submissionId,
+					[FLUE_ATTR.operationId]: event.operationId,
 					[FLUE_ATTR.operationKind]: event.operationKind,
 				}),
 			});
@@ -333,6 +347,8 @@ export function createCloudflareTracing(
 					[ATTR.agentName]: event.agent,
 					[ATTR.conversationId]: event.conversationId,
 					[ATTR.toolCallId]: event.toolCallId,
+					[FLUE_ATTR.submissionId]: event.submissionId,
+					[FLUE_ATTR.operationId]: event.operationId,
 					[FLUE_ATTR.taskId]: event.taskId,
 					...contentEntry(
 						ledger,
@@ -365,6 +381,9 @@ export function createCloudflareTracing(
 					// agent context on LLM-call spans the same way (#535).
 					[ATTR.agentName]: event.agentName,
 					[ATTR.conversationId]: event.conversationId,
+					[FLUE_ATTR.submissionId]: event.submissionId,
+					[FLUE_ATTR.operationId]: event.operationId,
+					[FLUE_ATTR.turnId]: event.turnId,
 					[ATTR.reasoningLevel]: request.reasoningLevel,
 					[ATTR.maxTokens]: request.maxTokens,
 					[ATTR.temperature]: request.temperature,
@@ -421,6 +440,8 @@ export function createCloudflareTracing(
 					owner: ownerKey(event),
 					submissionId: event.submissionId,
 					attributes: () => ({
+						[FLUE_ATTR.submissionId]: event.submissionId,
+						[FLUE_ATTR.operationId]: event.operationId,
 						[FLUE_ATTR.toolOrigin]: event.origin,
 					}),
 				});
@@ -439,6 +460,9 @@ export function createCloudflareTracing(
 					// tool runs on behalf of.
 					[ATTR.agentName]: event.agentName,
 					[ATTR.conversationId]: event.conversationId,
+					[FLUE_ATTR.submissionId]: event.submissionId,
+					[FLUE_ATTR.operationId]: event.operationId,
+					[FLUE_ATTR.turnId]: event.turnId,
 					[FLUE_ATTR.toolOrigin]: event.origin,
 					...contentEntry(
 						ledger,
@@ -567,7 +591,11 @@ export function createCloudflareTracing(
 			// One stable span name; phases distinguish by attribute so views
 			// keyed on the name survive new phases.
 			return platform.startActiveSpan('flue.coordinator', (opened) => {
-				const tracked: TrackedSpan = { span: opened, ended: false, ledger: createContentLedger() };
+				const tracked: TrackedSpan = {
+					span: opened,
+					ended: false,
+					ledger: createContentLedger(options.contentBudgetBytes),
+				};
 				if (opened.isTraced) {
 					writeAttributes(tracked, {
 						[FLUE_ATTR.coordinatorPhase]: operation.phase,

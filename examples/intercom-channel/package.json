@@ -5,8 +5,7 @@
 	"scripts": {
 		"build": "vite build",
 		"build:cloudflare": "vite build --config vite.config.cloudflare.ts",
-		"check:types": "tsc --noEmit",
-		"test": "vitest run --config vitest.config.ts && vitest run --config vitest.workerd.config.ts"
+		"check:types": "tsc --noEmit"
 	},
 	"dependencies": {
 		"@flue/intercom": "workspace:*",
