@@ -1,8 +1,9 @@
+import { getConversationFoldHost } from '../conversation-fold-host.ts';
+import type { ConversationTranscript } from '../conversation-projections.ts';
 import {
 	type ConversationStreamCheckpointChunk,
 	projectAgentConversationSnapshot,
 } from '../conversation-public.ts';
-import { getConversationFoldHost } from '../conversation-fold-host.ts';
 import { loadReducedConversationPrefix } from '../conversation-reader.ts';
 import type { ReducedInstanceState } from '../conversation-reducer.ts';
 import {
@@ -37,8 +38,14 @@ export async function handleAgentConversationRead(options: {
 }): Promise<Response> {
 	const url = new URL(options.request.url);
 	const view = url.searchParams.get('view') ?? 'history';
-	if (view === 'history') return historyResponse(options);
-	if (view === 'updates') return updatesResponse(options);
+	const transcript = url.searchParams.get('transcript') ?? 'combined';
+	if (transcript !== 'combined' && transcript !== 'chronological') {
+		return errorResponse(
+			new InvalidRequestError({ reason: 'Invalid transcript. Use combined or chronological.' }),
+		);
+	}
+	if (view === 'history') return historyResponse({ ...options, transcript });
+	if (view === 'updates') return updatesResponse({ ...options, transcript });
 	return errorResponse(
 		new InvalidRequestError({ reason: 'Invalid agent conversation view. Use history or updates.' }),
 	);
@@ -111,6 +118,7 @@ export async function handleAgentConversationHead(
 }
 
 async function historyResponse(options: {
+	transcript: ConversationTranscript;
 	store: ConversationStreamStore;
 	path: string;
 	request: Request;
@@ -130,7 +138,7 @@ async function historyResponse(options: {
 	const meta = await options.store.getMeta(options.path);
 	if (!meta) return errorResponse(new StreamNotFoundError({ path: options.path }));
 	const state = await getConversationFoldHost(options.store, options.path).getStateAtHead();
-	const snapshot = projectAgentConversationSnapshot(state);
+	const snapshot = projectAgentConversationSnapshot(state, options.transcript);
 	if (!snapshot) return errorResponse(new StreamNotFoundError({ path: options.path }));
 	// The projection is meta-free; the route stamps the stream's generation
 	// identity so `observe()` can detect a reset-and-regrown stream mid-follow
@@ -146,6 +154,7 @@ async function historyResponse(options: {
 }
 
 async function updatesResponse(options: {
+	transcript: ConversationTranscript;
 	store: ConversationStreamStore;
 	path: string;
 	request: Request;
@@ -183,7 +192,14 @@ async function updatesResponse(options: {
 		incarnation: meta.incarnation,
 	};
 	if (live === 'sse') {
-		return sseResponse(options.store, options.path, offset, checkpoint, options.request.signal);
+		return sseResponse(
+			options.store,
+			options.path,
+			offset,
+			checkpoint,
+			options.request.signal,
+			options.transcript,
+		);
 	}
 	const state = await stateAtOffset(options.store, options.path, offset);
 	let read = await options.store.read(options.path, { offset });
@@ -197,7 +213,7 @@ async function updatesResponse(options: {
 		if (waited === 'aborted') return new Response(null, { status: 499, headers: SECURITY_HEADERS });
 		read = waited;
 	}
-	const projected = projectConversationRead(state, read);
+	const projected = projectConversationRead(state, read, options.transcript);
 	return dsJsonResponse([checkpoint, ...projected.items], read, projected.offset);
 }
 
@@ -240,6 +256,7 @@ function sseResponse(
 	offset: string,
 	checkpoint: ConversationStreamCheckpointChunk,
 	signal: AbortSignal,
+	transcript: ConversationTranscript,
 ): Response {
 	const encoder = new TextEncoder();
 	let active = true;
@@ -277,7 +294,7 @@ function sseResponse(
 				while (active) {
 					pending = false;
 					const read = await store.read(path, { offset: currentOffset });
-					const projected = projectConversationRead(state, read);
+					const projected = projectConversationRead(state, read, transcript);
 					state = projected.state;
 					if (projected.items.length > 0) {
 						controller.enqueue(

@@ -188,7 +188,7 @@ export function createFlueClient(options: CreateFlueClientOptions): FlueClient {
 		history: async (opts = {}) =>
 			rewriteSnapshotAttachmentUrls(
 				await http.json<FlueConversationSnapshot>({
-					query: { view: 'history' },
+					query: { view: 'history', transcript: opts.transcript },
 					signal: opts.signal,
 				}),
 				http,
@@ -199,7 +199,7 @@ export function createFlueClient(options: CreateFlueClientOptions): FlueClient {
 					history: async (historyOptions) =>
 						rewriteSnapshotAttachmentUrls(
 							await http.json<FlueConversationSnapshot>({
-								query: { view: 'history' },
+								query: { view: 'history', transcript: opts.transcript },
 								signal: historyOptions.signal,
 							}),
 							http,
@@ -208,7 +208,7 @@ export function createFlueClient(options: CreateFlueClientOptions): FlueClient {
 						createFlueEventStream<ConversationStreamChunk>(
 							updateOptions,
 							{
-								url: http.url('', { view: 'updates' }),
+								url: http.url('', { view: 'updates', transcript: opts.transcript }),
 								fetch: http.fetchWithHeaders.bind(http),
 								onActivity,
 							},

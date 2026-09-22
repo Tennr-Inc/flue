@@ -235,14 +235,29 @@ history(options?: FlueConversationHistoryOptions): Promise<FlueConversationSnaps
 
 ```ts
 interface FlueConversationHistoryOptions {
+  transcript?: 'combined' | 'chronological';
   signal?: AbortSignal;
 }
 ```
+
+### Chronological transcripts
+
+Use `transcript: 'chronological'` to keep each assistant model step as a separate message. For example, an assistant step, a user steer, and the next assistant step appear in that order. Each step retains its own `id` and `turnId`. The default, `'combined'`, folds all steps of a submission into its first assistant message.
+
+```ts
+const history = await client.history({ transcript: 'chronological' });
+const observation = client.observe({ transcript: 'chronological', live: 'sse' });
+```
+
+The observation uses the same view for initial history, live updates, refresh, and reconnects. Render `messages` in their returned order. Tool outputs stay attached to their assistant step; named data rewrites retain their first-write location. Response metadata is shared across the submission's steps. `readSubmissionReply()` combines those steps when reading a chronological snapshot or observation, preserving the reply returned by the default view. `read()` and `wait()` retain their existing behavior.
+
+The chronological snapshot and observation state carry `transcript: 'chronological'`; keep that field when passing state to `readSubmissionReply()`. This option requires a runtime and SDK that both support chronological transcripts. It changes only the public UI projection, without exposing canonical records or changing agent execution, steering, or settlements.
 
 ### `FlueConversationSnapshot`
 
 ```ts
 interface FlueConversationSnapshot {
+  transcript?: 'combined' | 'chronological';
   v: 1;
   conversationId: string;
   offset: string;
@@ -301,7 +316,7 @@ interface FlueConversationMessage {
 }
 ```
 
-One message in a materialized conversation. An assistant message is one whole response: every model step of a tracked submission (text, tool calls, tool results, more text) accumulates as parts of a single message, in stream order — the same one-message-per-response shape as the AI SDK's `UIMessage`.
+One message in a materialized conversation. By default, an assistant message is one whole response: every model step of a tracked submission (text, tool calls, tool results, more text) accumulates as parts of a single message, in stream order — the same one-message-per-response shape as the AI SDK's `UIMessage`.
 
 | Field          | Description                                                                                                                                                                                                                                                                                                                                                  |
 | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -413,6 +428,7 @@ Chunk application is safe under at-least-once redelivery: every chunk carries a 
 
 ```ts
 interface AgentConversationObserveOptions {
+  transcript?: 'combined' | 'chronological';
   live?: ConversationLiveMode;
   signal?: AbortSignal;
   backoffOptions?: BackoffOptions;
@@ -494,6 +510,7 @@ type AgentConversationObservationPhase =
 
 ```ts
 interface FlueConversationState {
+  transcript?: 'combined' | 'chronological';
   conversationId: string;
   messages: FlueConversationMessage[];
   settlements: FlueConversationSettlement[];
