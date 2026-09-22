@@ -15,6 +15,7 @@
  */
 
 import { getConversationFoldHost } from '../conversation-fold-host.ts';
+import type { ConversationTranscript } from '../conversation-projections.ts';
 import {
 	type AgentConversationSnapshot,
 	type ConversationStreamChunk,
@@ -41,6 +42,7 @@ type ReducedPrefix = Awaited<ReturnType<typeof loadReducedConversationPrefix>>;
 export function projectConversationRead(
 	initialState: ReducedPrefix,
 	read: ConversationStreamReadResult,
+	transcript: ConversationTranscript = 'combined',
 ): { state: ReducedPrefix; items: ConversationStreamChunk[]; offset: string } {
 	let state = initialState;
 	const items: ConversationStreamChunk[] = [];
@@ -52,6 +54,7 @@ export function projectConversationRead(
 			...projectAgentConversationBatch({
 				state,
 				previousState,
+				transcript,
 				records: batch.records,
 				batchOrdinal: parseOffset(batch.offset),
 			}),

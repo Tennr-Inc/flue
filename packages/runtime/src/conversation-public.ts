@@ -1,4 +1,5 @@
 import {
+	type ConversationTranscript,
 	type ConversationUiMessage,
 	type ConversationUiSnapshot,
 	classifySignal,
@@ -55,6 +56,8 @@ export interface AgentConversationToolApproval {
  */
 export interface AgentConversationSnapshot {
 	v: 1;
+	/** Omitted for the default combined response view. */
+	transcript?: ConversationTranscript;
 	conversationId: string;
 	offset: string;
 	/**
@@ -216,15 +219,18 @@ function selectRootConversation(state: ReducedInstanceState) {
 
 export function projectAgentConversationSnapshot(
 	state: ReducedInstanceState,
+	transcript: ConversationTranscript = 'combined',
 ): AgentConversationSnapshot | undefined {
 	const conversation = selectRootConversation(state);
 	if (!conversation) return undefined;
 	const ui: ConversationUiSnapshot = projectConversationUi(
 		conversation,
 		state.recordsThroughOffset,
+		transcript,
 	);
 	return {
 		v: 1,
+		...(transcript === 'chronological' ? { transcript } : {}),
 		conversationId: conversation.conversationId,
 		offset: ui.streamOffset,
 		messages: ui.messages,
@@ -236,6 +242,7 @@ export function projectAgentConversationSnapshot(
 export function projectAgentConversationBatch(options: {
 	state: ReducedInstanceState;
 	previousState?: ReducedInstanceState;
+	transcript?: ConversationTranscript;
 	records: readonly ConversationRecord[];
 	/** Durable batch ordinal these records were read at; stamped onto each chunk. */
 	batchOrdinal: number;
@@ -251,7 +258,7 @@ export function projectAgentConversationBatch(options: {
 	// A reset subsumes the whole batch: a fresh snapshot already reflects every
 	// record in it, so emitting per-record chunks too would double-apply.
 	if (relevant.some((record) => requiresSnapshotReset(record, options.state))) {
-		const snapshot = projectAgentConversationSnapshot(options.state);
+		const snapshot = projectAgentConversationSnapshot(options.state, options.transcript);
 		return snapshot
 			? withPositions(
 					[{ type: 'conversation-reset', conversationId, snapshot }],
@@ -260,9 +267,15 @@ export function projectAgentConversationBatch(options: {
 			: [];
 	}
 
-	const responseIds = buildResponseMessageIndex(conversation);
+	// Chronological chunks keep each assistant step's canonical identity.
+	const responseIds =
+		options.transcript === 'chronological'
+			? new Map<string, string>()
+			: buildResponseMessageIndex(conversation);
 	return withPositions(
-		relevant.flatMap((record) => encodeRecord(record, conversationId, options.state, responseIds)),
+		relevant.flatMap((record) =>
+			encodeRecord(record, conversationId, options.state, responseIds, options.transcript),
+		),
 		options.batchOrdinal,
 	);
 }
@@ -334,6 +347,7 @@ function encodeRecord(
 	conversationId: string,
 	state: ReducedInstanceState,
 	responseIds: Map<string, string>,
+	transcript: ConversationTranscript = 'combined',
 ): ConversationStreamChunkBody[] {
 	// Assistant records of a tracked submission address the submission's
 	// response message, not the per-step canonical message.
@@ -392,7 +406,11 @@ function encodeRecord(
 				},
 			];
 		}
-		case 'assistant_message_started':
+		case 'assistant_message_started': {
+			const metadata =
+				transcript === 'chronological' && record.submissionId
+					? state.conversations.get(conversationId)?.responseMetadata.get(record.submissionId)
+					: record.responseMetadata;
 			return [
 				{
 					type: 'message-started',
@@ -400,18 +418,51 @@ function encodeRecord(
 					messageId: uiMessageId(record.messageId),
 					...(record.submissionId ? { submissionId: record.submissionId } : {}),
 					...(record.turnId ? { turnId: record.turnId } : {}),
-					...(record.responseMetadata ? { metadata: record.responseMetadata } : {}),
+					...(metadata ? { metadata } : {}),
 					...(record.timestamp ? { timestamp: record.timestamp } : {}),
 				},
 			];
+		}
 		case 'message_metadata': {
+			if (transcript === 'chronological') {
+				const conversation = state.conversations.get(conversationId);
+				if (!conversation || !record.submissionId) return [];
+				// Metadata belongs to the whole response, so update every rendered step.
+				const messageIds = [
+					...getActiveConversationPath(conversation)
+						.filter(
+							(entry) =>
+								entry.type === 'message' &&
+								entry.message.role === 'assistant' &&
+								entry.submissionId === record.submissionId,
+						)
+						.map((entry) => entry.id),
+					...[...conversation.inProgressMessages.values()]
+						.filter((message) => message.submissionId === record.submissionId)
+						.map((message) => message.messageId),
+				];
+				return messageIds.map((messageId) => ({
+					type: 'message-metadata',
+					conversationId,
+					messageId,
+					metadata: record.metadata,
+				}));
+			}
 			const messageId = record.submissionId ? responseIds.get(record.submissionId) : undefined;
 			return messageId
 				? [{ type: 'message-metadata', conversationId, messageId, metadata: record.metadata }]
 				: [];
 		}
 		case 'message_data_write': {
-			const messageId = record.submissionId ? responseIds.get(record.submissionId) : undefined;
+			// Rewrites retain the data part's first-write anchor, even after a steer.
+			const messageId = record.submissionId
+				? transcript === 'chronological'
+					? state.conversations
+							.get(conversationId)
+							?.responseDataParts.get(record.submissionId)
+							?.find((part) => part.name === record.name)?.anchorEntryId
+					: responseIds.get(record.submissionId)
+				: undefined;
 			return messageId
 				? [{ type: 'data-part', conversationId, messageId, name: record.name, data: record.data }]
 				: [];
