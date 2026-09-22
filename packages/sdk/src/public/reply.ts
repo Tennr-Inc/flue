@@ -16,7 +16,11 @@
  * so a reply read over HTTP and one read in-process agree byte for byte.
  */
 
-import type { FlueConversationMessage, FlueConversationSettlement } from './conversation.ts';
+import type {
+	FlueConversationMessage,
+	FlueConversationSettlement,
+	FlueConversationTranscript,
+} from './conversation.ts';
 
 /** The reply a settled submission produced, read from the conversation. */
 export interface AgentSubmissionReply {
@@ -32,6 +36,7 @@ export interface AgentSubmissionReply {
 }
 
 /**
+ * Chronological views combine the selected response's assistant steps first.
  * Read the reply the given submission produced: the final assistant message
  * stamped with its `submissionId`. A submission that joined a busy response
  * settles under the host's response — its settlement's
@@ -47,6 +52,7 @@ export function readSubmissionReply(
 	conversation: {
 		messages: FlueConversationMessage[];
 		settlements?: FlueConversationSettlement[];
+		transcript?: FlueConversationTranscript;
 	},
 	submissionId: string,
 ): AgentSubmissionReply {
@@ -66,7 +72,13 @@ export function readSubmissionReply(
 	}
 	if (!reply) return { text: '', data: {} };
 
-	const text = reply.parts
+	const parts =
+		conversation.transcript === 'chronological' && reply.submissionId
+			? assistantMessages
+					.filter((message) => message.submissionId === reply.submissionId)
+					.flatMap((message) => message.parts)
+			: reply.parts;
+	const text = parts
 		.filter(
 			(part): part is Extract<(typeof reply.parts)[number], { type: 'text' }> =>
 				part.type === 'text' && typeof part.text === 'string',
@@ -75,7 +87,7 @@ export function readSubmissionReply(
 		.join('\n\n');
 
 	const data: Record<string, unknown[]> = {};
-	for (const part of reply.parts) {
+	for (const part of parts) {
 		if (!part.type.startsWith('data-')) continue;
 		const name = part.type.slice('data-'.length);
 		const values = data[name] ?? [];

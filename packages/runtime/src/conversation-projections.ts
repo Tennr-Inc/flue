@@ -243,14 +243,17 @@ export function supersededAssistantErrorEntryIds(
 	return superseded;
 }
 
+export type ConversationTranscript = 'combined' | 'chronological';
+
 export function projectConversationUi(
 	conversation: ReducedConversationState,
 	streamOffset: string,
+	transcript: ConversationTranscript = 'combined',
 ): ConversationUiSnapshot {
 	const messages: ConversationUiMessage[] = [];
 	const byId = new Map<string, ConversationUiMessage>();
 	const supersededErrors = supersededAssistantErrorEntryIds(conversation);
-	// One UI message per assistant response (the UIMessage ecosystem shape):
+	// By default, one UI message per assistant response (the UIMessage ecosystem shape):
 	// every assistant step of a tracked submission folds into the submission's
 	// first assistant message, parts accumulating across steps in record order.
 	const responseBySubmission = new Map<string, ConversationUiMessage>();
@@ -259,7 +262,8 @@ export function projectConversationUi(
 		const projected = projectCompletedMessage(entry, supersededErrors.has(entry.id));
 		if (projected) {
 			if (projected.role === 'assistant' && projected.submissionId) {
-				const open = responseBySubmission.get(projected.submissionId);
+				const open =
+					transcript === 'combined' ? responseBySubmission.get(projected.submissionId) : undefined;
 				if (open) {
 					mergeAssistantContinuation(open, projected);
 					appendAnchoredDataParts(open, conversation, projected.submissionId, projected.id);
@@ -325,7 +329,9 @@ export function projectConversationUi(
 		// partial from an interrupted attempt awaiting terminalization —
 		// projects standalone, as before.
 		const open =
-			projected.submissionId && inProgress.parentId === conversation.activeLeafId
+			transcript === 'combined' &&
+			projected.submissionId &&
+			inProgress.parentId === conversation.activeLeafId
 				? responseBySubmission.get(projected.submissionId)
 				: undefined;
 		if (open) {

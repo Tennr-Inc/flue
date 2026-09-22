@@ -198,6 +198,7 @@ export interface FlueToolApproval {
  * Flue's own observation machinery.
  */
 export interface FlueConversationSnapshot {
+	transcript?: FlueConversationTranscript;
 	v: 1;
 	conversationId: string;
 	offset: string;
@@ -219,13 +220,18 @@ export interface FlueConversationSnapshot {
 
 /** Live materialized conversation maintained by `observe()`. */
 export interface FlueConversationState {
+	transcript?: FlueConversationTranscript;
 	conversationId: string;
 	messages: FlueConversationMessage[];
 	settlements: FlueConversationSettlement[];
 	toolApprovals: FlueToolApproval[];
 }
 
+/** Combined responses (default), or separate assistant steps in conversation order. */
+export type FlueConversationTranscript = 'combined' | 'chronological';
+
 /** Options for one `history()` read. */
 export interface FlueConversationHistoryOptions {
+	transcript?: FlueConversationTranscript;
 	signal?: AbortSignal;
 }

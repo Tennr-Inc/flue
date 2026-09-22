@@ -1,5 +1,9 @@
 import type { BackoffOptions } from '@durable-streams/client';
-import type { FlueConversationSnapshot, FlueConversationState } from './conversation.ts';
+import type {
+	FlueConversationSnapshot,
+	FlueConversationState,
+	FlueConversationTranscript,
+} from './conversation.ts';
 import {
 	applyConversationChunk,
 	type ConversationChunkPosition,
@@ -41,6 +45,8 @@ export interface AgentConversationObservationSnapshot {
 }
 
 export interface AgentConversationObserveOptions {
+	/** Applied to history, live updates, refresh, and reconnect hydration. */
+	transcript?: FlueConversationTranscript;
 	live?: ConversationLiveMode;
 	signal?: AbortSignal;
 	backoffOptions?: BackoffOptions;

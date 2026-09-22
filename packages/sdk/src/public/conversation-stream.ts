@@ -224,6 +224,7 @@ export function createConversationStreamState(
 	snapshot: FlueConversationSnapshot,
 ): FlueConversationState {
 	return {
+		...(snapshot.transcript ? { transcript: snapshot.transcript } : {}),
 		conversationId: snapshot.conversationId,
 		messages: snapshot.messages,
 		settlements: snapshot.settlements,

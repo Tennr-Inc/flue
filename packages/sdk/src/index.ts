@@ -25,6 +25,7 @@ export type {
 	FlueConversationSettlement,
 	FlueConversationSnapshot,
 	FlueConversationState,
+	FlueConversationTranscript,
 	FlueToolApproval,
 	FlueToolApprovalDecisionStatus,
 	FlueToolApprovalPresentation,
