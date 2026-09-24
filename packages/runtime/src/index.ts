@@ -174,6 +174,7 @@ export type {
 	ModelResponse,
 	PackagedSkillDirectory,
 	PackagedSkillFile,
+	PromptDocument,
 	PromptImage,
 	PromptModel,
 	PromptOptions,

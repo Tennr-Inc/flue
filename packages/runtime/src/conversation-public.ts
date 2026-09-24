@@ -7,7 +7,11 @@ import {
 } from './conversation-projections.ts';
 import type { ConversationRecord, SubmissionSettledRecord } from './conversation-records.ts';
 import type { ReducedConversationState, ReducedInstanceState } from './conversation-reducer.ts';
-import { getActiveConversationPath, toolResultEntryId } from './conversation-reducer.ts';
+import {
+	getActiveConversationPath,
+	hasUncommittedToolBatchAtLeaf,
+	toolResultEntryId,
+} from './conversation-reducer.ts';
 import { toolResultOutput, toolResultText } from './message-rendering.ts';
 import type { ToolApprovalPresentation, ToolApprovalStatus } from './tool-approval.ts';
 
@@ -24,6 +28,8 @@ interface AgentConversationSettlement {
 	 * on attempts that produced no assistant message.
 	 */
 	answeredBySubmissionId?: string;
+	/** Capture time (ISO 8601) of the `submission_settled` record. */
+	timestamp?: string;
 }
 
 /**
@@ -70,6 +76,13 @@ export interface AgentConversationSnapshot {
 	messages: ConversationUiMessage[];
 	settlements: AgentConversationSettlement[];
 	toolApprovals: AgentConversationToolApproval[];
+	/**
+	 * Present only on bounded history reads (`limit` / `from`): the cursor for
+	 * the next older page — the id of the oldest returned message — or `null`
+	 * when `messages` starts at the beginning of the conversation. Absent on
+	 * unbounded reads and on `conversation-reset` snapshots.
+	 */
+	before?: string | null;
 }
 
 /**
@@ -81,9 +94,10 @@ export interface AgentConversationSnapshot {
  * Boundary chunks (`message-started`, `tool-input`, `tool-output`,
  * `tool-output-error`, `message-completed`, `submission-settled`) carry the
  * capture-time `timestamp` of their underlying canonical record so run
- * chronology can be reconstructed from the stream. `message-delta`
- * deliberately omits it for wire weight — consumers interpolate between
- * stamped boundaries.
+ * chronology can be reconstructed from the stream; `message-appended` carries
+ * it on the embedded message (the same value the snapshot projects).
+ * `message-delta` deliberately omits it for wire weight — consumers
+ * interpolate between stamped boundaries.
  */
 type ConversationStreamChunkBody =
 	| { type: 'conversation-reset'; conversationId: string; snapshot: AgentConversationSnapshot }
@@ -233,6 +247,51 @@ export function projectAgentConversationSnapshot(
 	};
 }
 
+/**
+ * Ids of the projected messages in the root conversation that can still be
+ * the target of a future live chunk. A bounded history window must include
+ * all of them (see `conversation-history-window.ts`): the live stream
+ * addresses streaming content, metadata, data parts, tool results, and
+ * completion to a message by id, and a client drops chunks for messages it
+ * does not hold — so cutting one out loses its future content for good.
+ *
+ * - The response message of every tracked submission that has not settled.
+ *   A response keeps its first step's position while later steps (possibly
+ *   after joined deliveries) stream into it, so it can sit well above the
+ *   newest messages.
+ * - Every in-progress assistant message, under both its response id and its
+ *   own id (an interrupted ghost projects standalone until terminalized),
+ *   including zero-part shells.
+ * - The leaf assistant of an uncommitted tool batch, whose tool results are
+ *   still to arrive (covers untracked turns with no submission).
+ */
+export function projectLiveMessageTargets(state: ReducedInstanceState): ReadonlySet<string> {
+	const targets = new Set<string>();
+	const conversation = selectRootConversation(state);
+	if (!conversation) return targets;
+	const settled = new Set(
+		projectSettlements(state, conversation.conversationId).map((entry) => entry.submissionId),
+	);
+	const responseIds = buildResponseMessageIndex(conversation);
+	for (const [submissionId, messageId] of responseIds) {
+		if (!settled.has(submissionId)) targets.add(messageId);
+	}
+	for (const message of conversation.inProgressMessages.values()) {
+		targets.add(message.messageId);
+		const response = message.submissionId ? responseIds.get(message.submissionId) : undefined;
+		if (response) targets.add(response);
+	}
+	if (hasUncommittedToolBatchAtLeaf(conversation) && conversation.activeLeafId) {
+		const leaf = conversation.entries.get(conversation.activeLeafId);
+		const response =
+			leaf?.type === 'message' && leaf.submissionId
+				? responseIds.get(leaf.submissionId)
+				: undefined;
+		targets.add(response ?? conversation.activeLeafId);
+	}
+	return targets;
+}
+
 export function projectAgentConversationBatch(options: {
 	state: ReducedInstanceState;
 	previousState?: ReducedInstanceState;
@@ -352,6 +411,7 @@ function encodeRecord(
 						display: 'visible',
 						...(record.submissionId ? { submissionId: record.submissionId } : {}),
 						...(record.turnId ? { turnId: record.turnId } : {}),
+						...(record.timestamp ? { timestamp: record.timestamp } : {}),
 						parts: record.content.map((content) =>
 							content.type === 'text'
 								? { type: 'text', text: content.text, state: 'done' }
@@ -387,6 +447,7 @@ function encodeRecord(
 						...(record.turnId ? { turnId: record.turnId } : {}),
 						...(Object.keys(signal).length > 0 ? { signal } : {}),
 						...(settlement ? { settlement } : {}),
+						...(record.timestamp ? { timestamp: record.timestamp } : {}),
 						parts: [{ type: 'text', text: record.content, state: 'done' }],
 					},
 				},
@@ -606,6 +667,7 @@ function projectSettlements(
 				outcome: record.outcome,
 				...(record.error === undefined ? {} : { error: record.error }),
 				...(by === undefined ? {} : { answeredBySubmissionId: by }),
+				...(record.timestamp ? { timestamp: record.timestamp } : {}),
 			};
 		});
 }

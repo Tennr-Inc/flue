@@ -1,5 +1,6 @@
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
 import type { Context, ToolCall } from '@earendil-works/pi-ai';
+import { getCurrentSystemPrompt, getCurrentTools } from '@earendil-works/pi-ai';
 import {
 	fauxAssistantMessage,
 	fauxProvider,
@@ -344,8 +345,14 @@ describe('tool approval lifecycle', () => {
 		]);
 		expect(await fixture.attempt(TestAgent)).toMatchObject({ status: 'settled' });
 		expect((await fixture.writer.loadReducedState()).state.get('phase')).toBe('done');
-		expect(nextRequest?.systemPrompt).toContain('phase=done');
-		expect(nextRequest?.tools?.map((tool) => tool.name)).toContain('unlocked');
+		// Pi 0.86+ carries the prompt and tool set as transcript system messages.
+		const nextMessages = nextRequest?.messages ?? [];
+		expect(nextRequest?.systemPrompt ?? getCurrentSystemPrompt(nextMessages)).toContain(
+			'phase=done',
+		);
+		expect(
+			(nextRequest?.tools ?? getCurrentTools(nextMessages)).map((tool) => tool.name),
+		).toContain('unlocked');
 		expect(readPhase).toHaveBeenCalledExactlyOnceWith('done');
 	});
 
