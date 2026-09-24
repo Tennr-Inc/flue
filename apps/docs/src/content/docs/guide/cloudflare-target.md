@@ -117,6 +117,48 @@ When a Durable Object resumes after interruption, Flue decides what to do next f
 
 For the full recovery model, see [Durability](/docs/guide/durability/).
 
+## Per-instance agent implementations
+
+By default, each durable instance executes the agent definition in the current Worker deployment. Configure an `agentResolver` module to select an implementation for each instance, for example from a persisted release pin:
+
+```ts
+// flue.config.ts
+import { defineConfig } from '@flue/runtime/config';
+
+export default defineConfig({
+  target: 'cloudflare',
+  agentResolver: './src/resolve-agent.ts',
+});
+```
+
+The module default-exports a `CloudflareAgentResolver`. Flue passes it to the runtime as `resolveAgentForInstance`:
+
+```ts
+// src/resolve-agent.ts
+import type { CloudflareAgentResolver } from '@flue/runtime/cloudflare';
+import { readAssignedRelease, loadAgentPackage } from './agent-packages';
+
+const resolveAgent: CloudflareAgentResolver = async ({ agentName, instance }) => {
+  const release = await readAssignedRelease(agentName, instance.name, instance.env);
+  const pkg = await loadAgentPackage(release);
+  const agent = pkg.agents[agentName];
+  if (!agent) throw new Error(`Release ${release} has no agent ${agentName}`);
+  return agent;
+};
+
+export default resolveAgent;
+```
+
+`readAssignedRelease` and `loadAgentPackage` above are application-owned functions, not Flue APIs. The application owns assigning and durably storing the release pin before the first execution, retaining packages, checking compatibility, and loading the chosen code. Use an atomic assignment when creating pins so retries and concurrent calls agree. Missing historical pins require an explicit application policy; do not silently treat them as the current release.
+
+The resolver runs **inside the durable instance**, with its name, environment bindings, and `instance.ctx.storage` SQL/transaction access. It also runs within Flue's Cloudflare context. It may run during background recovery with no incoming HTTP request. Flue shares concurrent resolution calls and caches a successful function for that instance's residency. A cold start resolves again, so the application must return the same implementation from its persisted pin. Updating a pin does not change an already-resident instance's cached selection.
+
+The selected function supplies the implementation, initial-data schema, and durability policy used for new submissions. Previously stamped submission retry budgets remain durable. If resolution throws, admission fails and background work remains scheduled for a later retry; Flue does not substitute the currently registered agent. A failed lookup is not cached, and queued work is not claimed until its implementation is available.
+
+Keep one scanned `'use agent'` registration for each durable identity; this still supplies routing, the generated class, and the binding. Historical implementations must carry the same identity (set a literal `agentName` static on separately packaged functions to survive minification). Do not scan multiple historical definitions under the same identity or swap the global registration while resolving a cell. If there are several registered identities, the resolver must handle every identity it serves, including explicit current-definition selections where desired.
+
+This hook selects **agent code only**. Flue, the Agents SDK, generated classes, `cloudflare` extensions, routing middleware, providers, and storage/recovery machinery come from the current deployment. Historical code and state must remain compatible with that runtime. Agent packages must share the deployed `@flue/runtime` module instance for hooks and context; do not bundle a separate copy. The hook itself does not provide S3 fetching or a remote JavaScript evaluator: the application's loader must use capabilities supported by its Worker host.
+
 ## Calling a private agent over a service binding
 
 A Flue Worker deployed without a public route can still be reached from another Worker through a [service binding](https://developers.cloudflare.com/workers/runtime-apis/bindings/service-bindings/). The Flue Agent SDK client sends every request through its `fetch` option, so point that option at the binding instead of the network:

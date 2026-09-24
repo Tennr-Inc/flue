@@ -24,7 +24,8 @@
 		"prebuild": "tsx scripts/generate-blueprint-index.ts",
 		"build": "tsdown && mv dist/flue.mjs dist/flue.js",
 		"prepack": "node ../../scripts/build-docs.mjs cli",
-		"check:types": "tsc --noEmit"
+		"check:types": "tsc --noEmit",
+		"test": "vitest run"
 	},
 	"dependencies": {
 		"@flue/runtime": "workspace:*",

@@ -319,6 +319,9 @@ export function flue(config: FlueConfig = {}): Plugin[] {
 			const preliminaryTarget =
 				merged.target ?? (containsCloudflarePlugin(userConfig.plugins) ? 'cloudflare' : 'node');
 			state.target = preliminaryTarget;
+			if (project.agentResolver && preliminaryTarget !== 'cloudflare') {
+				throw new Error('[flue] agentResolver requires the Cloudflare target.');
+			}
 
 			// Preview is artifact-based (Cloudflare: the sibling plugin serves the
 			// built Worker output; Node: configurePreviewServer imports the built
@@ -551,6 +554,7 @@ export function flue(config: FlueConfig = {}): Plugin[] {
 				return generateCloudflareEntry({
 					appEntry: app,
 					cloudflareEntry: state.project.cloudflare,
+					agentResolver: state.project.agentResolver,
 					agents: state.agents,
 					providers: state.project.providers,
 					tracing: state.project.tracing,
@@ -796,6 +800,7 @@ function setupCloudflareDevSupervision(options: {
 			const structuralChange =
 				project.app !== state.project.app ||
 				project.cloudflare !== state.project.cloudflare ||
+				project.agentResolver !== state.project.agentResolver ||
 				agentSetChanged(state.agents, agents);
 			state.project = project;
 			updateAgents(agents);

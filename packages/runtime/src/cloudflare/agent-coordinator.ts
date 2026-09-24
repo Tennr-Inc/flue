@@ -53,11 +53,12 @@ import {
 	handleAgentConversationRead,
 } from '../runtime/handle-conversation-routes.ts';
 import { generateAttemptId, isKeyDerivedSubmissionId } from '../runtime/ids.ts';
+import { resolveAgentIdentity } from '../runtime/registration.ts';
 import { agentStreamPath } from '../runtime/stream-offsets.ts';
 import { getToolApprovalProvider } from '../runtime/tool-approval-provider.ts';
 import { createSessionStorageKey } from '../session-identity.ts';
 import type { ToolApproval } from '../tool-approval.ts';
-import type { DeliveredMessage } from '../types.ts';
+import type { Agent, DeliveredMessage } from '../types.ts';
 import {
 	createSqlAgentExecutionStore,
 	createSqlConversationStores,
@@ -140,6 +141,21 @@ interface CloudflareAgentRecoveredFiberContext {
 	readonly snapshot?: Record<string, unknown>;
 }
 
+/** Context available when selecting the implementation for one durable agent instance. */
+export interface CloudflareAgentResolverContext {
+	readonly agentName: string;
+	readonly instance: CloudflareAgentInstance;
+}
+
+/**
+ * Select an implementation with the same agent identity. Called lazily, including
+ * during background recovery, and cached for this instance's residency. Throw to
+ * retry resolution on a later invocation; errors never fall back to the registry.
+ */
+export type CloudflareAgentResolver = (
+	context: CloudflareAgentResolverContext,
+) => Agent | Promise<Agent>;
+
 /**
  * Handle for a started attempt. `running` is the guarded fiber promise
  * (never rejects; resolves after settlement AND cleanup). Wrapped in an
@@ -159,6 +175,7 @@ interface CloudflareAgentPreparedCoordinator {
 }
 
 interface CloudflareAgentRuntimeOptions {
+	readonly resolveAgentForInstance?: CloudflareAgentResolver;
 	readonly agents: ReadonlyArray<{
 		readonly name: string;
 		readonly agent: Parameters<typeof createAgentSubmissionSessionHandler>[0];
@@ -302,6 +319,7 @@ class CloudflareAgentCoordinator {
 	 * server state worth a farewell.
 	 */
 	private readonly mcpConnections = createMcpConnectionCache();
+	private resolvedAgent?: Promise<Agent>;
 	/**
 	 * Abort controllers for in-flight attempt fibers in this isolate, keyed by
 	 * submissionId, so an incoming cancel request can abort the running attempt.
@@ -631,6 +649,34 @@ class CloudflareAgentCoordinator {
 		return this.prepared.submissionStore;
 	}
 
+	private resolveAgent(): Promise<Agent | undefined> {
+		const resolver = this.options.resolveAgentForInstance;
+		if (!resolver) {
+			return Promise.resolve(
+				this.options.agents.find((record) => record.name === this.agentName)?.agent,
+			);
+		}
+		if (!this.resolvedAgent) {
+			// Cache before invoking user code: concurrent admissions/recovery share
+			// the same selection, without changing the isolate-wide registration.
+			const pending = Promise.resolve()
+				.then(() => resolver({ agentName: this.agentName, instance: this.instance }))
+				.then((agent) => {
+					if (typeof agent !== 'function' || resolveAgentIdentity(agent) !== this.agentName) {
+						throw new Error(
+							`[flue] resolveAgentForInstance must return an agent with identity "${this.agentName}".`,
+						);
+					}
+					return agent;
+				});
+			this.resolvedAgent = pending;
+			void pending.catch(() => {
+				if (this.resolvedAgent === pending) this.resolvedAgent = undefined;
+			});
+		}
+		return this.resolvedAgent;
+	}
+
 	private runWithInstanceContext<T>(callback: () => T): T {
 		return this.options.runWithInstanceContext(this.instance, this.agentName, callback);
 	}
@@ -782,15 +828,18 @@ class CloudflareAgentCoordinator {
 					);
 					continue;
 				}
-				const found = this.options.agents.find(
-					(record) => record.name === submission.input.agent,
-				)?.agent;
-				const agent =
-					found &&
-					submission.input.agent === this.agentName &&
-					submission.input.id === this.instance.name
-						? found
-						: undefined;
+				let agent: Agent | undefined;
+				try {
+					if (
+						submission.input.agent === this.agentName &&
+						submission.input.id === this.instance.name
+					) {
+						agent = await this.resolveAgent();
+					}
+				} catch (error) {
+					this.logSubmissionReconciliationFailure(submission, 'materialize_submission', error);
+					continue;
+				}
 				if (!agent) {
 					if (
 						Date.now() >= unreadySubmissionDeadline(submission, undefined) &&
@@ -878,6 +927,9 @@ class CloudflareAgentCoordinator {
 				}
 			}
 			for (const submission of await this.submissions.listRunnableSubmissions()) {
+				// Resolve before claiming: a package-store outage is not an agent
+				// execution attempt and must not spend the submission's retry budget.
+				await this.resolveAgent();
 				// Cloudflare DOs are single-threaded per instance — leases are
 				// advisory-only. Set to 0 so reconciliation never misidentifies
 				// an active submission as expired. The Node coordinator uses real
@@ -1141,7 +1193,7 @@ class CloudflareAgentCoordinator {
 		submission: AgentSubmission,
 	): Promise<AgentSubmission | undefined> {
 		const conversationWriter = await this.ensureConversationWriter();
-		const agent = this.options.agents.find((record) => record.name === this.agentName)?.agent;
+		const agent = await this.resolveAgent();
 		if (!agent) throw new Error('[flue] Agent target unavailable during durable reconciliation.');
 		const replacement = await reconcileInterruptedSubmission(
 			this.submissions,
@@ -1357,12 +1409,14 @@ class CloudflareAgentCoordinator {
 		signal?: AbortSignal,
 	): Promise<void> {
 		const conversationWriter = await this.ensureConversationWriter();
+		const agent = await this.resolveAgent();
 		await processSubmission({
 			submissions: this.submissions,
 			submission,
 			resolveAgent: (name) => {
-				const agent = this.options.agents.find((record) => record.name === name)?.agent;
-				if (!agent) throw new Error('[flue] Agent target unavailable during durable processing.');
+				if (!agent || name !== this.agentName) {
+					throw new Error('[flue] Agent target unavailable during durable processing.');
+				}
 				return agent;
 			},
 			createContext: (submissionId) =>
@@ -1387,7 +1441,7 @@ class CloudflareAgentCoordinator {
 			...(idempotencyKey !== undefined ? { idempotencyKey } : {}),
 		});
 		const keyed = idempotencyKey !== undefined;
-		const agent = this.options.agents.find((record) => record.name === this.agentName)?.agent;
+		const agent = await this.resolveAgent();
 		if (!agent) throw new Error('[flue] Agent target unavailable during durable admission.');
 		const loadReducedState = async () => (await this.ensureConversationWriter()).loadReducedState();
 		// A deduplicated replay re-attaches from the stream origin: the original
@@ -1506,7 +1560,7 @@ class CloudflareAgentCoordinator {
 		if (input.agent !== this.agentName || input.id !== this.instance.name) {
 			return new Response('Invalid internal dispatch target.', { status: 400 });
 		}
-		const agent = this.options.agents.find((record) => record.name === this.agentName)?.agent;
+		const agent = await this.resolveAgent();
 		if (!agent) return new Response('Dispatch target unavailable.', { status: 404 });
 		const keyed = isKeyDerivedSubmissionId(input.submissionId);
 		const submissionInput = createDispatchAgentSubmissionInput(input);

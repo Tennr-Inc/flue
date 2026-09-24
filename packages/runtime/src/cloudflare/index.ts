@@ -21,6 +21,10 @@ export {
 	RETRYABLE_INTERRUPTION_MARKER,
 	WORKERS_AI_OVERFLOW_MARKER,
 } from '../errors.ts';
+export type {
+	CloudflareAgentResolver,
+	CloudflareAgentResolverContext,
+} from './agent-coordinator.ts';
 export type { CloudflareSandboxOptions, CloudflareSandboxStub } from './cf-sandbox.ts';
 export { cloudflareSandbox } from './cf-sandbox.ts';
 export type { CloudflareContext, FlueDurableObjectIdentity } from './context.ts';
