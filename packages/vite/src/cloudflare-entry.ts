@@ -24,6 +24,8 @@ export interface GenerateCloudflareEntryOptions {
 	readonly appEntry: string;
 	/** Absolute path of the user's `cloudflare.*` entry, if any. */
 	readonly cloudflareEntry: string | undefined;
+	/** Absolute path to an optional per-instance agent resolver module. */
+	readonly agentResolver?: string;
 	/** The scanned `'use agent'` module set. */
 	readonly agents: readonly AgentScanResult[];
 	/**
@@ -46,7 +48,7 @@ function importPath(filePath: string): string {
 }
 
 export function generateCloudflareEntry(options: GenerateCloudflareEntryOptions): string {
-	const { appEntry, cloudflareEntry, agents, providers, tracing } = options;
+	const { appEntry, cloudflareEntry, agentResolver, agents, providers, tracing } = options;
 	const includeBindingProvider = providers === undefined || providers.includes('cloudflare');
 	const includeTracing = tracing !== false;
 
@@ -131,6 +133,8 @@ ${userCloudflareImport}
 ${agentImports}
 // The configured (or default) built-in provider set.
 import 'virtual:flue/providers';
+${agentResolver ? `import resolveAgentForInstance from ${importPath(agentResolver)};` : ''}
+${agentResolver ? `if (typeof resolveAgentForInstance !== 'function') throw new Error('[flue] The agentResolver module must default-export a resolver function.');` : ''}
 ${
 	includeBindingProvider
 		? `
@@ -236,6 +240,7 @@ function runWithInstanceContext(doInstance, identity, fn) {
 if (import.meta.env.DEV) installDevLifecycleLogger();
 const cloudflareAgents = createCloudflareAgentRuntime({
 	agents,
+	${agentResolver ? 'resolveAgentForInstance,' : ''}
 	createContext: createAgentContextForRequest,
 	runWithInstanceContext: (instance, agentName, fn) => runWithInstanceContext(instance, agentIdentities[agentName], fn),
 });

@@ -203,10 +203,16 @@ export function resolveAgentIdentity(agent: Agent): string | undefined {
  * policy is expressed in the assigned value (`Fn.durability = flag ? x : y`),
  * not by where the assignment lives. Returns `undefined` (store defaults
  * apply) for an unregistered identity or an agent carrying no static.
+ * A supplied definition takes precedence over the registry, including when
+ * it has no policy, so per-instance implementations remain independent.
  */
-export function resolveAgentDurability(identity: string | undefined): DurabilityConfig | undefined {
-	if (identity === undefined) return undefined;
-	const durability = registeredAgents.get(identity)?.agent.durability;
+export function resolveAgentDurability(
+	identity: string | undefined,
+	agent?: Agent,
+): DurabilityConfig | undefined {
+	const definition =
+		agent ?? (identity === undefined ? undefined : registeredAgents.get(identity)?.agent);
+	const durability = definition?.durability;
 	if (durability === undefined) return undefined;
 	assertDurability(durability, `[agent "${identity}"]`);
 	return durability;

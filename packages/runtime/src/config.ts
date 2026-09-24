@@ -63,6 +63,12 @@ export interface FlueConfig {
 	 */
 	cloudflare?: string;
 	/**
+	 * Cloudflare only: path to a module whose default export is a
+	 * `CloudflareAgentResolver`. Relative to the config file's directory;
+	 * never auto-discovered. The callback runs inside the durable instance.
+	 */
+	agentResolver?: string;
+	/**
 	 * Glob narrowing the `'use agent'` scan, relative to the source root
 	 * (`.flue/`, `src/`, or the project root — whichever resolves). Defaults
 	 * to the whole source root, recursively. Passed through verbatim for the
@@ -122,6 +128,7 @@ const FlueConfigSchema = v.strictObject({
 	app: v.optional(NonEmptyPathSchema),
 	db: v.optional(NonEmptyPathSchema),
 	cloudflare: v.optional(NonEmptyPathSchema),
+	agentResolver: v.optional(NonEmptyPathSchema),
 	agents: v.optional(NonEmptyPathSchema),
 	providers: v.optional(v.array(ProviderIdSchema)),
 	tracing: v.optional(v.boolean()),
@@ -158,6 +165,7 @@ export function mergeFlueConfig(file: FlueConfig, inline: FlueConfig): FlueConfi
 		app: inline.app ?? file.app,
 		db: inline.db ?? file.db,
 		cloudflare: inline.cloudflare ?? file.cloudflare,
+		agentResolver: inline.agentResolver ?? file.agentResolver,
 		agents: inline.agents ?? file.agents,
 		providers: inline.providers ?? file.providers,
 		tracing: inline.tracing ?? file.tracing,
@@ -337,6 +345,8 @@ export interface ResolvedFlueProject {
 	db: string | undefined;
 	/** Absolute `cloudflare.*` entry path, or `undefined` when none exists. */
 	cloudflare: string | undefined;
+	/** Absolute per-instance resolver module path, when explicitly configured. */
+	agentResolver: string | undefined;
 	/** The `'use agent'` scan glob, verbatim as authored (root-relative). */
 	agents: string | undefined;
 	/** Built-in provider IDs to register, or `undefined` for all built-ins. */
@@ -367,6 +377,10 @@ export function resolveFlueProject(opts: ResolveFlueProjectOptions): ResolvedFlu
 		app: resolveEntry('app', config.app, baseDir, sourceRoot),
 		db: resolveEntry('db', config.db, baseDir, sourceRoot),
 		cloudflare: resolveEntry('cloudflare', config.cloudflare, baseDir, sourceRoot),
+		agentResolver:
+			config.agentResolver === undefined
+				? undefined
+				: resolveEntry('agentResolver', config.agentResolver, baseDir, sourceRoot),
 		agents: config.agents,
 		providers: config.providers,
 		tracing: config.tracing,
@@ -374,7 +388,7 @@ export function resolveFlueProject(opts: ResolveFlueProjectOptions): ResolvedFlu
 }
 
 function resolveEntry(
-	field: 'app' | 'db' | 'cloudflare',
+	field: 'app' | 'db' | 'cloudflare' | 'agentResolver',
 	configured: string | undefined,
 	baseDir: string,
 	sourceRoot: string,

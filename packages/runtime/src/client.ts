@@ -453,10 +453,9 @@ async function initializeRootHarness(
 		model: resolvedModel,
 		thinkingLevel: definition.thinkingLevel ?? config.agentConfig.thinkingLevel,
 		compaction: definition.compaction ?? config.agentConfig.compaction,
-		// Submission retry policy: binding config (not a hook) because the
-		// policy must be readable even when the render itself crashes — the
-		// runner that bound this agent decided it.
-		durability: resolveAgentDurability(config.agentName),
+		// Use the selected definition's policy: two durable instances can
+		// resolve different implementations of the same registered identity.
+		durability: resolveAgentDurability(config.agentName, agent),
 	};
 	// Per-turn re-render: fresh closures over the latest state values, the
 	// identity-invariance guard, and a recomposed system prompt. The session
