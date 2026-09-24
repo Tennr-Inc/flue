@@ -85,7 +85,7 @@ export interface LocalAgentRun {
 const RUN_DB_RELATIVE_PATH = path.join('node_modules', '.cache', 'flue', 'run.db');
 
 /** Config fields `flue run` honors; anything else (legacy `root`/`output`, …) is ignored. */
-const RUN_CONFIG_FIELDS = ['target', 'app', 'db', 'cloudflare', 'agents', 'agentResolver'] as const;
+const RUN_CONFIG_FIELDS = ['target', 'app', 'db', 'cloudflare', 'agents'] as const;
 
 export function createLocalAgentRun(options: LocalAgentRunOptions): LocalAgentRun {
 	const controller = new AbortController();
@@ -271,11 +271,6 @@ async function resolveRunProject(cwd: string): Promise<{
 			if (value !== undefined) picked[field] = value;
 		}
 		config = parseFlueConfig(picked, path.basename(configPath));
-	}
-	if (config.agentResolver !== undefined) {
-		throw new Error(
-			'[flue] agentResolver requires the Cloudflare target and cannot be used with flue run.',
-		);
 	}
 	const project = resolveFlueProject({
 		root: cwd,

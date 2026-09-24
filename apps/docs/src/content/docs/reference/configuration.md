@@ -119,7 +119,7 @@ Cloudflare only: path to a module whose default export implements `CloudflareAge
 - Default: unset; agents use their scanned, registered definitions. Resolver files are never auto-discovered.
 - Relative paths resolve from the config file's directory and must exist, like `app`. The module is bundled into the Worker; config loading does not evaluate it in Node.
 - The callback receives `{ agentName, instance }` and returns an agent function, synchronously or asynchronously, with the same durable identity.
-- Node builds and `flue run` reject this option rather than ignoring the configured selection.
+- Node builds reject this Cloudflare-only option. `flue run` ignores it and executes the explicitly named local agent module, without loading or calling the resolver.
 
 ### `agents`
 
