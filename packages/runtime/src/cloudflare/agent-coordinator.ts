@@ -926,10 +926,13 @@ class CloudflareAgentCoordinator {
 					this.logSubmissionReconciliationFailure(submission, 'reconcile_submission', error);
 				}
 			}
-			for (const submission of await this.submissions.listRunnableSubmissions()) {
-				// Resolve before claiming: a package-store outage is not an agent
-				// execution attempt and must not spend the submission's retry budget.
+			const runnableSubmissions = await this.submissions.listRunnableSubmissions();
+			if (runnableSubmissions.length > 0) {
+				// Load this cell's agent before claiming work so a load failure
+				// doesn't consume a submission's execution-attempt budget.
 				await this.resolveAgent();
+			}
+			for (const submission of runnableSubmissions) {
 				// Cloudflare DOs are single-threaded per instance — leases are
 				// advisory-only. Set to 0 so reconciliation never misidentifies
 				// an active submission as expired. The Node coordinator uses real
