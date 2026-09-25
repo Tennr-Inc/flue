@@ -717,6 +717,12 @@ Declare a reusable MCP connection. A typing helper in the [`defineTool()`](#defi
 type McpTransport = 'streamable-http' | 'sse';
 type McpAuth = string | (() => string | Promise<string>);
 
+interface McpApprovalPolicy {
+  required: true;
+  tools?: string[]; // the server's own names; omit to gate every mounted tool
+  expiresInMs?: number;
+}
+
 interface McpConnectionDefinition {
   name: string;
   url: string | URL;
@@ -729,6 +735,7 @@ interface McpConnectionDefinition {
   resetTimeoutOnProgress?: boolean;
   tools?: string[];
   optional?: boolean;
+  approval?: McpApprovalPolicy;
 }
 ```
 
@@ -745,6 +752,7 @@ One MCP server, as `defineMcpConnection(...)`, `useMcpConnection(...)`, and [`cr
 - `resetTimeoutOnProgress` — reset the per-request timeout whenever the server sends a progress notification. Default `false`.
 - `tools` — allowlist of tools to adapt, by the server's own tool names, in this order. Unknown, repeated, and task-required names reject the connection.
 - `optional` — let the agent run without this server when it fails to resolve. Default `false`: a failed connection fails the submission before the model runs. With `optional: true`, any resolve failure mounts zero tools for the submission instead — announced to the model as a [`resources` signal](#dynamic-resources) and to observers as a `log`-level warning event — and the next submission retries.
+- `approval` — require a durable host decision before a gated tool calls the server, with the same parking, decision, and recovery semantics as a [`defineTool()`](#definetool) `approval`. `required` must be `true`. `tools` names the gated tools by the server's own names; omitted, every mounted tool is gated, including tools the server adds later. A name that is not mounted rejects the connection. `expiresInMs` sets each gated call's proposal deadline. Approval-gated execution currently requires the Cloudflare target. See [Require approval for MCP tools](/docs/guide/mcp/#require-approval-for-mcp-tools).
 - Unknown fields throw; so do malformed values, with the offending field named.
 
 ## `createMcpConnection()`
@@ -768,6 +776,7 @@ Definition fields are documented at [`McpConnectionDefinition`](#mcpconnectionde
 - Adapted tool names take the form `mcp__<server>__<tool>`; characters outside `[A-Za-z0-9_-]` are replaced with underscores. Duplicate adapted names reject the connection.
 - Adapted descriptions carry the server's own tool description (and `Title:` when the server provides a distinct one). The original tool and server names are spelled out only when sanitization altered a name part — otherwise the adapted name already encodes both.
 - Adapted definitions preserve the server's `annotations` object, including `readOnlyHint`, `destructiveHint`, `idempotentHint`, and `openWorldHint`, so trusted application code can inspect the hints before mounting or wrapping a tool. MCP annotations are server-supplied hints, not a security boundary; only base approval policy on them when you trust the server.
+- Tools gated by the definition's `approval` carry `approval: { required: true, expiresInMs?, presentation? }` and a derived `version`: `mcp:` followed by 32 hex characters of a SHA-256 over the tool name and its key-sorted input schema. `presentation.title` is the server's tool title when it declares one. The proposal records the arguments as validated against the tool's JSON schema, and an approved call executes through the adapter with exactly those arguments. A schema change produces a different version, so recovery refuses a pending approval captured under the old schema.
 - Tool discovery follows `tools/list` pagination; a repeated cursor throws. Tools that require task-based execution are skipped with a console warning (allowlisting one is an error).
 - `auth` resolves before every request; a 401 re-resolves once and retries, so a credential the application has already refreshed recovers in place.
 - A tool result's content is flattened to text for the model; a result with `isError` becomes a tool error. When the server declares an output schema, the MCP client validates structured content against it and a mismatch is an error.

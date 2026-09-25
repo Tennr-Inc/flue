@@ -6,18 +6,21 @@ import {
 	fauxProvider,
 	fauxToolCall,
 } from '@earendil-works/pi-ai/providers/faux';
+import type { CallToolResult, Tool, Transport } from '@modelcontextprotocol/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createFlueContext } from './client.ts';
 import { ConversationRecordWriter } from './conversation-writer.ts';
 import { SubmissionAbortedError } from './errors.ts';
 import type { Harness } from './harness.ts';
 import { useAgentFinish } from './hooks/use-agent-finish.ts';
+import { useMcpConnection } from './hooks/use-mcp-connection.ts';
 import { useModel } from './hooks/use-model.ts';
 import { usePersistentState } from './hooks/use-persistent-state.ts';
 import { useResponseFinish } from './hooks/use-response-finish.ts';
 import { useSandbox } from './hooks/use-sandbox.ts';
 import { useTool } from './hooks/use-tool.ts';
 import { instrument } from './instrumentation.ts';
+import { createMcpConnectionWithClient, type McpConnectionResolver } from './mcp.ts';
 import { local } from './node/index.ts';
 import { ensureInstanceIdentity, processSubmission } from './runtime/agent-submissions.ts';
 import { InMemoryAttachmentStore } from './runtime/attachment-store.ts';
@@ -45,8 +48,9 @@ afterEach(async () => {
 });
 
 // Exercise the real submission, rendering, and model-loop paths against the
-// same SQLite stores used by the Durable Object host. Only the model is scripted.
-async function createFixture() {
+// same SQLite stores used by the Durable Object host. Only the model (and, when
+// given, the MCP connection resolver) is scripted.
+async function createFixture(options: { mcpConnections?: McpConnectionResolver } = {}) {
 	const database = new DatabaseSync(':memory:');
 	databases.push(database);
 	const sql: SqlStorage = {
@@ -124,6 +128,7 @@ async function createFixture() {
 					conversationWriter: writer,
 					attachmentStore: new InMemoryAttachmentStore(),
 					submissionStore: submissions,
+					...(options.mcpConnections ? { mcpConnections: options.mcpConnections } : {}),
 				});
 				const initialize = context.initializeRootHarness.bind(context);
 				context.initializeRootHarness = async (...args) => {
@@ -515,5 +520,181 @@ describe('tool approval lifecycle', () => {
 				});
 			}
 		});
+	});
+});
+
+describe('MCP tool approval lifecycle', () => {
+	const createIssue: Tool = {
+		name: 'create_issue',
+		title: 'Create issue',
+		description: 'Create a Linear issue.',
+		inputSchema: {
+			type: 'object',
+			properties: { title: { type: 'string' } },
+			required: ['title'],
+		},
+	};
+	const searchIssues: Tool = {
+		name: 'search_issues',
+		description: 'Search Linear issues.',
+		inputSchema: {
+			type: 'object',
+			properties: { query: { type: 'string' } },
+			required: ['query'],
+		},
+	};
+
+	// A scripted MCP server. Every attempt resolves a fresh connection, the way
+	// a restarted instance reconnects, so `tools` can change between attempts.
+	function createMcpServer(initialTools: Tool[]) {
+		const server = {
+			tools: initialTools,
+			callTool: vi.fn(
+				async (request: { name: string; arguments?: Record<string, unknown> }) =>
+					({
+						content: [{ type: 'text', text: `${request.name} ok` }],
+					}) as CallToolResult,
+			),
+		};
+		const mcpConnections: McpConnectionResolver = {
+			resolve: (definition) =>
+				createMcpConnectionWithClient(
+					definition.name,
+					{
+						connect: async () => {},
+						close: async () => {},
+						listTools: async () => ({ tools: server.tools }),
+						callTool: server.callTool as never,
+					},
+					{} as Transport,
+					{},
+					{ tools: definition.tools, approval: definition.approval },
+				),
+		};
+		return { server, mcpConnections };
+	}
+
+	function LinearAgent() {
+		useModel('faux/faux-1', { compaction: false });
+		useMcpConnection({
+			name: 'linear',
+			url: 'https://mcp.example.test/mcp',
+			approval: { required: true, tools: ['create_issue'] },
+		});
+		return 'Manage Linear issues.';
+	}
+
+	async function outcomeFor(fixture: Awaited<ReturnType<typeof createFixture>>, callId: string) {
+		const records = await fixture.records();
+		return records.find(
+			(record) => record.type === 'tool_outcome' && record.toolCallId === callId,
+		) as Extract<(typeof records)[number], { type: 'tool_outcome' }> | undefined;
+	}
+
+	it('parks a gated MCP call with its arguments and executes exactly those once approved', async () => {
+		const { server, mcpConnections } = createMcpServer([createIssue, searchIssues]);
+		const fixture = await createFixture({ mcpConnections });
+		fixture.model.setResponses([
+			toolRequest(
+				fauxToolCall('mcp__linear__create_issue', { title: 'Fix login' }, { id: 'create-call' }),
+				fauxToolCall('mcp__linear__search_issues', { query: 'login' }, { id: 'search-call' }),
+			),
+		]);
+
+		expect(await fixture.attempt(LinearAgent)).toMatchObject({ status: 'waiting_for_approval' });
+		// The ungated sibling ran; the gated call has not reached the server.
+		expect(server.callTool).toHaveBeenCalledTimes(1);
+		expect(server.callTool.mock.calls[0]?.[0]).toMatchObject({
+			name: 'search_issues',
+			arguments: { query: 'login' },
+		});
+		const approvals = (await fixture.submissions.listToolApprovals?.('submission-1')) ?? [];
+		expect(approvals).toHaveLength(1);
+		expect(approvals[0]).toMatchObject({
+			toolName: 'mcp__linear__create_issue',
+			toolCallId: 'create-call',
+			arguments: { title: 'Fix login' },
+			presentation: { title: 'Create issue' },
+			status: 'pending',
+		});
+		expect(approvals[0]?.toolVersion).toMatch(/^mcp:[0-9a-f]{32}$/);
+
+		await fixture.decide('approved');
+		fixture.model.setResponses([fauxAssistantMessage('Created.')]);
+		expect(await fixture.attempt(LinearAgent)).toMatchObject({ status: 'settled' });
+
+		expect(server.callTool).toHaveBeenCalledTimes(2);
+		expect(server.callTool.mock.calls[1]?.[0]).toEqual({
+			name: 'create_issue',
+			arguments: { title: 'Fix login' },
+		});
+		expect(await outcomeFor(fixture, 'create-call')).toMatchObject({
+			isError: false,
+			content: [{ type: 'text', text: 'create_issue ok' }],
+		});
+		expect((await outcomeFor(fixture, 'create-call'))?.output).toBeUndefined();
+	});
+
+	it('never calls the server for a rejected MCP call', async () => {
+		const { server, mcpConnections } = createMcpServer([createIssue]);
+		const fixture = await createFixture({ mcpConnections });
+		fixture.model.setResponses([
+			toolRequest(
+				fauxToolCall('mcp__linear__create_issue', { title: 'Fix login' }, { id: 'create-call' }),
+			),
+		]);
+
+		expect(await fixture.attempt(LinearAgent)).toMatchObject({ status: 'waiting_for_approval' });
+		await fixture.decide('rejected');
+		fixture.model.setResponses([fauxAssistantMessage('Not created.')]);
+		expect(await fixture.attempt(LinearAgent)).toMatchObject({ status: 'settled' });
+
+		expect(server.callTool).not.toHaveBeenCalled();
+		expect(await outcomeFor(fixture, 'create-call')).toMatchObject({ isError: true });
+	});
+
+	it('refuses an approved MCP call after the server changes the tool schema', async () => {
+		const { server, mcpConnections } = createMcpServer([createIssue]);
+		const fixture = await createFixture({ mcpConnections });
+		fixture.model.setResponses([
+			toolRequest(
+				fauxToolCall('mcp__linear__create_issue', { title: 'Fix login' }, { id: 'create-call' }),
+			),
+		]);
+
+		expect(await fixture.attempt(LinearAgent)).toMatchObject({ status: 'waiting_for_approval' });
+		await fixture.decide('approved');
+		server.tools = [
+			{
+				...createIssue,
+				inputSchema: {
+					type: 'object',
+					properties: { title: { type: 'string' }, teamId: { type: 'string' } },
+					required: ['title', 'teamId'],
+				},
+			},
+		];
+		fixture.model.setResponses([fauxAssistantMessage('Could not create.')]);
+		expect(await fixture.attempt(LinearAgent)).toMatchObject({ status: 'settled' });
+
+		expect(server.callTool).not.toHaveBeenCalled();
+		const outcome = await outcomeFor(fixture, 'create-call');
+		expect(outcome).toMatchObject({ isError: true });
+		expect(JSON.stringify(outcome?.content)).toContain('is no longer available');
+	});
+
+	it('does not park an MCP call the policy does not name', async () => {
+		const { server, mcpConnections } = createMcpServer([createIssue, searchIssues]);
+		const fixture = await createFixture({ mcpConnections });
+		fixture.model.setResponses([
+			toolRequest(
+				fauxToolCall('mcp__linear__search_issues', { query: 'login' }, { id: 'search-call' }),
+			),
+			fauxAssistantMessage('Found it.'),
+		]);
+
+		expect(await fixture.attempt(LinearAgent)).toMatchObject({ status: 'settled' });
+		expect(server.callTool).toHaveBeenCalledTimes(1);
+		expect(await fixture.submissions.listToolApprovals?.('submission-1')).toEqual([]);
 	});
 });

@@ -28,6 +28,26 @@ export interface McpToolAnnotations {
 }
 
 /**
+ * Approval policy for an MCP connection's tools. A gated call parks the
+ * durable submission until a host decision arrives, exactly like a
+ * `defineTool({ approval })` tool. The runtime derives each gated tool's
+ * approval version from its input schema, so a server-side schema change
+ * invalidates pending approvals instead of executing them.
+ */
+export interface McpApprovalPolicy {
+	/** Same literal as `ToolApprovalPolicy`, so the two read alike. */
+	readonly required: true;
+	/**
+	 * Server tool names (the server's own names) that require approval. Omit
+	 * to gate every mounted tool, including tools the server adds later.
+	 * A name that is not mounted is an error.
+	 */
+	readonly tools?: readonly string[];
+	/** Optional deadline for each gated call's proposal, in milliseconds. */
+	readonly expiresInMs?: number;
+}
+
+/**
  * Bearer credential for an MCP server: a static token, or a resolver the
  * runtime calls to obtain the current token — per request, so rotating and
  * per-user credentials stay fresh for a connection's whole lifetime. Keep the
@@ -77,6 +97,12 @@ export interface McpConnectionDefinition {
 	 * retries.
 	 */
 	optional?: boolean;
+	/**
+	 * Require a persisted host decision before a gated tool calls the server.
+	 * Durable approvals need an approval-capable persistence adapter (the
+	 * Cloudflare target today).
+	 */
+	approval?: McpApprovalPolicy;
 }
 
 /**

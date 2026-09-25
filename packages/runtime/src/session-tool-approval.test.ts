@@ -1,13 +1,16 @@
+import type { Transport } from '@modelcontextprotocol/client';
 import { describe, expect, it, vi } from 'vitest';
 import type { ConversationRecord } from './conversation-records.ts';
 import type { ReducedConversationState } from './conversation-reducer.ts';
 import { SubmissionTimeoutError } from './errors.ts';
 import { registerExecutionInterceptor } from './execution-interceptor.ts';
 import { createHookStateBuffer } from './hooks/use-persistent-state.ts';
+import { createMcpConnectionWithClient } from './mcp.ts';
 import { Session } from './session.ts';
 import { defineTool } from './tool.ts';
-import type { ToolApproval } from './tool-approval.ts';
+import type { ToolApproval, ToolApprovalProposal } from './tool-approval.ts';
 import { toolApprovalProposalId } from './tool-approval.ts';
+import type { ToolDefinition } from './tool-types.ts';
 
 describe('tool state write fencing', () => {
 	it('discards writes made before and after an invocation scope is abandoned', async () => {
@@ -493,5 +496,99 @@ describe('approved tool batch repair', () => {
 		]);
 		expect(rebuildCanonicalContext).toHaveBeenCalledTimes(1);
 		expect(publishRecoveredToolOutcome).toHaveBeenCalledWith('call-1', outcome);
+	});
+});
+
+describe('MCP approval proposal recovery', () => {
+	async function gatedMcpTool(): Promise<ToolDefinition> {
+		const connection = await createMcpConnectionWithClient(
+			'linear',
+			{
+				connect: async () => {},
+				close: async () => {},
+				listTools: async () => ({
+					tools: [
+						{
+							name: 'create_issue',
+							description: 'Create a Linear issue.',
+							inputSchema: {
+								type: 'object',
+								properties: { title: { type: 'string' } },
+								required: ['title'],
+							},
+						},
+					],
+				}),
+				callTool: async () => ({ content: [] }),
+			},
+			{} as Transport,
+			{},
+			{ approval: { required: true } },
+		);
+		const [tool] = connection.tools;
+		if (!tool) throw new Error('Expected one adapted MCP tool.');
+		return tool;
+	}
+
+	function recreate(tool: ToolDefinition, args: Record<string, unknown>) {
+		const createToolApproval = vi.fn(
+			async (proposal: ToolApprovalProposal): Promise<ToolApproval> => ({
+				...proposal,
+				status: 'pending',
+			}),
+		);
+		const fakeSession = {
+			agentTools: [tool],
+			createToolLogger: () => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
+			executionIdentity: { harness: 'default' },
+			conversationId: 'conversation-1',
+			name: 'default',
+			ensureApprovalRequestedRecord: vi.fn(async () => {}),
+		};
+		const recreateMissingToolApproval = Reflect.get(
+			Session.prototype,
+			'recreateMissingToolApproval',
+		) as (
+			this: typeof fakeSession,
+			approvalStore: { createToolApproval: typeof createToolApproval },
+			submissionId: string,
+			partial: { entryId: string; assistant: unknown },
+			call: { id: string; name: string },
+			signal: AbortSignal,
+		) => Promise<ToolApproval | null>;
+		const running = recreateMissingToolApproval.call(
+			fakeSession,
+			{ createToolApproval },
+			'submission-1',
+			{
+				entryId: 'assistant-1',
+				assistant: {
+					content: [{ type: 'toolCall', id: 'call-1', name: tool.name, arguments: args }],
+				},
+			},
+			{ id: 'call-1', name: tool.name },
+			new AbortController().signal,
+		);
+		return { running, createToolApproval };
+	}
+
+	it('rebuilds a lost MCP proposal from the schema-validated model arguments', async () => {
+		const tool = await gatedMcpTool();
+		const { running, createToolApproval } = recreate(tool, { title: 'Fix login' });
+
+		await expect(running).resolves.toMatchObject({
+			toolName: 'mcp__linear__create_issue',
+			toolVersion: tool.version,
+			arguments: { title: 'Fix login' },
+		});
+		expect(createToolApproval).toHaveBeenCalledTimes(1);
+	});
+
+	it('refuses to rebuild a proposal from arguments the schema rejects', async () => {
+		const tool = await gatedMcpTool();
+		const { running, createToolApproval } = recreate(tool, {});
+
+		await expect(running).rejects.toThrow(/Validation failed for tool "mcp__linear__create_issue"/);
+		expect(createToolApproval).not.toHaveBeenCalled();
 	});
 });

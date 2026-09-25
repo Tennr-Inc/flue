@@ -140,6 +140,7 @@ Declare a remote MCP server whose tools this agent uses. Accepts an [`McpConnect
 
 - Definitions are read once per submission at initialization. A conditional declaration takes effect on the next submission, narrated as a [`resources` signal](/docs/reference/agent-api/#dynamic-resources).
 - Connections are reused for the instance's in-memory lifetime; definitions are read at first connect (`auth` excepted — resolved per request). A failed connect fails the submission before the model runs and is never cached — unless the definition sets `optional: true`, which mounts zero tools for the submission and announces the gap to the model instead (see [`McpConnectionDefinition`](/docs/reference/agent-api/#mcpconnectiondefinition)).
+- `approval` parks gated calls on a durable host decision, like a `defineTool()` approval; see [`McpConnectionDefinition`](/docs/reference/agent-api/#mcpconnectiondefinition).
 - Duplicate server names in one render throw. Subagent renders throw — declare the connection on the root agent.
 
 ## `useSkill()`

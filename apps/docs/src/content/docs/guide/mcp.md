@@ -1,7 +1,7 @@
 ---
 title: MCP
 description: Connect agents to remote MCP servers and mount their tools.
-lastReviewedAt: 2026-07-23
+lastReviewedAt: 2026-09-25
 ---
 
 [MCP](https://modelcontextprotocol.io) (Model Context Protocol) is an open standard for connecting AI agents to external services. Instead of writing a [tool](/docs/guide/tools/) for every Linear, Notion, or GitHub action your agent needs, connect to an MCP server and your agent gets access to its tools, remotely.
@@ -111,6 +111,32 @@ useMcpConnection({
 
 If the allowlist names a tool the server doesn't expose, the connection fails with an error.
 
+## Require approval for MCP tools
+
+Set `approval` to park calls to a server's tools until a human or policy decides, the same way an [approval-gated tool](/docs/guide/tools/#require-approval-before-a-tool-runs) does:
+
+```ts
+useMcpConnection({
+  name: 'linear',
+  url: 'https://mcp.linear.app/mcp',
+  auth: process.env.LINEAR_API_KEY,
+  tools: ['search_issues', 'create_issue', 'delete_issue'],
+  approval: {
+    required: true,
+    tools: ['create_issue', 'delete_issue'],
+    expiresInMs: 24 * 60 * 60 * 1000,
+  },
+});
+```
+
+- `approval.tools` lists the server's own tool names to gate. Omit it to gate every mounted tool, including tools the server adds later. Naming a tool that isn't mounted fails the connection.
+- The proposal records the model's arguments after they pass the tool's input schema. The approver decides through the same route, SDK method, and `ToolApprovalProvider` as any other approval.
+- Flue derives each gated tool's approval version from its input schema. If the server changes that schema while an approval is pending, the approved call fails with a tool error instead of running. Behavior the server changes behind an unchanged schema is not detected.
+- The proposal's `presentation.title` is the server's tool title. It is server-supplied text, so an approval UI should show the tool name and arguments, not only the title.
+- An approved call interrupted before its outcome is recorded is reported as unknown and not retried, like any approved tool without `durable: true`.
+- Approval-gated execution currently requires the Cloudflare target.
+- Connection definitions are read at first connect, so a changed `approval` takes effect when the instance next connects — after a deploy or an instance restart.
+
 ## Reusing an MCP server definition
 
 `defineMcpConnection(...)` validates an MCP connection object so you can define it once and then reuse it from any agent:
@@ -133,7 +159,7 @@ useMcpConnection({ ...linear, tools: ['search_issues'] }); // override fields pe
 
 ## Security
 
-An MCP server you connect to can influence your agent: its tool descriptions enter the prompt, and its tool results enter the conversation. Treat a server you don't control like any other third-party dependency, and consider using the `tools` allowlist to limit the surface area of your exposure.
+An MCP server you connect to can influence your agent: its tool descriptions enter the prompt, and its tool results enter the conversation. Treat a server you don't control like any other third-party dependency, and consider using the `tools` allowlist to limit the surface area of your exposure and `approval` to put a person in front of tools with side effects.
 
 ## Advanced: Making a direct MCP server connection
 
@@ -149,7 +175,7 @@ export function ProjectAssistant() {
 }
 ```
 
-Each adapted definition preserves the server's MCP `annotations`, so trusted application code can inspect `tool.annotations?.readOnlyHint`, `destructiveHint`, `idempotentHint`, and `openWorldHint` before mounting or wrapping it — for example, to require human approval for destructive calls. These are server-supplied hints, not a security boundary; only use them for approval decisions when you trust the server.
+Each adapted definition preserves the server's MCP `annotations`, so trusted application code can inspect `tool.annotations?.readOnlyHint`, `destructiveHint`, `idempotentHint`, and `openWorldHint` before mounting or wrapping it. These are server-supplied hints, not a security boundary; only use them for approval decisions when you trust the server. To gate calls by tool name instead, set [`approval`](#require-approval-for-mcp-tools) on the definition.
 
 This can also be helpful inside of a Node.js script, if you're ever using the Node.js JavaScript API directly — see [Standalone scripts](/docs/guide/building-agents/#standalone-scripts).
 

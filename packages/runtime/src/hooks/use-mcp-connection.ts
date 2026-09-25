@@ -13,7 +13,10 @@ const DEFINITION_KEYS = new Set<string>([
 	'resetTimeoutOnProgress',
 	'tools',
 	'optional',
+	'approval',
 ]);
+
+const APPROVAL_KEYS = new Set<string>(['required', 'tools', 'expiresInMs']);
 
 const TRANSPORTS: readonly McpTransport[] = ['streamable-http', 'sse'];
 
@@ -106,6 +109,52 @@ function assertMcpConnectionDefinition(
 	if (candidate.optional !== undefined && typeof candidate.optional !== 'boolean') {
 		throw new Error(`[flue] ${source} "${name}" optional must be a boolean.`);
 	}
+	if (candidate.approval !== undefined) {
+		assertMcpApprovalPolicy(candidate.approval, `${source} "${name}" approval`);
+	}
+}
+
+function assertMcpApprovalPolicy(approval: unknown, label: string): void {
+	if (!approval || typeof approval !== 'object' || Array.isArray(approval)) {
+		throw new Error(`[flue] ${label} must be an object: { required: true, tools?, expiresInMs? }.`);
+	}
+	for (const key of Object.keys(approval)) {
+		if (!APPROVAL_KEYS.has(key)) {
+			throw new Error(
+				`[flue] ${label} received unknown field "${key}". Accepted fields: ${[...APPROVAL_KEYS].join(', ')}.`,
+			);
+		}
+	}
+	const policy = approval as { required?: unknown; tools?: unknown; expiresInMs?: unknown };
+	if (policy.required !== true) {
+		throw new Error(`[flue] ${label} must set required: true.`);
+	}
+	if (policy.tools !== undefined) {
+		if (
+			!Array.isArray(policy.tools) ||
+			policy.tools.some((tool) => typeof tool !== 'string' || tool.length === 0)
+		) {
+			throw new Error(
+				`[flue] ${label} tools must be an array of tool names (the server's own names).`,
+			);
+		}
+		const duplicates = policy.tools.filter(
+			(tool, index) => (policy.tools as string[]).indexOf(tool) !== index,
+		);
+		if (duplicates.length > 0) {
+			throw new Error(
+				`[flue] ${label} tools repeats ${[...new Set(duplicates)].map((tool) => JSON.stringify(tool)).join(', ')}.`,
+			);
+		}
+	}
+	if (
+		policy.expiresInMs !== undefined &&
+		(typeof policy.expiresInMs !== 'number' ||
+			!Number.isFinite(policy.expiresInMs) ||
+			policy.expiresInMs <= 0)
+	) {
+		throw new Error(`[flue] ${label} expiresInMs must be a positive number.`);
+	}
 }
 
 /**
@@ -132,6 +181,16 @@ export function defineMcpConnection(definition: McpConnectionDefinition): McpCon
 	return Object.freeze({
 		...definition,
 		...(definition.tools !== undefined ? { tools: Object.freeze([...definition.tools]) } : {}),
+		...(definition.approval !== undefined
+			? {
+					approval: Object.freeze({
+						...definition.approval,
+						...(definition.approval.tools !== undefined
+							? { tools: Object.freeze([...definition.approval.tools]) }
+							: {}),
+					}),
+				}
+			: {}),
 	}) as McpConnectionDefinition;
 }
 
@@ -171,6 +230,9 @@ export function defineMcpConnection(definition: McpConnectionDefinition): McpCon
  *   runs, and the failure is not cached — the next submission retries.
  * - `tools` allowlists what to mount, by the server's own tool names; names
  *   the server does not expose are an error.
+ * - `approval` parks gated calls on a durable host decision, like a
+ *   `defineTool({ approval })` tool. Omit `approval.tools` to gate every
+ *   mounted tool; names that are not mounted are an error.
  *
  * To share one definition across agents, export it with
  * {@link defineMcpConnection} and mount the exported object. To filter or
