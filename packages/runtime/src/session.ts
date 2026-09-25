@@ -23,6 +23,7 @@ import type {
 	Message,
 	Model,
 	SimpleStreamOptions,
+	Tool,
 	ToolResultMessage,
 	UserMessage,
 } from '@earendil-works/pi-ai';
@@ -31,6 +32,7 @@ import {
 	getCurrentSystemPrompt,
 	getCurrentTools,
 	toToolDeclaration,
+	validateToolArguments,
 } from '@earendil-works/pi-ai';
 import type * as v from 'valibot';
 import { abandonToolOnAbort, abortErrorFor, createCallHandle, ToolTimeoutError } from './abort.ts';
@@ -3228,10 +3230,22 @@ export class Session implements FlueSession, AgentSubmissionSession {
 				candidate.type === 'toolCall' && candidate.id === call.id,
 		);
 		if (!block) return null;
-		const parsed = parseToolInput(toolDef, block.arguments, signal, {
-			log: this.createToolLogger(toolDef.name, call.id),
-			toolCallId: call.id,
-		});
+		// Recovery runs without Pi's preflight, so a prepared adapter (MCP)
+		// repeats Pi's JSON-schema validation here; a Valibot tool reparses.
+		const preparedToolAdapter = getPreparedToolAdapter(toolDef);
+		const data = preparedToolAdapter
+			? validateToolArguments(
+					{
+						name: toolDef.name,
+						description: toolDef.description,
+						parameters: preparedToolAdapter.parameters as Tool['parameters'],
+					},
+					block,
+				)
+			: parseToolInput(toolDef, block.arguments, signal, {
+					log: this.createToolLogger(toolDef.name, call.id),
+					toolCallId: call.id,
+				}).data;
 		const requestedAt = Date.now();
 		const proposal: ToolApprovalProposal = {
 			proposalId: toolApprovalProposalId(submissionId, partial.entryId, call.id),
@@ -3246,7 +3260,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 			toolName: toolDef.name,
 			toolVersion: toolDef.version ?? '1',
 			arguments: cloneJsonSerializable(
-				parsed.data ?? {},
+				data ?? {},
 				`Tool "${toolDef.name}" approval arguments`,
 			) as ToolApprovalProposal['arguments'],
 			requestedAt,
@@ -3363,6 +3377,9 @@ export class Session implements FlueSession, AgentSubmissionSession {
 			);
 		};
 		const log = this.createToolLogger(toolDef.name, call.id);
+		// Prepared adapters (MCP) execute outside `run`: the adapter receives the
+		// approved arguments as-is and returns the model-facing text.
+		const preparedToolAdapter = getPreparedToolAdapter(toolDef);
 		this.emit(
 			{ type: 'tool_start', toolName: toolDef.name, toolCallId: call.id },
 			{ ...telemetry, args: invocationArguments },
@@ -3375,6 +3392,12 @@ export class Session implements FlueSession, AgentSubmissionSession {
 					this.runWithToolStateScope(signal, () =>
 						this.runWithToolTimeout(toolDef, signal, async (toolSignal) => {
 							const invocationSignal = toolSignal ?? signal;
+							if (preparedToolAdapter) {
+								return await preparedToolAdapter.execute(
+									invocationArguments as Record<string, unknown>,
+									invocationSignal,
+								);
+							}
 							const invocationId = toolDef.harness ? generateInvocationId() : undefined;
 							const harness = invocationId
 								? this.createInvocationHarness(invocationId, invocationSignal, toolDef)
@@ -3403,6 +3426,13 @@ export class Session implements FlueSession, AgentSubmissionSession {
 						}),
 					),
 			);
+			if (preparedToolAdapter) {
+				// Mirrors the unapproved adapter path: text content, no structured output.
+				const text = result as string;
+				const outcome = buildOutcome(false, text);
+				queueOutcomePublication(outcome, text);
+				return outcome;
+			}
 			const resolved = resolveToolRun(toolDef, result);
 			const outcome = buildOutcome(
 				false,
@@ -4847,12 +4877,17 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		// an approval proposal is only created for the exact data `run` would see.
 		let args: Record<string, unknown>;
 		try {
-			const parsed = parseToolInput(toolDef, context.args ?? {}, undefined, {
-				log: this.createToolLogger(toolDef.name, context.toolCall.id),
-				toolCallId: context.toolCall.id,
-			});
+			// Prepared adapters (MCP) have no Valibot input: Pi has already
+			// validated `context.args` against the adapter's JSON schema, and
+			// those are exactly the arguments the adapter would execute with.
+			const data = getPreparedToolAdapter(toolDef)
+				? context.args
+				: parseToolInput(toolDef, context.args ?? {}, undefined, {
+						log: this.createToolLogger(toolDef.name, context.toolCall.id),
+						toolCallId: context.toolCall.id,
+					}).data;
 			args = cloneJsonSerializable(
-				parsed.data ?? {},
+				data ?? {},
 				`Tool "${toolDef.name}" approval arguments`,
 			) as Record<string, unknown>;
 		} catch (error) {

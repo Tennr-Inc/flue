@@ -8,11 +8,18 @@ import {
 	type Transport,
 } from '@modelcontextprotocol/client';
 import { version as runtimeVersion } from '../package.json' with { type: 'json' };
-import type { McpAuth, McpConnectionDefinition, McpTransport } from './mcp-types.ts';
+import type {
+	McpApprovalPolicy,
+	McpAuth,
+	McpConnectionDefinition,
+	McpTransport,
+} from './mcp-types.ts';
 import { registerPreparedToolAdapter } from './tool-adapter.ts';
+import type { ToolApprovalPolicy } from './tool-approval.ts';
 import type { ToolDefinition } from './types.ts';
 
 export type {
+	McpApprovalPolicy,
 	McpAuth,
 	McpConnectionDefinition,
 	McpToolAnnotations,
@@ -118,7 +125,7 @@ export async function createMcpConnection(
 			timeout: definition.timeoutMs,
 			resetTimeoutOnProgress: definition.resetTimeoutOnProgress,
 		},
-		{ tools: definition.tools },
+		{ tools: definition.tools, approval: definition.approval },
 	);
 }
 
@@ -127,7 +134,7 @@ export async function createMcpConnectionWithClient(
 	client: McpClient,
 	transport: Transport,
 	requestOptions: McpRequestOptions = {},
-	selection: { tools?: readonly string[] } = {},
+	selection: { tools?: readonly string[]; approval?: McpApprovalPolicy } = {},
 ): Promise<McpConnection> {
 	try {
 		await client.connect(transport);
@@ -147,11 +154,12 @@ export async function createMcpConnectionWithClient(
 
 		return {
 			name,
-			tools: createMcpTools(
+			tools: await createMcpTools(
 				name,
 				client,
 				selectMcpTools(name, tools, selection.tools),
 				requestOptions,
+				selection.approval,
 			),
 			close: () => client.close(),
 		};
@@ -237,12 +245,13 @@ function createTransport(
 	});
 }
 
-function createMcpTools(
+async function createMcpTools(
 	serverName: string,
 	client: McpClient,
 	tools: Tool[],
 	requestOptions: McpRequestOptions,
-): ToolDefinition[] {
+	approval: McpApprovalPolicy | undefined,
+): Promise<ToolDefinition[]> {
 	const names = new Set<string>();
 
 	const callableTools = tools.filter((tool) => {
@@ -252,6 +261,13 @@ function createMcpTools(
 		);
 		return false;
 	});
+	const gated = selectGatedMcpTools(serverName, callableTools, approval);
+	const approvalVersions = new Map<string, string>();
+	for (const tool of callableTools) {
+		if (gated.has(tool.name)) {
+			approvalVersions.set(tool.name, await mcpToolApprovalVersion(tool));
+		}
+	}
 
 	return callableTools.map((tool) => {
 		const toolName = createToolName(serverName, tool.name);
@@ -274,6 +290,12 @@ function createMcpTools(
 			...(tool.annotations === undefined
 				? {}
 				: { annotations: Object.freeze({ ...tool.annotations }) }),
+			...(approval && gated.has(tool.name)
+				? {
+						version: approvalVersions.get(tool.name) as string,
+						approval: createMcpToolApproval(tool, approval),
+					}
+				: {}),
 			run() {
 				throw new Error('[flue] MCP tools execute through the internal adapter.');
 			},
@@ -301,6 +323,71 @@ function createMcpTools(
 		});
 		return Object.freeze(definition);
 	});
+}
+
+/**
+ * Resolve which callable tools the approval policy gates, by the server's own
+ * names. Omitted `tools` gates everything mounted; a named tool that is not
+ * mounted must fail loud — a typo would otherwise leave a tool ungated.
+ */
+function selectGatedMcpTools(
+	serverName: string,
+	callable: Tool[],
+	approval: McpApprovalPolicy | undefined,
+): ReadonlySet<string> {
+	if (!approval) return new Set();
+	const mounted = callable.map((tool) => tool.name);
+	if (approval.tools === undefined) return new Set(mounted);
+	const unknown = approval.tools.filter((name) => !mounted.includes(name));
+	if (unknown.length > 0) {
+		throw new Error(
+			`[flue] MCP server "${serverName}" approval names ${formatToolNames(unknown)}, which ${unknown.length === 1 ? 'is' : 'are'} not mounted. Mounted tools: ${
+				mounted.join(', ') || '(none)'
+			}.`,
+		);
+	}
+	return new Set(approval.tools);
+}
+
+function createMcpToolApproval(tool: Tool, policy: McpApprovalPolicy): ToolApprovalPolicy {
+	const title = tool.title ?? tool.annotations?.title;
+	return Object.freeze({
+		required: true,
+		...(policy.expiresInMs !== undefined ? { expiresInMs: policy.expiresInMs } : {}),
+		// Server-supplied text: a label for the approval UI, never a substitute
+		// for showing the tool name and arguments.
+		...(title ? { presentation: Object.freeze({ title }) } : {}),
+	});
+}
+
+/**
+ * The approval version of a gated MCP tool: a digest of its name and the
+ * normalized input schema the model's arguments were validated against. An
+ * approval captured under one schema never executes under another — the
+ * server can change its tools without any application deploy, so there is no
+ * author-maintained version to bump.
+ */
+async function mcpToolApprovalVersion(tool: Tool): Promise<string> {
+	const preimage = `flue-mcp-tool-approval\n${tool.name}\n${canonicalJson(
+		normalizeInputSchema(tool.inputSchema),
+	)}`;
+	const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(preimage));
+	const hex = [...new Uint8Array(digest)]
+		.map((byte) => byte.toString(16).padStart(2, '0'))
+		.join('');
+	return `mcp:${hex.slice(0, 32)}`;
+}
+
+/** JSON with object keys sorted, so a server's key order never changes a version. */
+function canonicalJson(value: unknown): string {
+	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+	if (value !== null && typeof value === 'object') {
+		const entries = Object.entries(value)
+			.filter(([, entry]) => entry !== undefined)
+			.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+		return `{${entries.map(([key, entry]) => `${JSON.stringify(key)}:${canonicalJson(entry)}`).join(',')}}`;
+	}
+	return JSON.stringify(value) ?? 'null';
 }
 
 function mergeRequestInit(

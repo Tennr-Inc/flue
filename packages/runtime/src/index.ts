@@ -78,6 +78,7 @@ export { useTool } from './hooks/use-tool.ts';
 export { type FlueInstrumentation, instrument } from './instrumentation.ts';
 export type { JsonValue } from './json-snapshot.ts';
 export type {
+	McpApprovalPolicy,
 	McpAuth,
 	McpConnection,
 	McpConnectionDefinition,
