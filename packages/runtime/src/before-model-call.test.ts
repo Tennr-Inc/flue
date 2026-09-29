@@ -105,8 +105,8 @@ it('classifies the first and post-tool root calls with current delivery and mess
 	});
 	expect(startHook).toHaveBeenCalledTimes(1);
 	expect(decisions.map(({ delivery, messages }) => ({ delivery, messages }))).toEqual([
-		{ delivery: 'Prepared context.', messages: 2 },
-		{ delivery: 'Prepared context.', messages: 4 },
+		{ delivery: 'Prepared context.', messages: 3 },
+		{ delivery: 'Prepared context.', messages: 5 },
 	]);
 	expect(decisions.every((decision) => !decision.signal.aborted)).toBe(true);
 	expect(requests.map(({ model, reasoning }) => ({ model, reasoning }))).toEqual([
