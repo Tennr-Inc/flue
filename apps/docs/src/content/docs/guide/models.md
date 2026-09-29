@@ -54,7 +54,7 @@ On the Cloudflare target there is one more built-in provider ID: `cloudflare/...
 
 ## Model reasoning effort
 
-`useModel()` accepts an options object as its second argument with two fields: `thinkingLevel` and `compaction`.
+`useModel()` accepts an options object as its second argument with `thinkingLevel`, `beforeModelCall`, and `compaction`.
 
 ```ts
 useModel('anthropic/claude-opus-4-6', {
@@ -68,6 +68,23 @@ useModel('anthropic/claude-opus-4-6', {
 Higher levels increase reasoning depth at the cost of latency and tokens; `'off'` disables extended thinking entirely. The value is a _default_: individual operations may override it — a [subagent definition](/docs/guide/subagents/) can pin its own `thinkingLevel`, and programmatic `harness.prompt(...)` calls accept one per operation.
 
 Thinking only reaches the wire for models marked reasoning-capable. Catalog models carry that flag already, but if you register a custom provider and skip its `reasoning` metadata, a forwarded `thinkingLevel` is silently dropped. See [Custom providers](#custom-providers).
+
+To choose effort for each root-agent call, register an async `beforeModelCall` callback. It runs after start hooks, immediately before the first provider call and each call after tool results:
+
+```ts
+useModel('anthropic/claude-sonnet-4-6', {
+  thinkingLevel: 'low',
+  beforeModelCall: async ({ delivery, classify }) => {
+    const label = await classify({
+      model: 'anthropic/claude-haiku-4-5',
+      prompt: `Reply with "complex" or "simple" for this request: ${delivery.body}`,
+    });
+    return label.trim().toLowerCase() === 'complex' ? { thinkingLevel: 'high' } : undefined; // Keep the static 'low' default.
+  },
+});
+```
+
+`classify()` is a separate tool-free model call. It receives only the prompt you provide, requests a 128-token output cap, shares the submission's abort signal, and cannot call `beforeModelCall` again. The callback also receives the pending provider `messages` and `signal`. Flue records the selected effort before streaming, so a retry of an interrupted call uses the same choice. The classifier request is separate from the root turn's request telemetry and incurs its own provider usage.
 
 ## Compaction
 

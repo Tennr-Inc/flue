@@ -6,7 +6,7 @@ import type {
 	ToolApprovalDecisionStatus,
 	ToolApprovalPresentation,
 } from './tool-approval.ts';
-import type { PromptUsage } from './types.ts';
+import type { PromptUsage, ThinkingLevel } from './types.ts';
 
 interface ConversationRecordEnvelope {
 	v: 1;
@@ -534,6 +534,15 @@ interface ResourceSnapshotRecord extends ConversationRecordEnvelope {
 	snapshot: ResourceSnapshot;
 }
 
+/** Effective effort chosen before one root-agent call, memoized across attempts. */
+export interface ModelCallDecisionRecord extends ConversationRecordEnvelope {
+	type: 'model_call_decision';
+	submissionId: string;
+	/** Number of completed, non-aborted assistant calls earlier in this submission. */
+	callIndex: number;
+	thinkingLevel: ThinkingLevel;
+}
+
 export type ConversationRecord =
 	| ConversationCreatedRecord
 	| UserMessageRecord
@@ -561,7 +570,8 @@ export type ConversationRecord =
 	| MessageDataWriteRecord
 	| MessageMetadataRecord
 	| ToolStepSettledRecord
-	| ResourceSnapshotRecord;
+	| ResourceSnapshotRecord
+	| ModelCallDecisionRecord;
 
 export function generateConversationRecordId(): string {
 	return generateRecordId();

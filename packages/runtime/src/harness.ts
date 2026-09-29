@@ -89,6 +89,8 @@ export interface HarnessOptions {
 	 * lifecycle callback appends a signal. Same routing as hookState.
 	 */
 	advanceDelivery?: (message: DeliveredMessage) => void;
+	/** Current delivery cursor for the root model-call selector. */
+	getDelivery?: () => DeliveredMessage | undefined;
 	/** Dynamic-resource runtime (function agents only); same routing as hookState. */
 	resources?: SessionResourceRuntime;
 	/**
@@ -151,6 +153,7 @@ export class Harness implements FlueHarness {
 	private rerender: SessionRerender | undefined;
 	private output: AgentOutputChannel | undefined;
 	private advanceDelivery: ((message: DeliveredMessage) => void) | undefined;
+	private getDelivery: (() => DeliveredMessage | undefined) | undefined;
 	private resources: SessionResourceRuntime | undefined;
 	private envRuntime: SandboxRuntime | undefined;
 
@@ -172,6 +175,7 @@ export class Harness implements FlueHarness {
 		this.rerender = options.rerender;
 		this.output = options.output;
 		this.advanceDelivery = options.advanceDelivery;
+		this.getDelivery = options.getDelivery;
 		this.resources = options.resources;
 		this.envRuntime = options.envRuntime;
 		this.envSlot = options.envSlot ?? {
@@ -319,6 +323,7 @@ export class Harness implements FlueHarness {
 			rerender: this.rerender,
 			output: this.output,
 			advanceDelivery: this.advanceDelivery,
+			getDelivery: this.getDelivery,
 			resources: this.resources,
 			envSlot: this.envSlot,
 			envRuntime: this.envRuntime,
@@ -376,6 +381,7 @@ export class Harness implements FlueHarness {
 			),
 			model: taskModel,
 			thinkingLevel: taskAgent?.thinkingLevel ?? this.config.thinkingLevel,
+			beforeModelCall: undefined,
 			compaction: this.config.compaction,
 		};
 		const harnessScope = this.scopeName ? `${this.name}:${this.scopeName}` : this.name;
@@ -475,7 +481,7 @@ export class Harness implements FlueHarness {
 		const nestedScope = this.scopeName ? `${this.scopeName}:${scope}` : scope;
 		const harness = new Harness({
 			name: this.name,
-			config: options.config,
+			config: { ...options.config, beforeModelCall: undefined },
 			env: options.env,
 			eventCallback: options.eventCallback ?? this.eventCallback,
 			agentTools: options.tools,
