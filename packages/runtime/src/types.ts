@@ -1,5 +1,5 @@
 import type { AgentMessage, AgentTool, ThinkingLevel } from '@earendil-works/pi-agent-core';
-import type { ImageContent, Model } from '@earendil-works/pi-ai';
+import type { ImageContent, Message, Model } from '@earendil-works/pi-ai';
 
 export interface SignalMessage {
 	role: 'signal';
@@ -84,6 +84,35 @@ export type DeliveredMessage =
 			attributes?: Record<string, string>;
 			tagName?: string;
 	  };
+
+/** A separate, tool-free model request that never invokes `beforeModelCall`. */
+export interface ModelClassifierRequest {
+	/** Model specifier, such as `'anthropic/claude-haiku-4-5'`. */
+	model: string;
+	/** Classifier prompt. The root conversation is not sent to this model. */
+	prompt: string;
+	/** Classifier effort; defaults to `'off'`. */
+	thinkingLevel?: ThinkingLevel;
+}
+
+/** Context available immediately before a root-agent provider request. */
+export interface BeforeModelCallContext {
+	/** Latest delivered input, including a signal appended by a start hook. */
+	delivery: DeliveredMessage;
+	/** The messages about to be sent to the root model, copied for this callback. */
+	messages: readonly Message[];
+	/** Aborts when the submission or model call is cancelled. */
+	signal: AbortSignal;
+	/** Make an isolated, tool-free classifier request with a requested 128-token cap. */
+	classify(request: ModelClassifierRequest): Promise<string>;
+}
+
+/** Return an effort override, or nothing to use `thinkingLevel` unchanged. */
+// biome-ignore lint/suspicious/noConfusingVoidType: Promise<void> is a valid no-override callback result.
+export type BeforeModelCallResult = { thinkingLevel: ThinkingLevel } | void;
+export type BeforeModelCall = (
+	context: BeforeModelCallContext,
+) => BeforeModelCallResult | Promise<BeforeModelCallResult>;
 
 /**
  * A message as every `dispatch` surface accepts it: a {@link DeliveredMessage}
@@ -479,6 +508,8 @@ export interface AgentConfig {
 	 * harness substitutes `"medium"` when unset; see `AgentRuntimeConfig.thinkingLevel`.
 	 */
 	thinkingLevel?: ThinkingLevel;
+	/** Optional root-agent reasoning selector registered by `useModel()`. */
+	beforeModelCall?: BeforeModelCall;
 	/**
 	 * Compaction tuning. `false` disables threshold compaction (overflow
 	 * recovery and explicit `session.compact()` still run). An object
@@ -542,6 +573,8 @@ export interface AgentRuntimeConfig {
 	subagents?: SubagentDefinition[];
 	/** Default reasoning effort. Individual operations may override this value. */
 	thinkingLevel?: ThinkingLevel;
+	/** Root-agent reasoning selector, refreshed by each render. */
+	beforeModelCall?: BeforeModelCall;
 	/**
 	 * Automatic conversation-compaction configuration. `false` disables
 	 * threshold compaction; overflow recovery and explicit `session.compact()`

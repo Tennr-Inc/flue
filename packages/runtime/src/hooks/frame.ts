@@ -8,6 +8,7 @@ import type {
 } from '../message-output.ts';
 import type { ToolDefinition } from '../tool-types.ts';
 import type {
+	BeforeModelCall,
 	CompactionConfig,
 	DeliveredMessage,
 	SandboxFactory,
@@ -112,6 +113,8 @@ export interface RenderFrame {
 	model: string | undefined;
 	/** `useModel` options: default reasoning effort. */
 	thinkingLevel: ThinkingLevel | undefined;
+	/** `useModel` callback, registered synchronously and awaited at the provider seam. */
+	beforeModelCall: BeforeModelCall | undefined;
 	/** `useModel` options: threshold-compaction configuration. */
 	compaction: false | CompactionConfig | undefined;
 	/** `useSkill` mounts across the whole render, in call order; names unique. */
@@ -166,6 +169,7 @@ export function renderWithFrame<T>(
 		cwd: undefined,
 		model: undefined,
 		thinkingLevel: undefined,
+		beforeModelCall: undefined,
 		compaction: undefined,
 		skills: [],
 		subagents: [],

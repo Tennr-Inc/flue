@@ -452,6 +452,7 @@ async function initializeRootHarness(
 		subagents: initialResources.subagents,
 		model: resolvedModel,
 		thinkingLevel: definition.thinkingLevel ?? config.agentConfig.thinkingLevel,
+		beforeModelCall: definition.beforeModelCall,
 		compaction: definition.compaction ?? config.agentConfig.compaction,
 		// Use the selected definition's policy: two durable instances can
 		// resolve different implementations of the same registered identity.
@@ -472,6 +473,7 @@ async function initializeRootHarness(
 			// swaps, refreshed by the compaction rebaseline's rediscover.
 			systemPrompt: promptContext.recompose(next.config.instructions),
 			tools: [...(next.config.tools ?? []), ...mcpTools],
+			beforeModelCall: next.config.beforeModelCall,
 			resources: renderedResources(next),
 			sandbox: next.config.sandbox,
 			cwd: next.config.cwd,
@@ -507,6 +509,7 @@ async function initializeRootHarness(
 		advanceDelivery: (message) => {
 			renderState.delivery = message;
 		},
+		getDelivery: () => renderState.delivery,
 		resources: resourceRuntime,
 		envSlot,
 		envRuntime,

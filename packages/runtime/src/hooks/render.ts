@@ -104,6 +104,7 @@ export function renderAgentFunctionWithStructure(
 			...(instructions !== undefined ? { instructions } : {}),
 			...(tools.length > 0 ? { tools } : {}),
 			...(frame.thinkingLevel !== undefined ? { thinkingLevel: frame.thinkingLevel } : {}),
+			...(frame.beforeModelCall !== undefined ? { beforeModelCall: frame.beforeModelCall } : {}),
 			...(frame.compaction !== undefined ? { compaction: frame.compaction } : {}),
 			...(frame.cwd !== undefined ? { cwd: frame.cwd } : {}),
 			...(frame.sandbox !== undefined ? { sandbox: frame.sandbox } : {}),

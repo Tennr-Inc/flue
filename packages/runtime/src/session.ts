@@ -59,6 +59,7 @@ import {
 	DURABILITY_DEFAULT_TIMEOUT_MS,
 	type SubmissionDurability,
 } from './agent-execution-store.ts';
+import { assertThinkingLevel } from './agent-tuning.ts';
 import { decodeBase64, encodeBase64 } from './base64.ts';
 import {
 	type CompactionSettings,
@@ -218,6 +219,7 @@ import type { ToolApproval, ToolApprovalProposal } from './tool-approval.ts';
 import { toolApprovalProposalId } from './tool-approval.ts';
 import type {
 	AgentConfig,
+	BeforeModelCall,
 	CallHandle,
 	DeliveredMessage,
 	FlueEvent,
@@ -480,6 +482,8 @@ interface SessionInitOptions {
 	 * the next re-render.
 	 */
 	advanceDelivery?: (message: DeliveredMessage) => void;
+	/** Read the latest root-agent delivery cursor at the provider seam. */
+	getDelivery?: () => DeliveredMessage | undefined;
 	/**
 	 * Dynamic-resource runtime (function agents only): the init render's
 	 * resources, the durable baseline/narrated snapshots, and the rebaseline
@@ -504,6 +508,7 @@ export type SessionRerender = () => {
 	systemPrompt: string;
 	tools: ToolDefinition[];
 	resources: RenderedResources;
+	beforeModelCall?: BeforeModelCall;
 	/**
 	 * The render's declared sandbox and cwd. The session only inspects
 	 * PRESENCE at turn boundaries (a factory is a fresh object every render,
@@ -821,6 +826,8 @@ export class Session implements FlueSession, AgentSubmissionSession {
 	private rerender: SessionRerender | undefined;
 	private outputChannel: AgentOutputChannel | undefined;
 	private advanceDelivery: ((message: DeliveredMessage) => void) | undefined;
+	private getDelivery: (() => DeliveredMessage | undefined) | undefined;
+	private beforeModelCall: BeforeModelCall | undefined;
 	/**
 	 * Dynamic resources. The live maps track the CURRENT render (skill
 	 * activation and task resolution always see what the agent declares now);
@@ -899,17 +906,127 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		if (this.activeTurnId === undefined) this.activeTurnId = generateTurnId();
 		const turnId = this.activeTurnId;
 		const operationId = this.activeOperationId ?? generateOperationId();
-		this.emitTurnRequest(turnId, 'agent', model, context, options);
+		const selected = await this.resolveModelCallOptions(context.messages, options);
+		this.emitTurnRequest(turnId, 'agent', model, context, selected.options, selected.effort);
 		const operation = { type: 'model' as const, turnId };
 		const executionContext = this.executionContext({ operationId, turnId });
 		return interceptExecution(operation, executionContext, async () =>
 			wrapProviderStream(
-				getRuntimeModels().streamSimple(model, context, options),
+				getRuntimeModels().streamSimple(model, context, selected.options),
 				operation,
 				executionContext,
 			),
 		);
 	};
+
+	/** Memoize the effective effort before the root provider can start streaming. */
+	private async resolveModelCallOptions(
+		messages: Message[],
+		options: SimpleStreamOptions | undefined,
+	): Promise<{ options: SimpleStreamOptions | undefined; effort?: ThinkingLevel }> {
+		const callback = this.beforeModelCall;
+		const submissionId = this.activeSubmissionId;
+		// Scratch harnesses, programmatic operations, and compaction do not have
+		// a root submission delivery or a selector invocation.
+		if (!callback || !submissionId || !this.getDelivery) return { options };
+		const signal = options?.signal ?? this.activeJoinSignal;
+		if (!signal) throw new Error('[flue] A root model call has no abort signal.');
+		if (signal.aborted) throw abortErrorFor(signal);
+		const conversation = await this.requireConversation();
+		const callIndex = getActiveConversationPath(conversation).filter(
+			(entry) =>
+				entry.type === 'message' &&
+				entry.submissionId === submissionId &&
+				entry.message.role === 'assistant' &&
+				entry.message.stopReason !== 'aborted',
+		).length;
+		const id = `record_model_call_decision_${encodeCanonicalId(submissionId)}_${callIndex}`;
+		const existing = await this.conversationWriter.getRecord(id);
+		let thinkingLevel: ThinkingLevel;
+		if (existing) {
+			if (existing.type !== 'model_call_decision' || existing.submissionId !== submissionId) {
+				throw new Error(`[flue] Model-call decision record "${id}" is unavailable.`);
+			}
+			thinkingLevel = existing.thinkingLevel;
+		} else {
+			const delivery = this.getDelivery();
+			if (!delivery) throw new Error('[flue] A root model call has no delivered message.');
+			const selected = await abandonToolOnAbort(
+				() =>
+					callback({
+						delivery: structuredClone(delivery),
+						messages: structuredClone(messages),
+						signal,
+						classify: (request) => this.classifyModelCall(request, signal),
+					}),
+				signal,
+			);
+			if (selected !== undefined && (selected === null || typeof selected !== 'object')) {
+				throw new Error('[flue] beforeModelCall must return an effort override or nothing.');
+			}
+			const override = selected?.thinkingLevel;
+			assertThinkingLevel(override, 'beforeModelCall() result');
+			thinkingLevel = override ?? options?.reasoning ?? this.resolveThinkingLevelForCall(undefined);
+			if (signal.aborted) throw abortErrorFor(signal);
+			await this.appendCanonical([
+				{
+					...this.canonicalEnvelope('model_call_decision', id),
+					type: 'model_call_decision',
+					submissionId,
+					callIndex,
+					thinkingLevel,
+				},
+			]);
+		}
+		if (signal.aborted) throw abortErrorFor(signal);
+		return {
+			options: { ...options, reasoning: thinkingLevel === 'off' ? undefined : thinkingLevel },
+			effort: thinkingLevel,
+		};
+	}
+
+	/** Direct Pi completion keeps classifier work outside Flue's agent loop. */
+	private async classifyModelCall(
+		request: { model: string; prompt: string; thinkingLevel?: ThinkingLevel },
+		signal: AbortSignal,
+	): Promise<string> {
+		if (
+			typeof request?.model !== 'string' ||
+			!request.model.trim() ||
+			typeof request.prompt !== 'string'
+		) {
+			throw new Error('[flue] classify() requires a model and prompt string.');
+		}
+		assertThinkingLevel(request.thinkingLevel, 'classify() request');
+		const model = this.resolveModelForCall(request.model);
+		const response = await abandonToolOnAbort(
+			() =>
+				getRuntimeModels().completeSimple(
+					model,
+					{
+						messages: [{ role: 'user', content: request.prompt, timestamp: Date.now() }],
+					},
+					{
+						signal,
+						maxTokens: 128,
+						reasoning: request.thinkingLevel === 'off' ? undefined : request.thinkingLevel,
+					},
+				),
+			signal,
+		);
+		if (response.stopReason === 'error' || response.stopReason === 'aborted') {
+			throw new Error(
+				`[flue] Classifier model call failed: ${response.errorMessage ?? response.stopReason}`,
+			);
+		}
+		return response.content
+			.filter(
+				(part): part is Extract<(typeof response.content)[number], { type: 'text' }> =>
+					part.type === 'text',
+			)
+			.map((part) => part.text)
+			.join('');
+	}
 
 	private canonicalEnvelope(type: ConversationRecord['type'], id = generateConversationRecordId()) {
 		return {
@@ -994,6 +1111,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		// workspace.
 		const swapped = await this.maybeSwapEnvironment(next);
 		if (swapped) next = this.rerender();
+		this.beforeModelCall = next.beforeModelCall;
 		this.agentTools = next.tools;
 		// Live resource sets follow the render: skill activation and task
 		// resolution always see what the agent declares NOW, even while the
@@ -1307,6 +1425,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		await this.appendCanonical([compactionRecord, this.resourceSnapshotRecord(current, true)]);
 		this.lastNarratedResources = current;
 		this.agentTools = refreshed.tools;
+		this.beforeModelCall = refreshed.beforeModelCall;
 		this.liveSkills = refreshed.resources.skills;
 		this.liveSubagents = refreshed.resources.subagents;
 		this.lastRenderedResources = refreshed.resources;
@@ -1318,7 +1437,9 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		// prepareRerenderTurn does — a mid-call compaction must not drop a
 		// structured-result prompt's finish/give_up bundle, per-call tools,
 		// or active packaged skills for the turn that follows it.
-		this.updateAgentSystemPrompt(this.rerender().systemPrompt);
+		const recomposed = this.rerender();
+		this.beforeModelCall = recomposed.beforeModelCall;
+		this.updateAgentSystemPrompt(recomposed.systemPrompt);
 		const overrides = this.activeCallOverrides;
 		this.agentLoop.state.tools = this.assembleModelTools(
 			this.createBuiltinToolGroups(
@@ -2169,6 +2290,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		model: Model<any> | undefined,
 		purpose: 'agent' | 'compaction' | 'compaction_prefix',
 		options?: SimpleStreamOptions,
+		effort?: ThinkingLevel,
 	): ModelRequestInfo {
 		if (!model) throw new Error('[flue] Missing configured model for turn telemetry.');
 		const parsedEndpoint = parseProviderEndpoint(model.baseUrl);
@@ -2179,7 +2301,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 			api: model.api,
 			serverAddress: parsedEndpoint?.address,
 			serverPort: parsedEndpoint?.port,
-			reasoningLevel: options?.reasoning,
+			reasoningLevel: effort ?? options?.reasoning,
 			maxTokens: options?.maxTokens,
 			temperature: options?.temperature,
 			// Persistent context property, not a "just compacted" pulse. Internal
@@ -2199,6 +2321,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 			tools?: Array<{ name: string; description: string; parameters: unknown }>;
 		},
 		options: SimpleStreamOptions | undefined,
+		effort?: ThinkingLevel,
 	): void {
 		// pi 0.87 passes a transcript context: the prompt and tool declarations
 		// ride in the transcript's system messages, so fall back to pi's
@@ -2210,7 +2333,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 				parameters: tool.parameters,
 			}),
 		);
-		const request = this.modelRequestInfo(model, purpose, options);
+		const request = this.modelRequestInfo(model, purpose, options, effort);
 		this.modelRequests.set(turnId, { info: request, startedAt: Date.now() });
 		this.emit({
 			type: 'turn_request',
@@ -2303,6 +2426,8 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		this.rerender = options.rerender;
 		this.outputChannel = options.output;
 		this.advanceDelivery = options.advanceDelivery;
+		this.getDelivery = options.getDelivery;
+		this.beforeModelCall = options.config.beforeModelCall;
 		this.outputChannel?.connect((name, data) => this.enqueueMessageDataWrite(name, data));
 		// Dynamic resources (function agents): live sets start at the init
 		// render; legacy agents keep their init-frozen config for life. The

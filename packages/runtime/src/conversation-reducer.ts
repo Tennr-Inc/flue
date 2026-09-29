@@ -347,7 +347,7 @@ export interface ReducedContextEntry {
  */
 // Version 3 was independently used by the fork (approvals) and upstream
 // (truncated tool batches). Rebuild checkpoints for the combined semantics.
-export const REDUCED_STATE_FORMAT = 4;
+export const REDUCED_STATE_FORMAT = 5;
 
 export function createReducedInstanceState(): ReducedInstanceState {
 	return {
@@ -907,6 +907,14 @@ export function applyConversationRecord(
 		case 'state_write':
 			state.state.set(record.name, record.value);
 			break;
+		case 'model_call_decision':
+			if (!Number.isSafeInteger(record.callIndex) || record.callIndex < 0) {
+				fail(record, 'A model-call decision requires a non-negative call index.');
+			}
+			// Retain until settlement so a replacement attempt can read the
+			// decision by its deterministic id before starting the provider.
+			trackAttemptScopedRecord(conversation, record.submissionId, record.id);
+			break;
 		case 'resource_snapshot':
 			state.resources = {
 				narrated: record.snapshot,
@@ -977,6 +985,7 @@ function indexConversationRecord(record: ConversationRecord): IndexedConversatio
 	switch (record.type) {
 		case 'submission_settled':
 		case 'tool_step_settled':
+		case 'model_call_decision':
 		case 'agent_start_run':
 		case 'agent_finish_cycle':
 		case 'assistant_message_completed':
