@@ -6,7 +6,7 @@ import { requireRenderFrame } from './frame.ts';
 export interface UseModelOptions {
 	/** Default reasoning effort. Individual operations may override this value. */
 	thinkingLevel?: ThinkingLevel;
-	/** Choose reasoning effort before each root-agent model call. */
+	/** Choose reasoning effort once per delivered message for root-agent model calls. */
 	beforeModelCall?: BeforeModelCall;
 	/**
 	 * Automatic conversation-compaction configuration. `false` disables
@@ -26,10 +26,12 @@ export interface UseModelOptions {
  *
  * Model, static reasoning effort, and compaction are submission-scoped. The
  * `beforeModelCall` callback is refreshed on every render and awaited after
- * start hooks, immediately before each root-agent provider request.
+ * start hooks, immediately before the first root-agent provider request for
+ * each delivered message. Calls after tool results reuse that effort until
+ * the next delivery, so a tool loop keeps one request-level effort.
  *
  * `options` carries model-call tuning: `thinkingLevel` (default reasoning
- * effort), `beforeModelCall` (optional async per-call override), and
+ * effort), `beforeModelCall` (optional async per-delivery override), and
  * `compaction` (threshold-compaction configuration, or `false` to disable).
  */
 export function useModel(model: string, options: UseModelOptions = {}): void {

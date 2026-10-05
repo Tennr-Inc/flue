@@ -911,6 +911,9 @@ export function applyConversationRecord(
 			if (!Number.isSafeInteger(record.callIndex) || record.callIndex < 0) {
 				fail(record, 'A model-call decision requires a non-negative call index.');
 			}
+			if (record.deliveryEntryId !== undefined && typeof record.deliveryEntryId !== 'string') {
+				fail(record, 'A model-call decision delivery entry id must be a string.');
+			}
 			// Retain until settlement so a replacement attempt can read the
 			// decision by its deterministic id before starting the provider.
 			trackAttemptScopedRecord(conversation, record.submissionId, record.id);

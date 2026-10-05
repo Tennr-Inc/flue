@@ -11,9 +11,17 @@ import {
 import type { FauxResponseFactory } from '@earendil-works/pi-ai/providers/faux';
 import { afterEach, expect, it, vi } from 'vitest';
 import { createFlueContext } from './client.ts';
+import type { ConversationRecord } from './conversation-records.ts';
 import { ConversationRecordWriter } from './conversation-writer.ts';
 import type { Harness } from './harness.ts';
-import { init, instrument, useAgentStart, useModel, useTool } from './index.ts';
+import {
+	init,
+	instrument,
+	useAgentFinish,
+	useAgentStart,
+	useModel,
+	useTool,
+} from './index.ts';
 import { sqlite, start } from './node/index.ts';
 import { ensureInstanceIdentity, processSubmission } from './runtime/agent-submissions.ts';
 import { InMemoryAttachmentStore } from './runtime/attachment-store.ts';
@@ -33,7 +41,7 @@ afterEach(async () => {
 	resetModelsForTests();
 });
 
-it('classifies the first and post-tool root calls with current delivery and messages', async () => {
+it('classifies once per delivery and reuses the effort across a tool loop', async () => {
 	const faux = fauxProvider({
 		models: [
 			{ id: 'main', reasoning: true },
@@ -58,8 +66,9 @@ it('classifies the first and post-tool root calls with current delivery and mess
 				stopReason: 'toolUse',
 			}),
 		),
-		response(fauxAssistantMessage('low')),
 		response(fauxAssistantMessage('Done.')),
+		response(fauxAssistantMessage('low')),
+		response(fauxAssistantMessage('Again.')),
 	]);
 	const decisions: Array<{ delivery: string; messages: number; signal: AbortSignal }> = [];
 	const startHook = vi.fn();
@@ -103,14 +112,18 @@ it('classifies the first and post-tool root calls with current delivery and mess
 	await expect(agent.read(await agent.dispatch('Find it.'))).resolves.toMatchObject({
 		text: 'Done.',
 	});
-	expect(startHook).toHaveBeenCalledTimes(1);
+	await expect(agent.read(await agent.dispatch('Follow up.'))).resolves.toMatchObject({
+		text: 'Again.',
+	});
+	expect(startHook).toHaveBeenCalledTimes(2);
 	expect(decisions.map(({ delivery, messages }) => ({ delivery, messages }))).toEqual([
 		{ delivery: 'Prepared context.', messages: 3 },
-		{ delivery: 'Prepared context.', messages: 5 },
+		{ delivery: 'Prepared context.', messages: 8 },
 	]);
 	expect(decisions.every((decision) => !decision.signal.aborted)).toBe(true);
 	expect(requests.map(({ model, reasoning }) => ({ model, reasoning }))).toEqual([
 		{ model: 'classifier', reasoning: undefined },
+		{ model: 'main', reasoning: 'high' },
 		{ model: 'main', reasoning: 'high' },
 		{ model: 'classifier', reasoning: undefined },
 		{ model: 'main', reasoning: 'low' },
@@ -119,7 +132,111 @@ it('classifies the first and post-tool root calls with current delivery and mess
 		observations
 			.filter((event) => event.type === 'turn_request')
 			.map((event) => event.request.reasoningLevel),
-	).toEqual(['high', 'low']);
+	).toEqual(['high', 'high', 'low']);
+});
+
+it('selects again for a signal appended by a finish hook', async () => {
+	const faux = fauxProvider({ models: [{ id: 'main', reasoning: true }] });
+	const providerEfforts: Array<string | undefined> = [];
+	const respond =
+		(text: string): FauxResponseFactory =>
+		(_context, options) => {
+			providerEfforts.push((options as SimpleStreamOptions | undefined)?.reasoning);
+			return fauxAssistantMessage(text);
+		};
+	faux.setResponses([respond('Draft.'), respond('Checked.')]);
+	const deliveries: string[] = [];
+	let reviewed = false;
+	function ReviewAgent() {
+		useModel('faux/main', {
+			thinkingLevel: 'medium',
+			beforeModelCall: ({ delivery }) => {
+				deliveries.push(delivery.body);
+				return { thinkingLevel: delivery.kind === 'signal' ? 'high' : 'low' };
+			},
+		});
+		useAgentFinish(({ append }) => {
+			if (reviewed) return;
+			reviewed = true;
+			append({ kind: 'signal', type: 'review', body: 'Check the draft.' });
+		});
+		return 'Answer.';
+	}
+	const runtime = await start({
+		agents: [ReviewAgent],
+		db: sqlite(),
+		providers: [faux.provider],
+		env: {},
+	});
+	const agent = init(ReviewAgent, { id: 'review-agent' });
+	cleanups.push(async () => {
+		await agent.abort();
+		await runtime.stop();
+	});
+
+	await expect(agent.read(await agent.dispatch('Write it.'))).resolves.toMatchObject({
+		text: 'Draft.\n\nChecked.',
+	});
+	expect(deliveries).toEqual(['Write it.', 'Check the draft.']);
+	expect(providerEfforts).toEqual(['low', 'high']);
+});
+
+it('selects again for a delivery that joins the live response', async () => {
+	const faux = fauxProvider({ models: [{ id: 'main', reasoning: true }] });
+	const providerEfforts: Array<string | undefined> = [];
+	faux.setResponses([
+		(_context, options) => {
+			providerEfforts.push((options as SimpleStreamOptions | undefined)?.reasoning);
+			return fauxAssistantMessage([fauxToolCall('wait', {}, { id: 'wait-1' })], {
+				stopReason: 'toolUse',
+			});
+		},
+		(_context, options) => {
+			providerEfforts.push((options as SimpleStreamOptions | undefined)?.reasoning);
+			return fauxAssistantMessage('Both done.');
+		},
+	]);
+	const entered = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<string>();
+	const deliveries: string[] = [];
+	function JoinAgent() {
+		useModel('faux/main', {
+			beforeModelCall: ({ delivery }) => {
+				deliveries.push(delivery.body);
+				return { thinkingLevel: delivery.body === 'Also this.' ? 'high' : 'low' };
+			},
+		});
+		useTool({
+			name: 'wait',
+			description: 'Wait for the result.',
+			run: () => {
+				entered.resolve();
+				return release.promise;
+			},
+		});
+		return 'Answer every message.';
+	}
+	const runtime = await start({
+		agents: [JoinAgent],
+		db: sqlite(),
+		providers: [faux.provider],
+		env: {},
+	});
+	const agent = init(JoinAgent, { id: 'join-agent' });
+	cleanups.push(async () => {
+		release.resolve('released');
+		await agent.abort();
+		await runtime.stop();
+	});
+
+	const first = await agent.dispatch('First.');
+	await entered.promise;
+	await agent.dispatch('Also this.');
+	release.resolve('waited');
+	await expect(agent.read(first)).resolves.toMatchObject({ text: 'Both done.' });
+	expect(deliveries).toEqual(['First.', 'Also this.']);
+	expect(providerEfforts).toEqual(['low', 'high']);
+	expect(faux.state.callCount).toBe(2);
 });
 
 it('uses the static default on fallback and records an explicit off override', async () => {
@@ -205,28 +322,22 @@ it('cancels a pending selector before the root provider call', async () => {
 	expect(faux.state.callCount).toBe(0);
 });
 
-it('reuses the durable effort after an interrupted attempt', async () => {
+/**
+ * A file-backed agent whose store throws right after appending any batch that
+ * matches `crashOn`, until `restart()` reopens the files for a resumed attempt.
+ */
+async function createCrashFixture(
+	agentFn: () => string,
+	agentName: string,
+	crashOn: (records: readonly ConversationRecord[]) => boolean,
+) {
 	const directory = mkdtempSync(join(tmpdir(), 'flue-model-choice-'));
-	const path = agentStreamPath('RetryAgent', 'instance-1');
-	const crash = new Error('injected crash after decision commit');
-	const faux = fauxProvider({ models: [{ id: 'main', reasoning: true }] });
-	setProvider(faux.provider);
-	let crashOnDecision = true;
+	const path = agentStreamPath(agentName, 'instance-1');
+	const crash = new Error('injected crash after commit');
+	let crashArmed = true;
 	let attemptNumber = 0;
 	let admitted = false;
 	const harnesses: Harness[] = [];
-	const selector = vi.fn(() => ({ thinkingLevel: 'high' as const }));
-	const providerEfforts: Array<string | undefined> = [];
-	faux.setResponses([
-		(_context, options) => {
-			providerEfforts.push((options as SimpleStreamOptions | undefined)?.reasoning);
-			return fauxAssistantMessage('Recovered.');
-		},
-	]);
-	function RetryAgent() {
-		useModel('faux/main', { thinkingLevel: 'low', beforeModelCall: selector });
-		return 'Answer.';
-	}
 	async function open() {
 		const database = new DatabaseSync(join(directory, 'store.sqlite'));
 		const sql: SqlStorage = {
@@ -258,18 +369,13 @@ it('reuses the durable effort after an interrupted attempt', async () => {
 		const append = store.append.bind(store);
 		store.append = async (input) => {
 			const result = await append(input);
-			if (
-				crashOnDecision &&
-				input.records.some((record) => record.type === 'model_call_decision')
-			) {
-				throw crash;
-			}
+			if (crashArmed && crashOn(input.records)) throw crash;
 			return result;
 		};
 		const writer = await ConversationRecordWriter.create({
 			store,
 			path,
-			identity: { agentName: 'RetryAgent', instanceId: 'instance-1' },
+			identity: { agentName, instanceId: 'instance-1' },
 			producerId: `attempt-${attemptNumber}`,
 		});
 		return { database, submissions, store, writer };
@@ -286,11 +392,11 @@ it('reuses the durable effort after an interrupted attempt', async () => {
 	async function attempt() {
 		const { submissions, writer } = connection;
 		if (!admitted) {
-			await ensureInstanceIdentity(writer, RetryAgent, undefined);
+			await ensureInstanceIdentity(writer, agentFn, undefined);
 			await submissions.admitDirect({
 				kind: 'direct',
 				submissionId: 'submission-1',
-				agent: 'RetryAgent',
+				agent: agentName,
 				id: 'instance-1',
 				message: { kind: 'user', body: 'Answer now.' },
 				acceptedAt: new Date().toISOString(),
@@ -316,13 +422,13 @@ it('reuses the durable effort after an interrupted attempt', async () => {
 		await processSubmission({
 			submissions,
 			submission,
-			resolveAgent: () => RetryAgent,
+			resolveAgent: () => agentFn,
 			conversationWriter: writer,
 			isShutdownAbort: (error) => error === crash,
 			createContext: (submissionId) => {
 				const context = createFlueContext({
 					id: 'instance-1',
-					agentName: 'RetryAgent',
+					agentName,
 					submissionId,
 					env: {},
 					agentConfig: { resolveModel },
@@ -341,19 +447,91 @@ it('reuses the durable effort after an interrupted attempt', async () => {
 		});
 		return submissions.getSubmission('submission-1');
 	}
+	return {
+		crash,
+		attempt,
+		/** Close the crashed connection and reopen the same files, like a restart. */
+		async restart() {
+			await close();
+			crashArmed = false;
+			connection = await open();
+		},
+		async records() {
+			return (await connection.store.read(path)).batches.flatMap((batch) => batch.records);
+		},
+	};
+}
 
-	await expect(attempt()).rejects.toBe(crash);
+it('reuses the durable effort after an interrupted attempt', async () => {
+	const faux = fauxProvider({ models: [{ id: 'main', reasoning: true }] });
+	setProvider(faux.provider);
+	const selector = vi.fn(() => ({ thinkingLevel: 'high' as const }));
+	const providerEfforts: Array<string | undefined> = [];
+	faux.setResponses([
+		(_context, options) => {
+			providerEfforts.push((options as SimpleStreamOptions | undefined)?.reasoning);
+			return fauxAssistantMessage('Recovered.');
+		},
+	]);
+	function RetryAgent() {
+		useModel('faux/main', { thinkingLevel: 'low', beforeModelCall: selector });
+		return 'Answer.';
+	}
+	const fixture = await createCrashFixture(RetryAgent, 'RetryAgent', (records) =>
+		records.some((record) => record.type === 'model_call_decision'),
+	);
+
+	await expect(fixture.attempt()).rejects.toBe(fixture.crash);
 	expect(faux.state.callCount).toBe(0);
 	expect(selector).toHaveBeenCalledTimes(1);
-	await close();
-	crashOnDecision = false;
-	connection = await open();
-	await expect(attempt()).resolves.toMatchObject({ status: 'settled' });
+	await fixture.restart();
+	await expect(fixture.attempt()).resolves.toMatchObject({ status: 'settled' });
 	expect(selector).toHaveBeenCalledTimes(1);
 	expect(providerEfforts).toEqual(['high']);
-	const records = (await connection.store.read(path)).batches.flatMap((batch) => batch.records);
+	const records = await fixture.records();
 	expect(records.filter((record) => record.type === 'model_call_decision')).toHaveLength(1);
 	expect(records.findIndex((record) => record.type === 'model_call_decision')).toBeLessThan(
 		records.findIndex((record) => record.type === 'assistant_message_started'),
 	);
+});
+
+it('resumes a tool loop with the earlier effort instead of selecting again', async () => {
+	const faux = fauxProvider({ models: [{ id: 'main', reasoning: true }] });
+	setProvider(faux.provider);
+	const selector = vi.fn(() => ({ thinkingLevel: 'high' as const }));
+	const providerEfforts: Array<string | undefined> = [];
+	faux.setResponses([
+		(_context, options) => {
+			providerEfforts.push((options as SimpleStreamOptions | undefined)?.reasoning);
+			return fauxAssistantMessage([fauxToolCall('lookup', {}, { id: 'lookup-1' })], {
+				stopReason: 'toolUse',
+			});
+		},
+		(_context, options) => {
+			providerEfforts.push((options as SimpleStreamOptions | undefined)?.reasoning);
+			return fauxAssistantMessage('Recovered.');
+		},
+	]);
+	function ToolLoopAgent() {
+		useModel('faux/main', { thinkingLevel: 'low', beforeModelCall: selector });
+		useTool({ name: 'lookup', description: 'Look up the answer.', run: () => 'found' });
+		return 'Use the lookup tool, then answer.';
+	}
+	const fixture = await createCrashFixture(ToolLoopAgent, 'ToolLoopAgent', (records) =>
+		records.some((record) => record.type === 'tool_results_committed'),
+	);
+
+	await expect(fixture.attempt()).rejects.toBe(fixture.crash);
+	expect(faux.state.callCount).toBe(1);
+	expect(selector).toHaveBeenCalledTimes(1);
+	await fixture.restart();
+	await expect(fixture.attempt()).resolves.toMatchObject({ status: 'settled' });
+	expect(selector).toHaveBeenCalledTimes(1);
+	expect(providerEfforts).toEqual(['high', 'high']);
+	const decisions = (await fixture.records()).filter(
+		(record) => record.type === 'model_call_decision',
+	);
+	expect(decisions.map((record) => record.callIndex)).toEqual([0, 1]);
+	expect(decisions[0]?.deliveryEntryId).toEqual(expect.any(String));
+	expect(decisions[1]?.deliveryEntryId).toBe(decisions[0]?.deliveryEntryId);
 });

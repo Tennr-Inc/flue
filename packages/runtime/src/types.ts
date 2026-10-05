@@ -95,9 +95,17 @@ export interface ModelClassifierRequest {
 	thinkingLevel?: ThinkingLevel;
 }
 
-/** Context available immediately before a root-agent provider request. */
+/**
+ * Context available before the first root-agent provider request for a
+ * delivered message. Later calls for the same delivery (calls after tool
+ * results) reuse the selected effort without invoking the callback again.
+ */
 export interface BeforeModelCallContext {
-	/** Latest delivered input, including a signal appended by a start hook. */
+	/**
+	 * The delivery this effort is chosen for: the message that woke the agent, a
+	 * delivery that joined the live response, or a signal appended by a start or
+	 * finish hook.
+	 */
 	delivery: DeliveredMessage;
 	/** The messages about to be sent to the root model, copied for this callback. */
 	messages: readonly Message[];
