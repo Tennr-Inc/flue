@@ -381,7 +381,7 @@ export class Harness implements FlueHarness {
 			),
 			model: taskModel,
 			thinkingLevel: taskAgent?.thinkingLevel ?? this.config.thinkingLevel,
-			beforeModelCall: undefined,
+			beforeModelTurns: undefined,
 			compaction: this.config.compaction,
 		};
 		const harnessScope = this.scopeName ? `${this.name}:${this.scopeName}` : this.name;
@@ -481,7 +481,7 @@ export class Harness implements FlueHarness {
 		const nestedScope = this.scopeName ? `${this.scopeName}:${scope}` : scope;
 		const harness = new Harness({
 			name: this.name,
-			config: { ...options.config, beforeModelCall: undefined },
+			config: { ...options.config, beforeModelTurns: undefined },
 			env: options.env,
 			eventCallback: options.eventCallback ?? this.eventCallback,
 			agentTools: options.tools,

@@ -541,6 +541,11 @@ export interface ModelCallDecisionRecord extends ConversationRecordEnvelope {
 	/** Number of completed, non-aborted assistant calls earlier in this submission. */
 	callIndex: number;
 	thinkingLevel: ThinkingLevel;
+	/**
+	 * Path entry of the delivery the effort was chosen for. A later call with
+	 * the same delivery entry reuses this effort instead of selecting again.
+	 */
+	deliveryEntryId?: string;
 }
 
 export type ConversationRecord =

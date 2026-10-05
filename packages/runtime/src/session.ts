@@ -98,6 +98,8 @@ import {
 	type IndexedConversationRecord,
 	type InProgressAssistantMessage,
 	type ReducedConversationState,
+	type ReducedEntry,
+	type ReducedMessageEntry,
 	toolOutcomeKey,
 	toolResultEntryId,
 } from './conversation-reducer.ts';
@@ -219,7 +221,7 @@ import type { ToolApproval, ToolApprovalProposal } from './tool-approval.ts';
 import { toolApprovalProposalId } from './tool-approval.ts';
 import type {
 	AgentConfig,
-	BeforeModelCall,
+	BeforeModelTurns,
 	CallHandle,
 	DeliveredMessage,
 	FlueEvent,
@@ -508,7 +510,7 @@ export type SessionRerender = () => {
 	systemPrompt: string;
 	tools: ToolDefinition[];
 	resources: RenderedResources;
-	beforeModelCall?: BeforeModelCall;
+	beforeModelTurns?: BeforeModelTurns;
 	/**
 	 * The render's declared sandbox and cwd. The session only inspects
 	 * PRESENCE at turn boundaries (a factory is a fresh object every render,
@@ -827,7 +829,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 	private outputChannel: AgentOutputChannel | undefined;
 	private advanceDelivery: ((message: DeliveredMessage) => void) | undefined;
 	private getDelivery: (() => DeliveredMessage | undefined) | undefined;
-	private beforeModelCall: BeforeModelCall | undefined;
+	private beforeModelTurns: BeforeModelTurns | undefined;
 	/**
 	 * Dynamic resources. The live maps track the CURRENT render (skill
 	 * activation and task resolution always see what the agent declares now);
@@ -924,7 +926,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		messages: Message[],
 		options: SimpleStreamOptions | undefined,
 	): Promise<{ options: SimpleStreamOptions | undefined; effort?: ThinkingLevel }> {
-		const callback = this.beforeModelCall;
+		const callback = this.beforeModelTurns;
 		const submissionId = this.activeSubmissionId;
 		// Scratch harnesses, programmatic operations, and compaction do not have
 		// a root submission delivery or a selector invocation.
@@ -933,14 +935,17 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		if (!signal) throw new Error('[flue] A root model call has no abort signal.');
 		if (signal.aborted) throw abortErrorFor(signal);
 		const conversation = await this.requireConversation();
-		const callIndex = getActiveConversationPath(conversation).filter(
+		const path = getActiveConversationPath(conversation);
+		const callIndex = path.filter(
 			(entry) =>
 				entry.type === 'message' &&
 				entry.submissionId === submissionId &&
 				entry.message.role === 'assistant' &&
 				entry.message.stopReason !== 'aborted',
 		).length;
-		const id = `record_model_call_decision_${encodeCanonicalId(submissionId)}_${callIndex}`;
+		const decisionId = (index: number) =>
+			`record_model_call_decision_${encodeCanonicalId(submissionId)}_${index}`;
+		const id = decisionId(callIndex);
 		const existing = await this.conversationWriter.getRecord(id);
 		let thinkingLevel: ThinkingLevel;
 		if (existing) {
@@ -949,24 +954,23 @@ export class Session implements FlueSession, AgentSubmissionSession {
 			}
 			thinkingLevel = existing.thinkingLevel;
 		} else {
-			const delivery = this.getDelivery();
-			if (!delivery) throw new Error('[flue] A root model call has no delivered message.');
-			const selected = await abandonToolOnAbort(
-				() =>
-					callback({
-						delivery: structuredClone(delivery),
-						messages: structuredClone(messages),
-						signal,
-						classify: (request) => this.classifyModelCall(request, signal),
-					}),
-				signal,
-			);
-			if (selected !== undefined && (selected === null || typeof selected !== 'object')) {
-				throw new Error('[flue] beforeModelCall must return an effort override or nothing.');
+			// Effort is chosen once per delivery: calls after tool results reuse
+			// the previous call's effort until the delivery cursor advances, so a
+			// tool loop keeps one request-level effort (and its prompt cache).
+			const deliveryEntryId = this.deliveryCursorEntry(path)?.id;
+			const previous =
+				callIndex > 0 && deliveryEntryId
+					? await this.conversationWriter.getRecord(decisionId(callIndex - 1))
+					: undefined;
+			if (
+				previous?.type === 'model_call_decision' &&
+				previous.submissionId === submissionId &&
+				previous.deliveryEntryId === deliveryEntryId
+			) {
+				thinkingLevel = previous.thinkingLevel;
+			} else {
+				thinkingLevel = await this.selectDeliveryEffort(callback, messages, options, signal);
 			}
-			const override = selected?.thinkingLevel;
-			assertThinkingLevel(override, 'beforeModelCall() result');
-			thinkingLevel = override ?? options?.reasoning ?? this.resolveThinkingLevelForCall(undefined);
 			if (signal.aborted) throw abortErrorFor(signal);
 			await this.appendCanonical([
 				{
@@ -975,6 +979,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 					submissionId,
 					callIndex,
 					thinkingLevel,
+					...(deliveryEntryId ? { deliveryEntryId } : {}),
 				},
 			]);
 		}
@@ -983,6 +988,33 @@ export class Session implements FlueSession, AgentSubmissionSession {
 			options: { ...options, reasoning: thinkingLevel === 'off' ? undefined : thinkingLevel },
 			effort: thinkingLevel,
 		};
+	}
+
+	/** Invoke `beforeModelTurns` for a new delivery and resolve its effective effort. */
+	private async selectDeliveryEffort(
+		callback: BeforeModelTurns,
+		messages: Message[],
+		options: SimpleStreamOptions | undefined,
+		signal: AbortSignal,
+	): Promise<ThinkingLevel> {
+		const delivery = this.getDelivery?.();
+		if (!delivery) throw new Error('[flue] A root model call has no delivered message.');
+		const selected = await abandonToolOnAbort(
+			() =>
+				callback({
+					delivery: structuredClone(delivery),
+					messages: structuredClone(messages),
+					signal,
+					classify: (request) => this.classifyModelCall(request, signal),
+				}),
+			signal,
+		);
+		if (selected !== undefined && (selected === null || typeof selected !== 'object')) {
+			throw new Error('[flue] beforeModelTurns must return an effort override or nothing.');
+		}
+		const override = selected?.thinkingLevel;
+		assertThinkingLevel(override, 'beforeModelTurns() result');
+		return override ?? options?.reasoning ?? this.resolveThinkingLevelForCall(undefined);
 	}
 
 	/** Direct Pi completion keeps classifier work outside Flue's agent loop. */
@@ -1111,7 +1143,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		// workspace.
 		const swapped = await this.maybeSwapEnvironment(next);
 		if (swapped) next = this.rerender();
-		this.beforeModelCall = next.beforeModelCall;
+		this.beforeModelTurns = next.beforeModelTurns;
 		this.agentTools = next.tools;
 		// Live resource sets follow the render: skill activation and task
 		// resolution always see what the agent declares NOW, even while the
@@ -1425,7 +1457,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		await this.appendCanonical([compactionRecord, this.resourceSnapshotRecord(current, true)]);
 		this.lastNarratedResources = current;
 		this.agentTools = refreshed.tools;
-		this.beforeModelCall = refreshed.beforeModelCall;
+		this.beforeModelTurns = refreshed.beforeModelTurns;
 		this.liveSkills = refreshed.resources.skills;
 		this.liveSubagents = refreshed.resources.subagents;
 		this.lastRenderedResources = refreshed.resources;
@@ -1438,7 +1470,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		// structured-result prompt's finish/give_up bundle, per-call tools,
 		// or active packaged skills for the turn that follows it.
 		const recomposed = this.rerender();
-		this.beforeModelCall = recomposed.beforeModelCall;
+		this.beforeModelTurns = recomposed.beforeModelTurns;
 		this.updateAgentSystemPrompt(recomposed.systemPrompt);
 		const overrides = this.activeCallOverrides;
 		this.agentLoop.state.tools = this.assembleModelTools(
@@ -2021,52 +2053,67 @@ export class Session implements FlueSession, AgentSubmissionSession {
 	 * reconstructs its attachments from the attachment store.
 	 */
 	private async restoreDeliveryCursor(): Promise<void> {
-		const inputEntryId = this.activeInputEntryId;
-		if (!this.advanceDelivery || !inputEntryId) return;
+		if (!this.advanceDelivery) return;
 		const conversation = await this.requireConversation();
-		const path = getActiveConversationPath(conversation);
+		const entry = this.deliveryCursorEntry(getActiveConversationPath(conversation));
+		if (!entry || entry.id === this.activeInputEntryId) return;
+		const message = entry.message;
+		if (message.role === 'signal') {
+			this.advanceDelivery({
+				kind: 'signal',
+				type: message.type,
+				body: message.content,
+				...(message.attributes ? { attributes: message.attributes } : {}),
+				...(message.tagName ? { tagName: message.tagName } : {}),
+			});
+			return;
+		}
+		if (message.role !== 'user') return;
+		const body = Array.isArray(message.content)
+			? message.content
+					.filter((block) => block.type === 'text')
+					.map((block) => ('text' in block ? block.text : ''))
+					.join('\n')
+			: String(message.content);
+		const refs = [...(entry.attachmentRefs?.values() ?? [])];
+		const attachments =
+			refs.length > 0 ? await this.resolveCanonicalImages(refs.map((ref) => ref.id)) : undefined;
+		this.advanceDelivery({
+			kind: 'user',
+			body,
+			...(attachments?.length ? { attachments: attachments.map(toPublicAttachment) } : {}),
+		});
+	}
+
+	/**
+	 * The path entry the delivery cursor points at for the ACTIVE submission:
+	 * the latest `user` or non-reserved `signal` entry after the submission's
+	 * input entry, else the input entry itself. Shared by crash recovery
+	 * (`restoreDeliveryCursor`) and per-delivery effort reuse, so both agree on
+	 * what the current delivery is.
+	 */
+	private deliveryCursorEntry(path: ReducedEntry[]): ReducedMessageEntry | undefined {
+		const inputEntryId = this.activeInputEntryId;
+		if (!inputEntryId) return undefined;
 		const inputIndex = path.findIndex((entry) => entry.id === inputEntryId);
-		if (inputIndex === -1) return;
+		const input = path[inputIndex];
+		if (input?.type !== 'message') return undefined;
 		for (let i = path.length - 1; i > inputIndex; i--) {
 			const entry = path[i];
 			if (entry?.type !== 'message') continue;
 			const message = entry.message;
-			if (message.role === 'signal') {
-				// Reserved types are framework-authored by construction (admission
-				// and `ctx.append` reject them) and none of them ever advanced the
-				// live cursor: narration appends pass `advance: false`, and the
-				// recovery pair / terminalization advisories are appended straight
-				// to the record stream, outside the append path — the recovery
-				// pair in particular lands during THIS resume (`repairResumableTail`
-				// runs before this walk), after every render the crashed attempt
-				// made. Skipping them restores exactly what the live renders saw.
-				if (RESERVED_SIGNAL_TYPES.has(message.type)) continue;
-				this.advanceDelivery({
-					kind: 'signal',
-					type: message.type,
-					body: message.content,
-					...(message.attributes ? { attributes: message.attributes } : {}),
-					...(message.tagName ? { tagName: message.tagName } : {}),
-				});
-				return;
-			}
-			if (message.role !== 'user') continue;
-			const body = Array.isArray(message.content)
-				? message.content
-						.filter((block) => block.type === 'text')
-						.map((block) => ('text' in block ? block.text : ''))
-						.join('\n')
-				: String(message.content);
-			const refs = [...(entry.attachmentRefs?.values() ?? [])];
-			const attachments =
-				refs.length > 0 ? await this.resolveCanonicalImages(refs.map((ref) => ref.id)) : undefined;
-			this.advanceDelivery({
-				kind: 'user',
-				body,
-				...(attachments?.length ? { attachments: attachments.map(toPublicAttachment) } : {}),
-			});
-			return;
+			// Reserved types are framework-authored by construction (admission
+			// and `ctx.append` reject them) and none of them ever advanced the
+			// live cursor: narration appends pass `advance: false`, and the
+			// recovery pair / terminalization advisories are appended straight
+			// to the record stream, outside the append path — the recovery
+			// pair in particular lands during a resume (`repairResumableTail`
+			// runs before `restoreDeliveryCursor`), after every render the
+			// crashed attempt made. Skipping them matches what live renders saw.
+			if (message.role === 'signal' && !RESERVED_SIGNAL_TYPES.has(message.type)) return entry;
+			if (message.role === 'user') return entry;
 		}
+		return input;
 	}
 
 	/** Count durably continued `useAgentFinish` cycles for one submission. */
@@ -2427,7 +2474,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		this.outputChannel = options.output;
 		this.advanceDelivery = options.advanceDelivery;
 		this.getDelivery = options.getDelivery;
-		this.beforeModelCall = options.config.beforeModelCall;
+		this.beforeModelTurns = options.config.beforeModelTurns;
 		this.outputChannel?.connect((name, data) => this.enqueueMessageDataWrite(name, data));
 		// Dynamic resources (function agents): live sets start at the init
 		// render; legacy agents keep their init-frozen config for life. The

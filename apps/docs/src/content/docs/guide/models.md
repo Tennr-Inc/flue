@@ -54,7 +54,7 @@ On the Cloudflare target there is one more built-in provider ID: `cloudflare/...
 
 ## Model reasoning effort
 
-`useModel()` accepts an options object as its second argument with `thinkingLevel`, `beforeModelCall`, and `compaction`.
+`useModel()` accepts an options object as its second argument with `thinkingLevel`, `beforeModelTurns`, and `compaction`.
 
 ```ts
 useModel('anthropic/claude-opus-4-6', {
@@ -69,12 +69,12 @@ Higher levels increase reasoning depth at the cost of latency and tokens; `'off'
 
 Thinking only reaches the wire for models marked reasoning-capable. Catalog models carry that flag already, but if you register a custom provider and skip its `reasoning` metadata, a forwarded `thinkingLevel` is silently dropped. See [Custom providers](#custom-providers).
 
-To choose effort for each root-agent call, register an async `beforeModelCall` callback. It runs after start hooks, immediately before the first provider call and each call after tool results:
+To choose effort for each delivered message, register an async `beforeModelTurns` callback. It runs after start hooks, immediately before the first root-agent provider call for each delivery: the message that woke the agent, a message that joins the live response, or a signal appended by a `useAgentStart` or `useAgentFinish` hook. Calls after tool results reuse that effort until the next delivery:
 
 ```ts
 useModel('anthropic/claude-sonnet-4-6', {
   thinkingLevel: 'low',
-  beforeModelCall: async ({ delivery, classify }) => {
+  beforeModelTurns: async ({ delivery, classify }) => {
     const label = await classify({
       model: 'anthropic/claude-haiku-4-5',
       prompt: `Reply with "complex" or "simple" for this request: ${delivery.body}`,
@@ -84,7 +84,9 @@ useModel('anthropic/claude-sonnet-4-6', {
 });
 ```
 
-`classify()` is a separate tool-free model call. It receives only the prompt you provide, requests a 128-token output cap, shares the submission's abort signal, and cannot call `beforeModelCall` again. The callback also receives the pending provider `messages` and `signal`. Flue records the selected effort before streaming, so a retry of an interrupted call uses the same choice. The classifier request is separate from the root turn's request telemetry and incurs its own provider usage.
+`classify()` is a separate tool-free model call. It receives only the prompt you provide, requests a 128-token output cap, shares the submission's abort signal, and cannot call `beforeModelTurns` again. The callback also receives the pending provider `messages` and `signal`. Flue records the selected effort before streaming, so a retry of an interrupted call, or a resumed tool loop, uses the same choice. The classifier request is separate from the root turn's request telemetry and incurs its own provider usage.
+
+Effort stays fixed within a tool loop because some provider APIs send it as a request-level parameter, and changing it between requests invalidates the prompt cache. Framework narration signals, such as resource and instruction updates, are not deliveries and never trigger a new selection.
 
 ## Compaction
 
