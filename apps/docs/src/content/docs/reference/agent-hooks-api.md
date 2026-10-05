@@ -44,7 +44,7 @@ What may vary between renders, and what may not:
 
 Value scoping:
 
-- `useModel` values (model, `thinkingLevel`, `compaction`), the `useSandbox` factory and `cwd`, and `useMcpConnection` definitions are **submission-scoped**: read once when a submission starts. A different value computed by a later render takes effect on the next submission, not mid-run. Exceptions: `useModel`'s `beforeModelCall` callback refreshes at each render, and `useSandbox` _presence_ is re-read at every turn boundary.
+- `useModel` values (model, `thinkingLevel`, `compaction`), the `useSandbox` factory and `cwd`, and `useMcpConnection` definitions are **submission-scoped**: read once when a submission starts. A different value computed by a later render takes effect on the next submission, not mid-run. Exceptions: `useModel`'s `beforeModelTurns` callback refreshes at each render, and `useSandbox` _presence_ is re-read at every turn boundary.
 - Resource sets (tools, skills, subagents) and instruction text are **per-render**: each model call uses what the current render declared.
 
 Root and subagent renders:
@@ -67,15 +67,15 @@ function useModel(model: string, options?: UseModelOptions): void;
 
 interface UseModelOptions {
   thinkingLevel?: ThinkingLevel;
-  beforeModelCall?: (
-    context: BeforeModelCallContext,
+  beforeModelTurns?: (
+    context: BeforeModelTurnsContext,
   ) => { thinkingLevel: ThinkingLevel } | void | Promise<{ thinkingLevel: ThinkingLevel } | void>;
   compaction?: false | CompactionConfig;
 }
 
 type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
-interface BeforeModelCallContext {
+interface BeforeModelTurnsContext {
   delivery: DeliveredMessage;
   messages: readonly import('@earendil-works/pi-ai').Message[];
   signal: AbortSignal;
@@ -91,7 +91,7 @@ Declare the agent's model. Required: an agent render without a `useModel` call c
 
 - `model` — a model specifier string, `'provider-id/model-id'` (e.g. `'anthropic/claude-sonnet-4-6'`). An unresolvable specifier fails the submission at initialization. See [Models](/docs/guide/models/#model-specifier) for the catalog and [Provider API](/docs/reference/provider-api/) for registering providers.
 - `options.thinkingLevel` — the agent-wide default reasoning effort. Individual `harness.prompt()` calls may override it. When unset, the harness substitutes `'medium'`. An unknown value throws.
-- `options.beforeModelCall` — an optional async selector that runs once per delivered message, before the first root-agent provider call for that delivery. A delivery is the message that woke the agent, a delivery that joins the live response at a turn boundary, or a non-reserved signal appended by a `useAgentStart` or `useAgentFinish` hook; framework narration signals never count. Calls after tool results reuse the selected effort until the next delivery. The render registers the callback synchronously; the runtime awaits it after intake and start hooks, just before the provider request. Its `delivery` is the delivered message the effort is for, `messages` is a copy of the pending provider transcript, and `signal` cancels with the submission. Return `{ thinkingLevel }` to override the static default or return nothing to keep it. The effective choice is persisted before streaming and reused if an interrupted attempt retries that call or resumes the tool loop. `classify()` makes a separate text-only, tool-free model call with no root transcript, a requested 128-token output cap, and the same abort signal; it never invokes this selector. The selector does not run for classifiers, scratch harnesses, or compaction calls.
+- `options.beforeModelTurns` — an optional async selector that runs once per delivered message, before the first root-agent provider call for that delivery. A delivery is the message that woke the agent, a delivery that joins the live response at a turn boundary, or a non-reserved signal appended by a `useAgentStart` or `useAgentFinish` hook; framework narration signals never count. Calls after tool results reuse the selected effort until the next delivery. The render registers the callback synchronously; the runtime awaits it after intake and start hooks, just before the provider request. Its `delivery` is the delivered message the effort is for, `messages` is a copy of the pending provider transcript, and `signal` cancels with the submission. Return `{ thinkingLevel }` to override the static default or return nothing to keep it. The effective choice is persisted before streaming and reused if an interrupted attempt retries that call or resumes the tool loop. `classify()` makes a separate text-only, tool-free model call with no root transcript, a requested 128-token output cap, and the same abort signal; it never invokes this selector. The selector does not run for classifiers, scratch harnesses, or compaction calls.
 - `options.compaction` — threshold-compaction configuration ([`CompactionConfig`](#compactionconfig), below), or `false` to disable threshold compaction. Overflow recovery and explicit [`harness.compact()`](/docs/reference/agent-api/#harnesscompact) still compact when needed.
 - Unknown option fields throw.
 - Model, static effort, and compaction values are submission-scoped: the runtime reads them when a submission starts, so a value computed from state takes effect on the next submission. The callback refreshes with each render. See [Changing models mid-conversation](/docs/guide/models/#changing-models-mid-conversation).

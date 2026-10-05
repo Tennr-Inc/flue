@@ -221,7 +221,7 @@ import type { ToolApproval, ToolApprovalProposal } from './tool-approval.ts';
 import { toolApprovalProposalId } from './tool-approval.ts';
 import type {
 	AgentConfig,
-	BeforeModelCall,
+	BeforeModelTurns,
 	CallHandle,
 	DeliveredMessage,
 	FlueEvent,
@@ -510,7 +510,7 @@ export type SessionRerender = () => {
 	systemPrompt: string;
 	tools: ToolDefinition[];
 	resources: RenderedResources;
-	beforeModelCall?: BeforeModelCall;
+	beforeModelTurns?: BeforeModelTurns;
 	/**
 	 * The render's declared sandbox and cwd. The session only inspects
 	 * PRESENCE at turn boundaries (a factory is a fresh object every render,
@@ -829,7 +829,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 	private outputChannel: AgentOutputChannel | undefined;
 	private advanceDelivery: ((message: DeliveredMessage) => void) | undefined;
 	private getDelivery: (() => DeliveredMessage | undefined) | undefined;
-	private beforeModelCall: BeforeModelCall | undefined;
+	private beforeModelTurns: BeforeModelTurns | undefined;
 	/**
 	 * Dynamic resources. The live maps track the CURRENT render (skill
 	 * activation and task resolution always see what the agent declares now);
@@ -926,7 +926,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		messages: Message[],
 		options: SimpleStreamOptions | undefined,
 	): Promise<{ options: SimpleStreamOptions | undefined; effort?: ThinkingLevel }> {
-		const callback = this.beforeModelCall;
+		const callback = this.beforeModelTurns;
 		const submissionId = this.activeSubmissionId;
 		// Scratch harnesses, programmatic operations, and compaction do not have
 		// a root submission delivery or a selector invocation.
@@ -969,7 +969,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 			) {
 				thinkingLevel = previous.thinkingLevel;
 			} else {
-				thinkingLevel = await this.selectModelCallEffort(callback, messages, options, signal);
+				thinkingLevel = await this.selectDeliveryEffort(callback, messages, options, signal);
 			}
 			if (signal.aborted) throw abortErrorFor(signal);
 			await this.appendCanonical([
@@ -990,9 +990,9 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		};
 	}
 
-	/** Invoke `beforeModelCall` for a new delivery and resolve its effective effort. */
-	private async selectModelCallEffort(
-		callback: BeforeModelCall,
+	/** Invoke `beforeModelTurns` for a new delivery and resolve its effective effort. */
+	private async selectDeliveryEffort(
+		callback: BeforeModelTurns,
 		messages: Message[],
 		options: SimpleStreamOptions | undefined,
 		signal: AbortSignal,
@@ -1010,10 +1010,10 @@ export class Session implements FlueSession, AgentSubmissionSession {
 			signal,
 		);
 		if (selected !== undefined && (selected === null || typeof selected !== 'object')) {
-			throw new Error('[flue] beforeModelCall must return an effort override or nothing.');
+			throw new Error('[flue] beforeModelTurns must return an effort override or nothing.');
 		}
 		const override = selected?.thinkingLevel;
-		assertThinkingLevel(override, 'beforeModelCall() result');
+		assertThinkingLevel(override, 'beforeModelTurns() result');
 		return override ?? options?.reasoning ?? this.resolveThinkingLevelForCall(undefined);
 	}
 
@@ -1143,7 +1143,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		// workspace.
 		const swapped = await this.maybeSwapEnvironment(next);
 		if (swapped) next = this.rerender();
-		this.beforeModelCall = next.beforeModelCall;
+		this.beforeModelTurns = next.beforeModelTurns;
 		this.agentTools = next.tools;
 		// Live resource sets follow the render: skill activation and task
 		// resolution always see what the agent declares NOW, even while the
@@ -1457,7 +1457,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		await this.appendCanonical([compactionRecord, this.resourceSnapshotRecord(current, true)]);
 		this.lastNarratedResources = current;
 		this.agentTools = refreshed.tools;
-		this.beforeModelCall = refreshed.beforeModelCall;
+		this.beforeModelTurns = refreshed.beforeModelTurns;
 		this.liveSkills = refreshed.resources.skills;
 		this.liveSubagents = refreshed.resources.subagents;
 		this.lastRenderedResources = refreshed.resources;
@@ -1470,7 +1470,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		// structured-result prompt's finish/give_up bundle, per-call tools,
 		// or active packaged skills for the turn that follows it.
 		const recomposed = this.rerender();
-		this.beforeModelCall = recomposed.beforeModelCall;
+		this.beforeModelTurns = recomposed.beforeModelTurns;
 		this.updateAgentSystemPrompt(recomposed.systemPrompt);
 		const overrides = this.activeCallOverrides;
 		this.agentLoop.state.tools = this.assembleModelTools(
@@ -2474,7 +2474,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		this.outputChannel = options.output;
 		this.advanceDelivery = options.advanceDelivery;
 		this.getDelivery = options.getDelivery;
-		this.beforeModelCall = options.config.beforeModelCall;
+		this.beforeModelTurns = options.config.beforeModelTurns;
 		this.outputChannel?.connect((name, data) => this.enqueueMessageDataWrite(name, data));
 		// Dynamic resources (function agents): live sets start at the init
 		// render; legacy agents keep their init-frozen config for life. The

@@ -85,7 +85,7 @@ export type DeliveredMessage =
 			tagName?: string;
 	  };
 
-/** A separate, tool-free model request that never invokes `beforeModelCall`. */
+/** A separate, tool-free model request that never invokes `beforeModelTurns`. */
 export interface ModelClassifierRequest {
 	/** Model specifier, such as `'anthropic/claude-haiku-4-5'`. */
 	model: string;
@@ -96,11 +96,12 @@ export interface ModelClassifierRequest {
 }
 
 /**
- * Context available before the first root-agent provider request for a
- * delivered message. Later calls for the same delivery (calls after tool
- * results) reuse the selected effort without invoking the callback again.
+ * Context available before the series of model turns that answers one
+ * delivered message, ahead of its first root-agent provider request. Later
+ * turns for the same delivery (calls after tool results) reuse the selected
+ * effort without invoking the callback again.
  */
-export interface BeforeModelCallContext {
+export interface BeforeModelTurnsContext {
 	/**
 	 * The delivery this effort is chosen for: the message that woke the agent, a
 	 * delivery that joined the live response, or a signal appended by a start or
@@ -117,10 +118,11 @@ export interface BeforeModelCallContext {
 
 /** Return an effort override, or nothing to use `thinkingLevel` unchanged. */
 // biome-ignore lint/suspicious/noConfusingVoidType: Promise<void> is a valid no-override callback result.
-export type BeforeModelCallResult = { thinkingLevel: ThinkingLevel } | void;
-export type BeforeModelCall = (
-	context: BeforeModelCallContext,
-) => BeforeModelCallResult | Promise<BeforeModelCallResult>;
+export type BeforeModelTurnsResult = { thinkingLevel: ThinkingLevel } | void;
+/** Runs once per delivered message, before the model turns that answer it. */
+export type BeforeModelTurns = (
+	context: BeforeModelTurnsContext,
+) => BeforeModelTurnsResult | Promise<BeforeModelTurnsResult>;
 
 /**
  * A message as every `dispatch` surface accepts it: a {@link DeliveredMessage}
@@ -517,7 +519,7 @@ export interface AgentConfig {
 	 */
 	thinkingLevel?: ThinkingLevel;
 	/** Optional root-agent reasoning selector registered by `useModel()`. */
-	beforeModelCall?: BeforeModelCall;
+	beforeModelTurns?: BeforeModelTurns;
 	/**
 	 * Compaction tuning. `false` disables threshold compaction (overflow
 	 * recovery and explicit `session.compact()` still run). An object
@@ -582,7 +584,7 @@ export interface AgentRuntimeConfig {
 	/** Default reasoning effort. Individual operations may override this value. */
 	thinkingLevel?: ThinkingLevel;
 	/** Root-agent reasoning selector, refreshed by each render. */
-	beforeModelCall?: BeforeModelCall;
+	beforeModelTurns?: BeforeModelTurns;
 	/**
 	 * Automatic conversation-compaction configuration. `false` disables
 	 * threshold compaction; overflow recovery and explicit `session.compact()`

@@ -75,7 +75,7 @@ it('classifies once per delivery and reuses the effort across a tool loop', asyn
 	function ClassifiedAgent() {
 		useModel('faux/main', {
 			thinkingLevel: 'medium',
-			beforeModelCall: async ({ delivery, messages, signal, classify }) => {
+			beforeModelTurns: async ({ delivery, messages, signal, classify }) => {
 				decisions.push({ delivery: delivery.body, messages: messages.length, signal });
 				const label = await classify({ model: 'faux/classifier', prompt: delivery.body });
 				return { thinkingLevel: label as ThinkingLevel };
@@ -150,7 +150,7 @@ it('selects again for a signal appended by a finish hook', async () => {
 	function ReviewAgent() {
 		useModel('faux/main', {
 			thinkingLevel: 'medium',
-			beforeModelCall: ({ delivery }) => {
+			beforeModelTurns: ({ delivery }) => {
 				deliveries.push(delivery.body);
 				return { thinkingLevel: delivery.kind === 'signal' ? 'high' : 'low' };
 			},
@@ -201,7 +201,7 @@ it('selects again for a delivery that joins the live response', async () => {
 	const deliveries: string[] = [];
 	function JoinAgent() {
 		useModel('faux/main', {
-			beforeModelCall: ({ delivery }) => {
+			beforeModelTurns: ({ delivery }) => {
 				deliveries.push(delivery.body);
 				return { thinkingLevel: delivery.body === 'Also this.' ? 'high' : 'low' };
 			},
@@ -255,7 +255,7 @@ it('uses the static default on fallback and records an explicit off override', a
 	function DefaultAgent() {
 		useModel('faux/main', {
 			thinkingLevel: 'high',
-			beforeModelCall: async ({ delivery }) =>
+			beforeModelTurns: async ({ delivery }) =>
 				delivery.body === 'Disable.' ? { thinkingLevel: 'off' as const } : undefined,
 		});
 		return 'Answer.';
@@ -296,7 +296,7 @@ it('cancels a pending selector before the root provider call', async () => {
 	const entered = Promise.withResolvers<AbortSignal>();
 	function CancelAgent() {
 		useModel('faux/main', {
-			beforeModelCall: ({ signal }) => {
+			beforeModelTurns: ({ signal }) => {
 				entered.resolve(signal);
 				return new Promise(() => {});
 			},
@@ -474,7 +474,7 @@ it('reuses the durable effort after an interrupted attempt', async () => {
 		},
 	]);
 	function RetryAgent() {
-		useModel('faux/main', { thinkingLevel: 'low', beforeModelCall: selector });
+		useModel('faux/main', { thinkingLevel: 'low', beforeModelTurns: selector });
 		return 'Answer.';
 	}
 	const fixture = await createCrashFixture(RetryAgent, 'RetryAgent', (records) =>
@@ -513,7 +513,7 @@ it('resumes a tool loop with the earlier effort instead of selecting again', asy
 		},
 	]);
 	function ToolLoopAgent() {
-		useModel('faux/main', { thinkingLevel: 'low', beforeModelCall: selector });
+		useModel('faux/main', { thinkingLevel: 'low', beforeModelTurns: selector });
 		useTool({ name: 'lookup', description: 'Look up the answer.', run: () => 'found' });
 		return 'Use the lookup tool, then answer.';
 	}

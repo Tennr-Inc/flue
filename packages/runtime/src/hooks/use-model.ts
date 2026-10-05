@@ -1,13 +1,13 @@
 import { assertCompaction, assertThinkingLevel } from '../agent-tuning.ts';
-import type { BeforeModelCall, CompactionConfig, ThinkingLevel } from '../types.ts';
+import type { BeforeModelTurns, CompactionConfig, ThinkingLevel } from '../types.ts';
 import { requireRenderFrame } from './frame.ts';
 
 /** Model-call tuning accepted alongside the model specifier. */
 export interface UseModelOptions {
 	/** Default reasoning effort. Individual operations may override this value. */
 	thinkingLevel?: ThinkingLevel;
-	/** Choose reasoning effort once per delivered message for root-agent model calls. */
-	beforeModelCall?: BeforeModelCall;
+	/** Choose reasoning effort once per delivered message, before the model turns that answer it. */
+	beforeModelTurns?: BeforeModelTurns;
 	/**
 	 * Automatic conversation-compaction configuration. `false` disables
 	 * threshold compaction; overflow recovery and explicit compaction still
@@ -25,13 +25,13 @@ export interface UseModelOptions {
  * durable state); the CALL may not disappear.
  *
  * Model, static reasoning effort, and compaction are submission-scoped. The
- * `beforeModelCall` callback is refreshed on every render and awaited after
+ * `beforeModelTurns` callback is refreshed on every render and awaited after
  * start hooks, immediately before the first root-agent provider request for
  * each delivered message. Calls after tool results reuse that effort until
  * the next delivery, so a tool loop keeps one request-level effort.
  *
  * `options` carries model-call tuning: `thinkingLevel` (default reasoning
- * effort), `beforeModelCall` (optional async per-delivery override), and
+ * effort), `beforeModelTurns` (optional async per-delivery override), and
  * `compaction` (threshold-compaction configuration, or `false` to disable).
  */
 export function useModel(model: string, options: UseModelOptions = {}): void {
@@ -55,17 +55,17 @@ export function useModel(model: string, options: UseModelOptions = {}): void {
 		throw new Error('[flue] useModel() options must be an object.');
 	}
 	for (const key of Object.keys(options)) {
-		if (key !== 'thinkingLevel' && key !== 'beforeModelCall' && key !== 'compaction') {
+		if (key !== 'thinkingLevel' && key !== 'beforeModelTurns' && key !== 'compaction') {
 			throw new Error(`[flue] useModel() options received unknown field "${key}".`);
 		}
 	}
 	assertThinkingLevel(options.thinkingLevel, 'useModel() options');
 	assertCompaction(options.compaction, 'useModel() options');
-	if (options.beforeModelCall !== undefined && typeof options.beforeModelCall !== 'function') {
-		throw new Error('[flue] useModel() options beforeModelCall must be a function.');
+	if (options.beforeModelTurns !== undefined && typeof options.beforeModelTurns !== 'function') {
+		throw new Error('[flue] useModel() options beforeModelTurns must be a function.');
 	}
 	frame.model = model;
 	if (options.thinkingLevel !== undefined) frame.thinkingLevel = options.thinkingLevel;
-	frame.beforeModelCall = options.beforeModelCall;
+	frame.beforeModelTurns = options.beforeModelTurns;
 	if (options.compaction !== undefined) frame.compaction = options.compaction;
 }
