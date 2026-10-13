@@ -77,7 +77,6 @@ function execShell(
 		let stderr = '';
 		let truncated = false;
 		let settled = false;
-		let killTimer: NodeJS.Timeout | undefined;
 
 		const killTree = (sig: NodeJS.Signals): void => {
 			if (child.pid === undefined) return;
@@ -95,14 +94,14 @@ function execShell(
 
 		const onAbort = (): void => {
 			killTree('SIGTERM');
-			killTimer = setTimeout(() => killTree('SIGKILL'), KILL_GRACE_MS);
-			killTimer.unref();
+			setTimeout(() => killTree('SIGKILL'), KILL_GRACE_MS).unref();
 		};
 
 		const settle = (result: ShellResult): void => {
 			if (settled) return;
 			settled = true;
-			if (killTimer !== undefined) clearTimeout(killTimer);
+			// A pending SIGKILL stays armed: a group member that ignores SIGTERM
+			// and holds none of the shell's pipes outlives the shell's exit.
 			opts.signal?.removeEventListener('abort', onAbort);
 			resolve(result);
 		};

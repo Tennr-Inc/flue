@@ -84,10 +84,14 @@ export function createPackagedSkillReadTool(
 		parameters: ReadParams,
 		async execute(_toolCallId: string, params: Static<typeof ReadParams>, signal?: AbortSignal) {
 			throwIfAborted(signal);
-			const content = readPackagedSkillFile(packagedSkills, params.path);
+			// Models often drop the advertised path's leading `/`.
+			const path = params.path.startsWith(PACKAGED_SKILLS_ROOT.slice(1))
+				? `/${params.path}`
+				: params.path;
+			const content = readPackagedSkillFile(packagedSkills, path);
 			if (content === undefined)
 				throw new Error(`[flue] Packaged skill file not found: ${params.path}`);
-			return formatReadContent(params.path, content, params.offset, params.limit);
+			return formatReadContent(path, content, params.offset, params.limit);
 		},
 	};
 }

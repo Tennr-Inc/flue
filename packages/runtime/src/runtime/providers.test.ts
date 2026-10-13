@@ -6,6 +6,7 @@ import {
 	isDynamicModel,
 	resetDynamicModelWarnForTests,
 	resetModelsForTests,
+	resetVersionSeparatorAliasWarnForTests,
 	resolveModel,
 	setProvider,
 } from './providers.ts';
@@ -33,7 +34,51 @@ function markerOf(model: Model<Api>): unknown {
 afterEach(() => {
 	resetModelsForTests();
 	resetDynamicModelWarnForTests();
+	resetVersionSeparatorAliasWarnForTests();
 	vi.restoreAllMocks();
+});
+
+function catalogModel(id: string): Model<Api> {
+	return {
+		id,
+		name: id,
+		api: 'anthropic-messages',
+		provider: 'test',
+		baseUrl: 'https://example.test',
+		reasoning: false,
+		input: ['text'],
+		cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 1000,
+		maxTokens: 500,
+	};
+}
+
+describe('model version-separator aliases', () => {
+	it('resolves a renamed model and warns once per requested specifier', () => {
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		setProvider(providerWith('test', [catalogModel('claude-sonnet-4.6')]));
+
+		expect(resolveModel('test/claude-sonnet-4-6').id).toBe('claude-sonnet-4.6');
+		resolveModel('test/claude-sonnet-4-6');
+		expect(warn).toHaveBeenCalledTimes(1);
+		expect(warn.mock.calls[0]?.[0]).toContain('test/claude-sonnet-4.6');
+	});
+
+	it('uses an exact catalog match before considering aliases', () => {
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		setProvider(
+			providerWith('test', [catalogModel('claude-sonnet-4-6'), catalogModel('claude-sonnet-4.6')]),
+		);
+
+		expect(resolveModel('test/claude-sonnet-4-6').id).toBe('claude-sonnet-4-6');
+		expect(warn).not.toHaveBeenCalled();
+	});
+
+	it('rejects ambiguous aliases instead of selecting an arbitrary model', () => {
+		setProvider(providerWith('test', [catalogModel('model-4.6.1'), catalogModel('model-4-6.1')]));
+
+		expect(() => resolveModel('test/model-4-6-1')).toThrow('Unknown model ID');
+	});
 });
 
 describe('dynamic model templates', () => {

@@ -1,6 +1,6 @@
 {
 	"name": "@flue/intercom",
-	"version": "2.1.1",
+	"version": "2.3.0",
 	"type": "module",
 	"license": "Apache-2.0",
 	"homepage": "https://flueframework.com/",
@@ -25,7 +25,9 @@
 	},
 	"scripts": {
 		"build": "tsdown",
-		"check:types": "tsc --noEmit"
+		"check:types": "tsc --noEmit",
+		"test": "vitest run",
+		"test:workerd": "vitest run --config vitest.workerd.config.ts"
 	},
 	"dependencies": {
 		"hono": "^4.12.32"

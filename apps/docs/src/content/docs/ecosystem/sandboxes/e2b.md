@@ -19,7 +19,7 @@ flue add sandbox e2b
 The blueprint installs `e2b` when needed and creates `sandboxes/e2b.ts` in your source-root. That file adapts an E2B sandbox that your application has already created; it does not create, retain, or close provider resources.
 
 ```ts title="<source-root>/sandboxes/e2b.ts (abridged)"
-// flue-blueprint: sandbox/e2b@1
+// flue-blueprint: sandbox/e2b@2
 import { sandboxFromDriver, useModel } from '@flue/runtime';
 import type { SandboxDriver, SandboxFactory, Sandbox, FileStat } from '@flue/runtime';
 import type { Sandbox as E2BSandbox } from 'e2b';
@@ -31,7 +31,8 @@ class E2BSandboxDriver implements SandboxDriver {
 
   /* Rejects recursive or force before calling sandbox.files.remove(). */
 
-  /* Implements exec() with sandbox.commands.run(), forwarding timeoutMs unchanged. */
+  /* Implements exec() with sandbox.commands.run(), forwarding timeoutMs unchanged
+     and returning a non-zero exit (CommandExitError) as a result. */
 }
 
 export function e2b(sandbox: E2BSandbox): SandboxFactory {

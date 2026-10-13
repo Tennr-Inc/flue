@@ -501,7 +501,7 @@ async function initializeRootHarness(
 		submissionStore: config.submissionStore,
 		executionContext: {
 			instanceId: config.id,
-			...(config.agentName ? { agentName: config.agentName } : {}),
+			...(config.agentName === undefined ? {} : { agentName: config.agentName }),
 		},
 		hookState,
 		rerender,
