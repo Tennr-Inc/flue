@@ -166,7 +166,8 @@ function renderHelloAgent(target: InitTarget): string {
 	const model = [`\tuseModel('anthropic/claude-haiku-4-5');`];
 	if (target === 'cloudflare') {
 		model.unshift(
-			`\t// Cloudflare's built-in models need no API key — swap in e.g.`,
+			`\t// Cloudflare's built-in models need no API key — uncomment the AI binding`,
+			`\t// in wrangler.jsonc, then swap in e.g.`,
 			`\t// useModel('cloudflare/@cf/moonshotai/kimi-k2.6') to go keyless.`,
 		);
 	}
@@ -245,6 +246,10 @@ function renderWrangler(opts: InitPlanOptions): string {
 		`\t// Workers Traces shows each agent response as a trace with agent-level`,
 		`\t// spans: https://flueframework.com/docs/guide/observability/#cloudflare`,
 		`\t"observability": { "traces": { "enabled": true } },`,
+		`\t// Keyless \`cloudflare/...\` models run through this Workers AI binding.`,
+		`\t// It reaches your Cloudflare account even in local dev:`,
+		`\t// https://flueframework.com/docs/guide/models/#cloudflare-workers-ai-cloudflare-only`,
+		`\t// "ai": { "binding": "AI" },`,
 		`\t// Every agent generates a Durable Object class named after its identity`,
 		`\t// (Hello -> FlueHelloAgent), and Cloudflare requires a migration entry`,
 		`\t// for each one. Append a new tag when you add an agent:`,

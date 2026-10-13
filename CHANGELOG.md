@@ -1,10 +1,132 @@
 # Changelog
 
+## 2.3.0 - 2026-10-12
+
+### New Features
+
+- **Updated `@earendil-works/pi-ai` and `@earendil-works/pi-agent-core` to 1.1.0.** New models resolve with no configuration, including Claude Sonnet 5.5 (`anthropic/claude-sonnet-5-5`), Claude Haiku 5.5 (`anthropic/claude-haiku-5-5`), and GPT-6.1 Sol (`openai/gpt-6.1-sol`). **Azure users must update:** Pi renamed the Azure provider from `azure-openai-responses` to `azure`, so change `azure-openai-responses/...` model specifiers and `providers` config entries to `azure`. The `AZURE_OPENAI_*` environment variables are unchanged. Tool and turn `durationMs` values now come from Pi's monotonic timing, so a tool's duration covers only its execution, not Flue's hooks or result storage.
+
+### Fixes & Other Changes
+
+- **`useAgentFinish` callbacks once again see state written during the response.** Since 2.2.0, finish hooks ran against the agent render from before the response's final turn, so a durable guard set by a finish callback — the documented `usePersistentState` pattern for appending a reminder once — was never observed: the callback re-appended on every cycle until the response failed at the runaway-loop ceiling. The agent now re-renders before each finish-hook cycle (#818).
+- **`read_skill_resource` accepts a packaged skill path without its leading `/`.** Models often echo the advertised `/.flue/packaged-skills/...` path without the slash, and the read failed as not found (#781).
+- **The local sandbox SIGKILLs a command's whole process group after the grace period, even when the shell exits first.** On an `exec()` timeout or abort, the pending SIGKILL was cancelled once the shell's pipes closed, so a process that ignored SIGTERM and held none of the shell's output kept running after `exec()` returned (#809).
+- **Execution interceptors see `agentName` on model, tool, and shell steps, not only on the outer `agent` operation.** The root harness's execution context carried only the instance id, so an interceptor that branches per agent took its default branch on every step (#785).
+- **`flue init --target cloudflare` scaffolds the Workers AI binding that keyless `cloudflare/...` models need, commented out in `wrangler.jsonc`.** The generated agent suggested switching to a keyless Cloudflare model but nothing declared `env.AI`; it now points at the binding to uncomment. The binding stays off by default because it reaches your Cloudflare account even in local dev (#739).
+- **The E2B sandbox blueprint returns a non-zero exit from `exec()` instead of throwing.** E2B's `commands.run()` throws `CommandExitError` on a non-zero exit, so a failing command rejected with no command or stderr instead of resolving with its `exitCode`. The blueprint is bumped to version 2; run `flue update sandbox e2b` to update an existing integration (#805).
+
+## 2.2.2 - 2026-09-28
+
+### Fixes & Other Changes
+
+- **Claude models on the `cloudflare-ai-gateway` provider are registered under Anthropic's dashed ids, fixing `404 not_found_error: model: claude-sonnet-4.6 was not found`.** Since Pi 0.84.3 the gateway catalog lists Claude models with dotted versions (`claude-sonnet-4.6`), but the gateway's native Anthropic endpoint forwards the model id to Anthropic, which only accepts dashed ids. Flue now registers these models under Anthropic's ids (`cloudflare-ai-gateway/claude-sonnet-4-6`); dotted specifiers still resolve to them. The `cloudflare` binding provider, which uses Cloudflare's dotted catalog names, is unchanged (#793).
+
+## 2.2.1 - 2026-09-28
+
+### Fixes & Other Changes
+
+- **Model specifiers that stopped resolving after the Pi 0.87.1 upgrade resolve again.** Pi renamed the `cloudflare-ai-gateway` Claude model ids from dashed to dotted versions (`claude-sonnet-4-6` → `claude-sonnet-4.6`), so existing specifiers such as `cloudflare-ai-gateway/claude-sonnet-4-6` failed with `Unknown model ID`. When a model id is not in the catalog but matches exactly one catalog id that differs only in `-` versus `.` between version digits, Flue now resolves to that model and logs a one-time warning suggesting the current id (#791).
+
+## 2.2.0 - 2026-09-28
+
+### New Features
+
+- **Bounded conversation history reads: long-running chats no longer transfer the whole transcript on every page load or reconnect.** `client.history({ limit })` reads only the newest messages — the snapshot keeps the head `offset`, the `incarnation`, and every settlement, and adds a `before` cursor. `client.historyBefore(cursor, { limit })` reads older messages one page at a time (the page size is required). `client.observe({ limit })` hydrates only the newest messages, then grows forward with live updates; rehydration after a reconnect reads from the window's oldest message so no gap opens, the runtime cuts `conversation-reset` snapshots to the same window, the observed state's `before` cursor feeds `historyBefore()`, and a changed cursor means the window re-based. A window never cuts out a message that can still receive live updates (such as a response still streaming above messages delivered after it), so it may hold more than `limit` messages. Cursors are opaque and bound to one stream generation: after the stream is reset and regrown, reads with an old cursor are rejected with `history_cursor_not_found` (410), even when message ids repeat, and `observe()` re-bases. `readSubmissionReply()` now requires `settlements`, so history pages are not accepted; it falls back to the latest assistant message only on a complete conversation, never on a bounded window where that message may belong to another submission. Unbounded reads are unchanged, and `@flue/react` still observes the whole conversation (#767).
+- **Document attachments (PDFs) on user messages.** `DeliveredAttachment` is now a union of image and document attachments — `{ type: 'document', data, mimeType: 'application/pdf', filename? }` — accepted on `dispatch()`, the `init()` handle, and direct HTTP prompts. `session.prompt()`, `skill()`, and `task()` gain a `documents` option alongside `images`, and `@flue/react`'s `sendMessage()` gains a `documents` option. Documents are forwarded to the model as native document content: Anthropic `document` blocks, OpenAI (and Azure OpenAI) Responses `input_file` parts, and Google `inlineData`; on other model APIs the document is replaced in model context with a text placeholder saying it was omitted. Documents are stored like images — as canonical attachments projected as `file` parts with `mediaType: 'application/pdf'` — so existing conversations and persistence adapters need no migration. The SDK also exports `DeliveredImageAttachment` and `DeliveredDocumentAttachment` (#766).
+- **Conversation messages carry a server-authored `timestamp`.** The ISO 8601 capture time of the underlying durable record is exposed in `history()`, `observe()`, and `useFlueAgent` for every role, including existing conversations; `metadata` remains entirely agent-authored. Conversation settlements carry the same `timestamp` for when the submission settled (#772).
+
+### Fixes & Other Changes
+
+- Updated `@earendil-works/pi-ai` and `@earendil-works/pi-agent-core` to 0.87.1, adding support for GPT-6 Sol, GPT-6 Luna, and Claude Opus 5.5 — pass these models to `useModel()` without extra configuration. The model list at `https://flueframework.com/models.json` also includes them. There are no public API changes (#771).
+- **Cloudflare-routed Anthropic models (`cloudflare/anthropic/*`) no longer fail with `betas: Extra inputs are not permitted` when the agent has tools.** Anthropic beta features are now sent in the `anthropic-beta` request header instead of the request body (#777).
+- **Markdown and skill imports written as Node subpath imports now transform correctly.** Specifiers resolved through package.json `imports` (e.g. `import core from '#src/prompts/core.md'`) now transform like relative and package specifiers in both dev and production builds: `.md` imports load as markdown text and `SKILL.md` imports package the skill directory. Previously the leading `#` was mistaken for a fragment marker, the import was left untransformed, and Vite tried to parse the Markdown file as JavaScript. Queried forms (`?raw`, `?url`, ...) continue to be delegated to Vite (#780).
+
+## 2.1.1 - 2026-09-23
+
+### Fixes & Other Changes
+
+- **`useFlueAgent`'s `status` stays `streaming` after a reload for an unsettled submission.** The reducer now derives active (unsettled) submission ids from the observed conversation — message `submissionId`s minus settled ids — instead of relying only on the in-memory admission receipt, which does not survive a reload. Previously a fresh hook would report `idle` for an admitted-but-silent prompt or a running tool call until the next assistant text part streamed (#756).
+- **`useFlueAgent`'s `status` contract is clarified to match the reducer's actual aggregate behavior.** `status` reflects the observed conversation's activity — including submissions admitted out-of-band (webhooks, dispatches, other clients) — combined with the hook's in-memory local admission recollection. The README now documents the full precedence order (failed-local-settlement `error` → streaming text → `submitted` → active/recollected submission `streaming` → retained-failed-send `error` → `idle`) and notes that a locally-admitted submission that has not yet settled keeps `streaming` across empty or absent observations until it settles. A submission admitted but not yet materialized into a message at reload time is documented as a residual window (#757).
+- **Tool arguments and results of every payload shape are recorded on the standard `gen_ai.tool.call.arguments` / `gen_ai.tool.call.result` attributes, so OTel backends can display them.** The shape-based diversion to the vendor `flue.tool.call.*` fallback keys is removed — those keys are no longer emitted, and their constants are retained for source compatibility. Payloads record exactly as before: objects/arrays as JSON strings, strings byte-for-byte within the content budget, other scalars as their JSON form (#748).
+- **Trace content truncation now scales linearly for long message arrays.** Large traced conversations no longer repeatedly serialize the remaining history while fitting `gen_ai.input.messages` to the attribute budget, avoiding request latency and Cloudflare Durable Object CPU-limit resets (#743).
+- **Flue packages and newly scaffolded applications can share a compatible Hono installation.** Hono dependencies now use `^4.12.32`, preventing fresh projects from installing a newer root Hono alongside the runtime's older exact version and failing typecheck (#741).
+- A skill's `allowed-tools` field is documented as guidance. Flue accepts it for Agent Skills spec compatibility and does not enforce it; enforce authorization in your own tools and approval gates (#746).
+
+## 2.1.0 - 2026-09-18
+
+### New Features
+
+- **Tools can declare a `timeoutMs` execution bound.** On expiry the harness aborts the tool's `context.signal` and settles the call with a `ToolTimeoutError` (the model sees `Tool "<name>" timed out after <ms>ms` and the conversation continues) instead of letting one hung call consume the submission's durability budget. The Tools guide and agent API reference document the option (#726).
+
+  ```ts
+  export const lookupCatalog = defineTool({
+    name: 'lookup_catalog',
+    description: 'Query the upstream catalog API.',
+    input: v.object({ sku: v.string() }),
+    timeoutMs: 15_000,
+    async run({ data, signal }) {
+      // Past 15s, `signal` aborts and the call settles with a ToolTimeoutError
+      // the model sees — it can retry or change approach.
+      const response = await fetch(`https://catalog.example.com/${data.sku}`, { signal });
+      return { output: await response.json() };
+    },
+  });
+  ```
+
+- **Tools returned by `createMcpConnection()` retain the metadata the MCP server sent in its `tools/list` response, available as `tool.annotations`.** `defineTool()` and `useTool()` also accept `annotations`, so wrappers can carry the metadata forward. Flue does not automatically change a tool's behavior based on these server-supplied values; the MCP guide and Agent API reference document how trusted applications can inspect them and why server-supplied hints are not a security boundary (#732).
+
+  ```ts
+  const connection = await createMcpConnection(definition);
+  const deleteIssue = connection.tools.find((tool) => tool.name.endsWith('delete_issue'));
+  console.log(deleteIssue?.annotations?.destructiveHint); // true
+  ```
+
+- **Trace content budgets are configurable.** `createCloudflareTracing({ contentBudgetBytes })` and `createOpenTelemetryInstrumentation({ contentBudgetBytes })` override the default 56 KiB per-span content pool — raise it (e.g. `contentBudgetBytes: 200_000`) to ship fuller prompts and tool results to an observability backend that is not bound by workerd's 64 KiB span-attribute cap, or tighten it. The 128-byte sentinel floor and the shared-pool semantics are unchanged. On the Cloudflare target it is a tightening control only, since workerd's span-attribute cap is a platform limit no setting raises; the OpenTelemetry ecosystem page and Cloudflare target guide document the option (#727).
+- **`@flue/react`'s `sendMessage` passes through every send control `client.send()` accepts (`idempotencyKey`, `initialData`, `uid`, `signal`, …) and resolves with the admission receipt (`AgentSendResult`) instead of `void`.** Retry a send safely by persisting a key before sending and reusing it when the request's outcome is uncertain — `receipt.submissionId` correlates with settlements, and `receipt.deduplicated` is true when a retry converged on an already-admitted send; a network failure does not prove the server rejected the prompt, so retrying later with the same key converges on the original submission (#724).
+
+### Fixes & Other Changes
+
+- **Two fixes in the configurable content budget.** An invalid `contentBudgetBytes` value (non-integer, too small, or too large) now throws a `TypeError` at setup instead of producing confusing trace content later, and the span that records conversation compaction now honors the configured budget, so its content is truncated or shipped consistently with every other span (#729).
+
+## 2.0.8 - 2026-09-16
+
+### Fixes & Other Changes
+
+- **Interrupted submissions no longer retry forever when the recovery render throws.** Once the submission's durability deadline passes, a submission whose classification render keeps failing is settled as timed out instead of being re-rendered on every supervisor wake without ever consuming an attempt (#711).
+- **Duplicate responses no longer appear after a model stream fails partway through and Flue retries it successfully.** Clients now see only the successful replacement response instead of the incomplete first attempt followed by the complete retry (#571).
+- **The first streamed delta is no longer delayed by the full coalescing interval.** After a quiet period, the first delta now flushes to the durable stream immediately, so observers see output as soon as the model starts responding.
+- **The Cloudflare binding's Anthropic gateway path maps the agent's `thinkingLevel` to an adaptive-thinking effort (`output_config.effort`).** `useModel` thinking levels now take effect on adaptive-thinking models instead of always running at Anthropic's default (#713).
+- **The Cloudflare binding provider accepts a `cacheRetention` option (`'short'` or `'long'`) to enable Anthropic prompt caching for `anthropic/…` gateway models.** Repeated prefixes are served from cache at the cached input rate instead of paying full input price every turn. The default `'none'` keeps the previous behavior (#662).
+- **Models synthesized from a dynamic model template are detectable via the exported `isDynamicModel()` helper, and the runtime warns once when such a model is first resolved.** Providers that serve model ids beyond their catalog (such as Workers AI) previously had their cost silently read as $0 with no way to tell "free" apart from "unknown" (#671).
+- **GenAI trace content stays schema-valid when it cannot be fully represented.** Oversized, unserializable, or transform-failing messages under `gen_ai.input.messages` / `gen_ai.output.messages` fall back to a shape-preserving `role: "flue"` message (output fallbacks keep `finish_reason`) instead of a bare diagnostic string or an array element that violates the message schema (#686).
+- The Cloudflare Sandbox documentation page now presents `flue add sandbox cloudflare` as a copyable prompt for your coding agent, with an explainer of what the blueprint-driven agent may do — installing `@cloudflare/sandbox`, wiring the Durable Object binding, migration, and container `Dockerfile`, and updating the agent to use the sandbox (#582).
+
+## 2.0.7 - 2026-09-15
+
+### Fixes & Other Changes
+
+- **Installed packages once again include the bundled Flue documentation**, so commands such as `flue docs read guide/sandboxes` work out of the box.
+- **Conversations no longer error with `Cannot continue from message role: assistant` after context compaction.** A completed response is now preserved through overflow compaction, so the next turn continues normally; only genuine provider overflow errors trigger a retry (#600).
+- **Sessions that end through a terminating tool now compact their context as expected**, so the next turn starts from a manageable context instead of continuing to grow (#692).
+- **Submissions no longer fail when a model length limit truncates a tool call batch.** Truncated batches now resume cleanly with their outcomes reconstructed instead of erroring out (#548).
+- **Tool results are no longer lost when a submission is aborted mid-batch.** Completed tool calls keep their stored outcomes, and unexecuted calls are recorded as interrupted instead of being dropped (#683).
+- **A harness tool invoking another harness tool, directly or indirectly, no longer recurses infinitely.** Parallel tool calls remain independent, and unrelated tools sharing a public name are still allowed (#561).
+- **Tools without an output schema can return union-shaped results and still typecheck.** Inferred branch unions, optional object properties, readonly arrays, and explicit `undefined` now match what the runtime actually serializes (#617).
+- **Workers AI conversations no longer stall on tool-call-only turns.** `null` or missing assistant content is treated as an absent text delta, and malformed non-string content is rejected with a clear error instead of being silently dropped (#639).
+- **Cloudflare Anthropic gateway models keep catalog compatibility.** Completions through `anthropic-gateway` continue to work with the full catalog of model options (#689).
+- **Cloudflare sandbox directory listings no longer collapse into a single entry.** `readdir` results are now correctly separated (#698).
+- **Cloudflare traces carry submission, operation, and turn identifiers on agent, task, model, tool, and shell spans**, so trace fragments can be correlated across durable invocations (#624).
+- Telemetry now marks model requests whose context includes a compaction summary, so compacted turns are distinguishable from ordinary ones (#623).
+- Terminal telemetry for persisted submissions now includes the agent's output text, matching what direct prompts report (#621).
+- **`@flue/sdk`'s `observe()` no longer applies a stale reconnect delay.** After a stream has been healthy for a full stream lifetime, the reconnect backoff resets, so a subsequent disconnect reconnects promptly (#696).
+- **`useFlueAgent` callbacks no longer change identity on every store update.** They stay stable until the underlying session changes, preventing unnecessary re-renders and stale-effect churn (#555).
+- **Markdown importers written in JSX (`.tsx`/`.jsx`) are now scanned correctly.** `SKILL.md` imports that belong to the Agents SDK's virtual skill registry are left to its owning plugin instead of being claimed by Flue's transform (#638).
+
 ## 2.0.6 - 2026-09-14
 
 ### Fixes & Other Changes
 
-- **Published packages once again include the bundled Flue documentation.** The 2.0.4 and 2.0.5 releases omitted the generated `docs/` directories from `@flue/cli`, `@flue/runtime`, and `@flue/sdk`, causing commands such as `flue docs read guide/sandboxes` to fail. Package documentation can now be prepared explicitly with `pnpm build:docs` before publishing.
+- **Published packages once again include the bundled Flue documentation.** The 2.0.4 and 2.0.5 releases omitted the generated `docs/` directories from `@flue/cli`, `@flue/runtime`, and `@flue/sdk`, causing commands such as `flue docs read guide/sandboxes` to fail.
 
 ## 2.0.5 - 2026-09-11
 

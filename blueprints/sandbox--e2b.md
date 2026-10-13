@@ -1,7 +1,7 @@
 ---
 {
   "kind": "sandbox",
-  "version": 1,
+  "version": 2,
   "website": "https://e2b.dev"
 }
 ---
@@ -43,7 +43,7 @@ Write this file verbatim. Do not "improve" it — it conforms to the published
 `SandboxDriver` contract.
 
 ```ts
-// flue-blueprint: sandbox/e2b@1
+// flue-blueprint: sandbox/e2b@2
 /**
  * E2B adapter for Flue.
  *
@@ -76,6 +76,7 @@ Write this file verbatim. Do not "improve" it — it conforms to the published
  */
 import { sandboxFromDriver, SandboxOperationUnsupportedError } from '@flue/runtime';
 import type { SandboxDriver, SandboxFactory, Sandbox, FileStat } from '@flue/runtime';
+import { CommandExitError } from 'e2b';
 import type { Sandbox as E2BSandbox } from 'e2b';
 
 /**
@@ -88,7 +89,9 @@ import type { Sandbox as E2BSandbox } from 'e2b';
  * recursive/force flags, so the adapter explicitly rejects either option
  * before calling the provider.
  *
- * `commands.run()` returns `{ stdout, stderr, exitCode }` directly. Both E2B
+ * `commands.run()` returns `{ stdout, stderr, exitCode }` for a zero exit and
+ * throws `CommandExitError`, which carries the same fields, for a non-zero
+ * one, so the adapter returns that error as the result. Both E2B
  * and Flue express command timeouts in milliseconds, so the adapter forwards
  * them unchanged.
  */
@@ -167,11 +170,16 @@ class E2BSandboxDriver implements SandboxDriver {
 			signal?: AbortSignal;
 		},
 	): Promise<{ stdout: string; stderr: string; exitCode: number }> {
-		const result = await this.sandbox.commands.run(command, {
-			cwd: options?.cwd,
-			envs: options?.env,
-			timeoutMs: options?.timeoutMs,
-		});
+		const result = await this.sandbox.commands
+			.run(command, {
+				cwd: options?.cwd,
+				envs: options?.env,
+				timeoutMs: options?.timeoutMs,
+			})
+			.catch((error: unknown) => {
+				if (error instanceof CommandExitError) return error;
+				throw error;
+			});
 		return {
 			stdout: result.stdout ?? '',
 			stderr: result.stderr ?? '',
@@ -290,3 +298,32 @@ When updating an existing integration, inspect and compare it against this compl
 ### Version 1 — 2026-06-14
 
 Initial version.
+
+### Version 2 — 2026-10-12
+
+Return a non-zero exit as a result. E2B's `commands.run()` throws `CommandExitError` for a non-zero exit, so `exec()` rejected instead of returning `exitCode`.
+
+```diff
+--- a/src/sandboxes/e2b.ts
++++ b/src/sandboxes/e2b.ts
+-// flue-blueprint: sandbox/e2b@1
++// flue-blueprint: sandbox/e2b@2
++import { CommandExitError } from 'e2b';
+ import type { Sandbox as E2BSandbox } from 'e2b';
+@@
+-		const result = await this.sandbox.commands.run(command, {
+-			cwd: options?.cwd,
+-			envs: options?.env,
+-			timeoutMs: options?.timeoutMs,
+-		});
++		const result = await this.sandbox.commands
++			.run(command, {
++				cwd: options?.cwd,
++				envs: options?.env,
++				timeoutMs: options?.timeoutMs,
++			})
++			.catch((error: unknown) => {
++				if (error instanceof CommandExitError) return error;
++				throw error;
++			});
+```

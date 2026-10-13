@@ -154,7 +154,7 @@ The minimal structural shape of a Workers AI binding, exported from `@flue/runti
 | Provider ID                   | `providerName`    |
 | ----------------------------- | ----------------- |
 | `amazon-bedrock`              | `aws.bedrock`     |
-| `azure-openai-responses`      | `azure.ai.openai` |
+| `azure`                       | `azure.ai.openai` |
 | `google`                      | `gcp.gemini`      |
 | `google-vertex`               | `gcp.vertex_ai`   |
 | `mistral`                     | `mistral_ai`      |

@@ -1848,13 +1848,15 @@ export class Session implements FlueSession, AgentSubmissionSession {
 				if (this.approvalParked) return;
 				continue;
 			}
+			if ((this.outputChannel?.agentFinishes ?? []).length === 0) return;
+			// The loop only re-renders between turns of one run, never after its
+			// last turn — re-render here so the hooks' closures and guards observe
+			// state written during the run (and by earlier cycles' callbacks).
+			await this.prepareRerenderTurn();
 			const hooks = this.outputChannel?.agentFinishes ?? [];
-			if (hooks.length === 0) return;
 			const cycle = await this.countAgentFinishCycles(submissionId);
 			const toolCalls = await this.collectResponseToolCalls(submissionId);
 			const before = this.pendingSignalAppends.length;
-			// Re-read declarations each cycle: render-per-turn agents re-render on
-			// continuation turns, refreshing the closures.
 			for (const [index, hook] of hooks.entries()) {
 				await this.executeAgentFinishHook(index, hook, toolCalls, options.signal);
 			}
@@ -2418,7 +2420,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 			type: 'turn',
 			turnId,
 			purpose,
-			durationMs: durationSince(this.modelRequests.get(turnId)?.startedAt),
+			durationMs: response?.durationMs ?? durationSince(this.modelRequests.get(turnId)?.startedAt),
 			request,
 			response: {
 				responseId: response?.responseId,
@@ -2841,6 +2843,10 @@ export class Session implements FlueSession, AgentSubmissionSession {
 					}
 					const outcomeKey = `${encodeCanonicalId(assistantMessageId)}_${encodeCanonicalId(event.toolCallId)}`;
 					const messageId = `entry_tool_outcome_${outcomeKey}`;
+					// pi's monotonic `execute()` time, reused for both the durable
+					// record and the ephemeral `tool` event so the two can never
+					// disagree. pi omits it when the tool never ran.
+					const toolDurationMs = event.durationMs ?? durationSince(call.startedAt);
 					const result = event.result as AgentToolResult<any>;
 					const outcomeContent = await this.persistToolResultContent(result, messageId);
 					const details = result.details as { output?: unknown } | undefined;
@@ -2849,9 +2855,6 @@ export class Session implements FlueSession, AgentSubmissionSession {
 						typeof details === 'object' &&
 						details !== null &&
 						'output' in details;
-					// Measure once and reuse for both the durable record and the
-					// ephemeral `tool` event so the two can never disagree.
-					const toolDurationMs = durationSince(call.startedAt);
 					const outcomeRecord: ConversationRecord = {
 						...this.canonicalEnvelope('tool_outcome', `record_tool_outcome_${outcomeKey}`),
 						type: 'tool_outcome',
