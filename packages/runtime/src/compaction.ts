@@ -438,6 +438,10 @@ function findCutPoint(
 		const messageTokens = estimateTokens(message);
 		accumulatedTokens += messageTokens;
 		if (accumulatedTokens >= keepRecentTokens) {
+			// A trailing tool-result batch can exceed the budget on its own, leaving no
+			// cut point at or after `i`. Keep the batch with its requesting assistant
+			// instead of falling back to `start`, which would refuse to compact.
+			cutIndex = cutPoints[cutPoints.length - 1] ?? start;
 			for (const cutPoint of cutPoints) {
 				if (cutPoint >= i) {
 					cutIndex = cutPoint;
