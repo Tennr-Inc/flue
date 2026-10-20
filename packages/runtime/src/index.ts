@@ -151,6 +151,7 @@ export type {
 	CallHandle,
 	CompactionConfig,
 	DeliveredAttachment,
+	DeliveredFileAttachment,
 	DeliveredMessage,
 	DeliveredMessageInput,
 	DispatchReceipt,

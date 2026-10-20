@@ -1,7 +1,12 @@
-import { isDocumentMimeType } from './document-attachments.ts';
+import { toPublicAttachment } from './document-attachments.ts';
 import type { AgentSubmissionInput } from './runtime/agent-submissions.ts';
 import { MAX_IMAGE_DATA_LENGTH } from './runtime/schemas.ts';
-import type { PromptDocument, PromptImage } from './types.ts';
+import type {
+	DeliveredAttachment,
+	DeliveredFileAttachment,
+	PromptDocument,
+	PromptImage,
+} from './types.ts';
 
 export { MAX_IMAGE_DATA_LENGTH };
 export const IMAGE_DATA_CHUNK_LENGTH = 256 * 1024;
@@ -9,7 +14,16 @@ export const IMAGE_DATA_CHUNK_LENGTH = 256 * 1024;
 const markerPrefix = '__flue_submission_chunks__:';
 
 type ImageBlock =
-	PromptImage | PromptDocument | (Omit<PromptImage | PromptDocument, 'data'> & { data: string });
+	| PromptImage
+	| PromptDocument
+	| DeliveredFileAttachment
+	| (Omit<PromptImage | PromptDocument, 'data'> & { data: string });
+
+const ATTACHMENT_LABELS: Record<DeliveredAttachment['type'], string> = {
+	image: 'Image',
+	document: 'Document',
+	file: 'File',
+};
 
 /**
  * One persisted chunk of a submission payload value: `itemId` addresses the
@@ -38,7 +52,7 @@ export interface ExtractedImages<T> {
 export function assertImagesWithinLimit(images: readonly PromptImage[] | undefined): void {
 	for (const image of images ?? []) {
 		if (image.data.length > MAX_IMAGE_DATA_LENGTH) {
-			const kind = isDocumentMimeType(image.mimeType) ? 'Document' : 'Image';
+			const kind = ATTACHMENT_LABELS[toPublicAttachment(image).type];
 			throw new Error(`[flue] ${kind} data exceeds the ${MAX_IMAGE_DATA_LENGTH} character limit.`);
 		}
 	}
@@ -87,7 +101,7 @@ export function hydrateSubmissionAttachments(
 	} as AgentSubmissionInput;
 }
 
-function extractImageArray<T extends PromptImage | PromptDocument>(
+function extractImageArray<T extends ImageBlock>(
 	images: T[] | undefined,
 ): ExtractedImages<T[] | undefined> {
 	if (images === undefined) return { value: undefined, chunks: [] };
@@ -101,7 +115,7 @@ function extractImageBlocks(blocks: unknown[]): ExtractedImages<unknown[]> {
 		if (!isImageBlock(block)) return block;
 		if (block.data.length > MAX_IMAGE_DATA_LENGTH) {
 			throw new Error(
-				`[flue] ${block.type === 'document' ? 'Document' : 'Image'} data exceeds the ${MAX_IMAGE_DATA_LENGTH} character limit.`,
+				`[flue] ${ATTACHMENT_LABELS[block.type]} data exceeds the ${MAX_IMAGE_DATA_LENGTH} character limit.`,
 			);
 		}
 		const itemId = String(imageIndex++);
@@ -156,11 +170,14 @@ function hydrateImageArray<T>(blocks: T[], itemData: ReadonlyMap<string, string>
 
 /**
  * A binary attachment block whose `data` is chunked out of the submission
- * row: an image, or a document (`type: 'document'`, same `data`/`mimeType`
- * shape).
+ * row: an image, a document (`type: 'document'`), or a text file
+ * (`type: 'file'`), all with the same `data`/`mimeType` shape.
  */
 function isImageBlock(value: unknown): value is ImageBlock {
 	if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
 	const block = value as { type?: unknown; data?: unknown };
-	return (block.type === 'image' || block.type === 'document') && typeof block.data === 'string';
+	return (
+		(block.type === 'image' || block.type === 'document' || block.type === 'file') &&
+		typeof block.data === 'string'
+	);
 }

@@ -131,6 +131,7 @@ import {
 	redactObservationDetailImages,
 } from './event-redaction.ts';
 import { type FlueExecutionContext, interceptExecution } from './execution-interceptor.ts';
+import { isFileMimeType } from './file-attachments.ts';
 import {
 	EMPTY_HARNESS_TOOL_LINEAGE,
 	enterHarnessTool,
@@ -6145,6 +6146,8 @@ export class Session implements FlueSession, AgentSubmissionSession {
 	): Promise<Map<string, PromptImage>> {
 		const resolved = new Map<string, PromptImage>();
 		for (const attachment of this.visibleCanonicalAttachments(conversation).values()) {
+			// The model context never carries a file's bytes, so they are not loaded.
+			if (isFileMimeType(attachment.mimeType)) continue;
 			const stored = await this.attachmentStore.get({
 				streamPath: this.conversationWriter.path,
 				conversationId: this.conversationId,

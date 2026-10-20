@@ -89,7 +89,8 @@ Signal fields:
 ### `DeliveredAttachment`
 
 ```ts
-type DeliveredAttachment = DeliveredImageAttachment | DeliveredDocumentAttachment;
+type DeliveredAttachment =
+  DeliveredImageAttachment | DeliveredDocumentAttachment | DeliveredFileAttachment;
 
 interface DeliveredImageAttachment {
   type: 'image';
@@ -104,15 +105,27 @@ interface DeliveredDocumentAttachment {
   mimeType: 'application/pdf';
   filename?: string;
 }
+
+interface DeliveredFileAttachment {
+  type: 'file';
+  data: string;
+  mimeType:
+    | 'text/plain'
+    | 'text/csv'
+    | 'application/json'
+    | 'application/x-ndjson'
+    | 'application/har+json';
+  filename?: string;
+}
 ```
 
-One attachment on a `kind: 'user'` message: an image, or a document (PDF) forwarded to the model as native document content. Native document input is supported on Anthropic Messages, Google Generative AI / Vertex, and OpenAI (and Azure OpenAI) Responses models; on any other model API the document is replaced in model context with a text placeholder saying it was omitted (and the runtime logs a one-time warning per API).
+One attachment on a `kind: 'user'` message: an image, or a document (PDF) forwarded to the model as native document content. Native document input is supported on Anthropic Messages, Google Generative AI / Vertex, and OpenAI (and Azure OpenAI) Responses models; on any other model API the document is replaced in model context with a text placeholder saying it was omitted (and the runtime logs a one-time warning per API). A file (`type: 'file'`) is a text attachment whose bytes the server stores but never sends to the model. Its `mimeType` must be `text/plain`, `text/csv`, `application/json`, `application/x-ndjson`, or `application/har+json`. The model sees only a `<file id filename mimeType size />` entry in the message's attachment manifest; the agent decides where the bytes go, for example a `useAgentStart` hook that reads them from `useDelivery()` and writes them to the sandbox. An image whose `mimeType` is one of the file types is rejected with `invalid_request` (400).
 
 | Field      | Description                                                                                                   |
 | ---------- | ------------------------------------------------------------------------------------------------------------- |
-| `type`     | `'image'` or `'document'`.                                                                                    |
+| `type`     | `'image'`, `'document'`, or `'file'`.                                                                         |
 | `data`     | Base64-encoded bytes. The server rejects data longer than 14 MiB of characters.                               |
-| `mimeType` | The image MIME type (`image/png`, `image/jpeg`, …), or `application/pdf` for a document.                      |
+| `mimeType` | The image MIME type (`image/png`, `image/jpeg`, …), `application/pdf` for a document, or a text file type.    |
 | `filename` | Optional original filename, surfaced on the projected `file` part (and passed to the provider for documents). |
 
 ### `AgentSendResult`

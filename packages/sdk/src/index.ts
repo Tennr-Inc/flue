@@ -51,6 +51,7 @@ export type {
 	AgentSendResult,
 	DeliveredAttachment,
 	DeliveredDocumentAttachment,
+	DeliveredFileAttachment,
 	DeliveredImageAttachment,
 	DeliveredMessage,
 } from './public/send.ts';

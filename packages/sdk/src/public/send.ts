@@ -27,8 +27,28 @@ export interface DeliveredDocumentAttachment {
 	filename?: string;
 }
 
-/** One attachment on a `kind: 'user'` delivered message: an image or a document. */
-export type DeliveredAttachment = DeliveredImageAttachment | DeliveredDocumentAttachment;
+/**
+ * One text file on a `kind: 'user'` delivered message. The server stores its
+ * bytes but never sends them to the model, which sees only a `<file>` entry in
+ * the attachment manifest. The agent decides where the bytes go.
+ */
+export interface DeliveredFileAttachment {
+	type: 'file';
+	/** Base64-encoded file bytes. */
+	data: string;
+	mimeType:
+		| 'text/plain'
+		| 'text/csv'
+		| 'application/json'
+		| 'application/x-ndjson'
+		| 'application/har+json';
+	/** Optional original filename, surfaced on the projected `file` part. */
+	filename?: string;
+}
+
+/** One attachment on a `kind: 'user'` delivered message: an image, a document, or a text file. */
+export type DeliveredAttachment =
+	DeliveredImageAttachment | DeliveredDocumentAttachment | DeliveredFileAttachment;
 
 /**
  * The message delivered into an agent's session — the same unified shape the

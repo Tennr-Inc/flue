@@ -30,7 +30,8 @@
  * images sent to a non-vision model.
  */
 import type { Api, Context, ImageContent, Model, SimpleStreamOptions } from '@earendil-works/pi-ai';
-import type { PromptDocument, PromptImage } from './types.ts';
+import { isFileMimeType } from './file-attachments.ts';
+import type { DeliveredAttachment, PromptDocument, PromptImage } from './types.ts';
 
 /** Document MIME types accepted on attachments and operation `documents`. */
 export const DOCUMENT_MIME_TYPES = ['application/pdf'] as const;
@@ -105,17 +106,22 @@ export function mergeOperationAttachments(
 }
 
 /**
- * Convert a pi-carrier block back to its public shape — a document block when
- * its MIME type is a document type, else the image unchanged. Used where the
- * runtime reconstructs a `DeliveredMessage` from the model context or the
- * attachment store (task delegation, delivery-cursor restore).
+ * Convert a pi-carrier block back to its public shape by MIME type: a file, a
+ * document, or else the image unchanged. Used where the runtime reconstructs
+ * a `DeliveredMessage` from the model context or the attachment store (task
+ * delegation, delivery-cursor restore).
  */
-export function toPublicAttachment<T extends { mimeType: string; data: string }>(
-	block: T,
-): (T & { type: 'image' }) | (T & { type: 'document' }) {
+export function toPublicAttachment(block: {
+	data: string;
+	mimeType: string;
+	filename?: string;
+}): DeliveredAttachment {
+	if (isFileMimeType(block.mimeType)) {
+		return { ...block, type: 'file', mimeType: block.mimeType };
+	}
 	return isDocumentMimeType(block.mimeType)
-		? { ...block, type: 'document' as const }
-		: { ...block, type: 'image' as const };
+		? { ...block, type: 'document' }
+		: { ...block, type: 'image' };
 }
 
 /** Text that replaces a document for a model API without native document input. */

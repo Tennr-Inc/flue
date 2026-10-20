@@ -1,7 +1,9 @@
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import type {
 	AssistantMessage,
+	ImageContent,
 	JsonObject,
+	TextContent,
 	ToolResultMessage,
 	UserMessage,
 } from '@earendil-works/pi-ai';
@@ -17,6 +19,7 @@ import {
 } from './conversation-records.ts';
 import { isDocumentMimeType } from './document-attachments.ts';
 import { AttachmentNotAvailableError, ConversationRecordInvariantError } from './errors.ts';
+import { isFileMimeType } from './file-attachments.ts';
 import { fnv1a64 } from './fnv.ts';
 import { deepMergeMetadata } from './message-output.ts';
 import { createUserContextMessage, renderSignalMessage } from './message-rendering.ts';
@@ -1539,22 +1542,26 @@ function resolveMessageAttachments(
 	}
 	const attachments = [...(entry.attachmentRefs?.values() ?? [])];
 	let manifestProjected = false;
-	const content = message.content.map((block) => {
+	const content = message.content.flatMap<TextContent | ImageContent>((block) => {
 		if (block.type === 'text' && !manifestProjected && attachments.length > 0) {
 			manifestProjected = true;
-			return { ...block, text: attachmentManifest(block.text, attachments) };
+			return [{ ...block, text: attachmentManifest(block.text, attachments) }];
 		}
-		if (block.type !== 'image') return block;
+		if (block.type !== 'image') return [block];
 		const ref = entry.attachmentRefs?.get(block.data);
-		if (!ref) return block;
+		if (!ref) return [block];
+		// A file reaches the model only as its manifest entry; its bytes are never resolved.
+		if (isFileMimeType(ref.mimeType)) return [];
 		if (!options.resolveAttachment) throw new AttachmentNotAvailableError({ attachmentId: ref.id });
 		// Documents ride pi's image carrier (see document-attachments.ts); the
 		// uploader filename travels with them for the provider payload rewrite.
-		return {
-			type: 'image' as const,
-			...options.resolveAttachment(ref),
-			...(ref.filename && isDocumentMimeType(ref.mimeType) ? { filename: ref.filename } : {}),
-		};
+		return [
+			{
+				type: 'image' as const,
+				...options.resolveAttachment(ref),
+				...(ref.filename && isDocumentMimeType(ref.mimeType) ? { filename: ref.filename } : {}),
+			},
+		];
 	});
 	if (!manifestProjected && attachments.length > 0) {
 		content.unshift({ type: 'text', text: attachmentManifest('', attachments) });
@@ -1564,17 +1571,22 @@ function resolveMessageAttachments(
 
 function attachmentManifest(text: string, attachments: readonly AttachmentRef[]): string {
 	if (attachments.length === 0) return text;
-	const manifest = attachments
-		.map((attachment) =>
-			isDocumentMimeType(attachment.mimeType)
-				? `<document id="${attachment.id}" mimeType="${attachment.mimeType}"${
-						attachment.filename ? ` filename="${escapeManifestAttribute(attachment.filename)}"` : ''
-					} />`
-				: `<image id="${attachment.id}" mimeType="${attachment.mimeType}" />`,
-		)
-		.join('\n');
+	const manifest = attachments.map(attachmentManifestEntry).join('\n');
 	const projection = `\n\n<attachments>\n${manifest}\n</attachments>`;
 	return text.endsWith(projection) ? text : `${text}${projection}`;
+}
+
+function attachmentManifestEntry(attachment: AttachmentRef): string {
+	const filename = attachment.filename
+		? ` filename="${escapeManifestAttribute(attachment.filename)}"`
+		: '';
+	if (isFileMimeType(attachment.mimeType)) {
+		return `<file id="${attachment.id}"${filename} mimeType="${attachment.mimeType}" size="${attachment.size}" />`;
+	}
+	if (isDocumentMimeType(attachment.mimeType)) {
+		return `<document id="${attachment.id}" mimeType="${attachment.mimeType}"${filename} />`;
+	}
+	return `<image id="${attachment.id}" mimeType="${attachment.mimeType}" />`;
 }
 
 function escapeManifestAttribute(value: string): string {

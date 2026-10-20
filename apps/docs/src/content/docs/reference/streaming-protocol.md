@@ -65,10 +65,21 @@ type DeliveredMessage =
 
 type DeliveredAttachment =
   | { type: 'image'; data: string; mimeType: string; filename?: string } // data: base64
-  | { type: 'document'; data: string; mimeType: 'application/pdf'; filename?: string };
+  | { type: 'document'; data: string; mimeType: 'application/pdf'; filename?: string }
+  | {
+      type: 'file';
+      data: string;
+      mimeType:
+        | 'text/plain'
+        | 'text/csv'
+        | 'application/json'
+        | 'application/x-ndjson'
+        | 'application/har+json';
+      filename?: string;
+    };
 ```
 
-- `kind: 'user'` — a direct user chat turn. `attachments` accepts images and documents; `data` is base64 and limited to 14,680,064 characters (14 × 1024 × 1024) — longer data is rejected with `invalid_request` (400). A document's `mimeType` must be `application/pdf`, or the request is rejected with `invalid_request` (400).
+- `kind: 'user'` — a direct user chat turn. `attachments` accepts images, documents, and text files; `data` is base64 and limited to 14,680,064 characters (14 × 1024 × 1024) — longer data is rejected with `invalid_request` (400). A document's `mimeType` must be `application/pdf`, or the request is rejected with `invalid_request` (400). A file (`type: 'file'`) is a text attachment whose bytes the server stores but never sends to the model. Its `mimeType` must be `text/plain`, `text/csv`, `application/json`, `application/x-ndjson`, or `application/har+json`. The model sees only a `<file id filename mimeType size />` entry in the message's attachment manifest; the agent decides where the bytes go, for example a `useAgentStart` hook that reads them from `useDelivery()` and writes them to the sandbox. An image whose `mimeType` is one of the file types is rejected with `invalid_request` (400).
 - `kind: 'signal'` — a structured event delivery. `type` must be non-empty. `body` is a plain string; JSON-stringify structured payloads yourself. `tagName` must be a valid XML tag name (`^[A-Za-z_][A-Za-z0-9_.-]*$`); it is rendered unescaped as the signal's envelope in model context, so looser values are rejected with `invalid_request` (400).
 - `initialData` — instance-creation data, consulted only when this send creates the conversation. When the agent declares an `initialData` schema, a creating send is validated against it; mismatches are rejected with `invalid_request` (400) before anything durable is admitted.
 - `uid` — send condition. A string delivers only to the incarnation with that uid: an absent instance or a mismatched uid is rejected with `agent_instance_not_found` (404). `null` creates only when no instance exists: an existing instance is rejected with `agent_instance_exists` (409), whose `details` names the existing uid. Omitted sends deliver unconditionally. Combining a string `uid` with `initialData` is a contradiction (the condition forbids creation) and is rejected with `invalid_request` (400). Failed conditions leave nothing durable behind.

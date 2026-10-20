@@ -17,6 +17,7 @@ declare module '@earendil-works/pi-agent-core' {
 }
 
 import type * as v from 'valibot';
+import type { FileMimeType } from './file-attachments.ts';
 import type { McpConnectionDefinition } from './mcp-types.ts';
 import type { ToolDefinition } from './tool-types.ts';
 
@@ -44,13 +45,29 @@ export type {
 export type { ThinkingLevel };
 
 /**
- * One attachment on a `kind: 'user'` {@link DeliveredMessage}: an image
- * ({@link PromptImage}, pi-ai's `ImageContent`) or a document
- * ({@link PromptDocument}), with an optional uploader-provided `filename`
- * (carried on the wire and the canonical record, but not part of the model
- * content shape).
+ * A text file on a `kind: 'user'` {@link DeliveredMessage}. Flue stores its
+ * bytes but never sends them to a model: the model sees only a
+ * `<file id filename mimeType size />` entry in the attachment manifest. An
+ * agent hook reads the bytes from `useDelivery()` and puts them where the
+ * model can read them, such as the sandbox.
  */
-export type DeliveredAttachment = (PromptImage | PromptDocument) & { filename?: string };
+export interface DeliveredFileAttachment {
+	type: 'file';
+	/** Base64-encoded file bytes. */
+	data: string;
+	mimeType: FileMimeType;
+	filename?: string;
+}
+
+/**
+ * One attachment on a `kind: 'user'` {@link DeliveredMessage}: an image
+ * ({@link PromptImage}, pi-ai's `ImageContent`), a document
+ * ({@link PromptDocument}), or a text file ({@link DeliveredFileAttachment}),
+ * with an optional uploader-provided `filename` (carried on the wire and the
+ * canonical record, but not part of the model content shape).
+ */
+export type DeliveredAttachment =
+	((PromptImage | PromptDocument) & { filename?: string }) | DeliveredFileAttachment;
 
 /**
  * A message delivered into an agent's session — the single unified input

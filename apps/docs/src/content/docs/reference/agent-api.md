@@ -128,18 +128,31 @@ type DeliveredMessage =
 
 type DeliveredMessageInput = string | DeliveredMessage;
 
-type DeliveredAttachment = (PromptImage | PromptDocument) & { filename?: string };
+type DeliveredAttachment =
+  ((PromptImage | PromptDocument) & { filename?: string }) | DeliveredFileAttachment;
 
 interface PromptDocument {
   type: 'document';
   data: string; // base64
   mimeType: string; // 'application/pdf'
 }
+
+interface DeliveredFileAttachment {
+  type: 'file';
+  data: string; // base64
+  mimeType:
+    | 'text/plain'
+    | 'text/csv'
+    | 'application/json'
+    | 'application/x-ndjson'
+    | 'application/har+json';
+  filename?: string;
+}
 ```
 
 The single unified input shape for every delivery surface: `dispatch()`, the `init()` handle, [`useDispatchMessage()`](/docs/reference/agent-hooks-api/#usedispatchmessage), and a direct HTTP prompt (whose wire body is this shape verbatim). Everywhere a `DeliveredMessageInput` is accepted, a bare string is shorthand for `{ kind: 'user', body }`.
 
-- `kind: 'user'` — a direct user talking to the assistant. Produces a canonical `user_message` record and projects with `purpose: 'user'` in the conversation. `attachments` carries images for vision-capable models — `{ type: 'image', data, mimeType, filename? }` — and documents — `{ type: 'document', data, mimeType: 'application/pdf', filename? }`. `data` is base64 and capped at 14 MiB of base64 characters per attachment (`14 * 1024 * 1024`). Documents are forwarded to the model as native document content (for PDFs the provider sees extracted text plus a rendered image of every page) rather than text extracted or pages rasterized in your code. Native document input is supported on Anthropic Messages, Google Generative AI / Vertex, and OpenAI (and Azure OpenAI) Responses models; on any other model API the document is replaced in model context with a text placeholder saying it was omitted (and the runtime logs a one-time warning per API). Other document MIME types are rejected with `invalid_request` (400).
+- `kind: 'user'` — a direct user talking to the assistant. Produces a canonical `user_message` record and projects with `purpose: 'user'` in the conversation. `attachments` carries images for vision-capable models — `{ type: 'image', data, mimeType, filename? }` — and documents — `{ type: 'document', data, mimeType: 'application/pdf', filename? }`. `data` is base64 and capped at 14 MiB of base64 characters per attachment (`14 * 1024 * 1024`). Documents are forwarded to the model as native document content (for PDFs the provider sees extracted text plus a rendered image of every page) rather than text extracted or pages rasterized in your code. Native document input is supported on Anthropic Messages, Google Generative AI / Vertex, and OpenAI (and Azure OpenAI) Responses models; on any other model API the document is replaced in model context with a text placeholder saying it was omitted (and the runtime logs a one-time warning per API). Other document MIME types are rejected with `invalid_request` (400). A file (`type: 'file'`) is a text attachment whose bytes the server stores but never sends to the model. Its `mimeType` must be `text/plain`, `text/csv`, `application/json`, `application/x-ndjson`, or `application/har+json`. The model sees only a `<file id filename mimeType size />` entry in the message's attachment manifest; the agent decides where the bytes go, for example a `useAgentStart` hook that reads them from `useDelivery()` and writes them to the sandbox. An image whose `mimeType` is one of the file types is rejected with `invalid_request` (400).
 - `kind: 'signal'` — everything beyond a direct 1:1 exchange, and the right shape for most channels: each participant's or system's activity, with sender identity and structured metadata in `attributes` and the content in `body`. Signals render into model context as an XML-tagged block, not a chat turn.
   - `type` — caller-defined event type, e.g. `'slack.message'`. Non-empty. [Framework-reserved types](#dynamic-resources) are rejected at admission on every transport.
   - `body` — a plain string. JSON-stringify structured payloads yourself.

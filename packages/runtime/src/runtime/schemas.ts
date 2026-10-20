@@ -2,11 +2,12 @@ import * as v from 'valibot';
 import { RESERVED_SIGNAL_TYPES } from '../conversation-records.ts';
 import { DOCUMENT_MIME_TYPES } from '../document-attachments.ts';
 import { InvalidRequestError } from '../errors.ts';
+import { FILE_MIME_TYPES, isFileMimeType } from '../file-attachments.ts';
 import type { DeliveredMessage } from '../types.ts';
 
 /**
- * Per-attachment base64 length cap, shared by images and documents (~10.5 MB
- * decoded).
+ * Per-attachment base64 length cap, shared by images, documents, and files
+ * (~10.5 MB decoded).
  */
 export const MAX_IMAGE_DATA_LENGTH = 14 * 1024 * 1024;
 
@@ -19,7 +20,15 @@ const DeliveredImageAttachmentSchema = v.object({
 			`Image data exceeds the ${MAX_IMAGE_DATA_LENGTH} character limit.`,
 		),
 	),
-	mimeType: v.string(),
+	// Stored attachments keep only their MIME type, so a file type here would
+	// turn the image into a file on every later read.
+	mimeType: v.pipe(
+		v.string(),
+		v.check(
+			(mimeType) => !isFileMimeType(mimeType),
+			(issue) => `Image mimeType "${issue.input}" is a text file type; send it as type "file".`,
+		),
+	),
 	filename: v.optional(v.string()),
 });
 
@@ -39,10 +48,27 @@ const DeliveredDocumentAttachmentSchema = v.object({
 	filename: v.optional(v.string()),
 });
 
+const DeliveredFileAttachmentSchema = v.object({
+	type: v.literal('file'),
+	data: v.pipe(
+		v.string(),
+		v.maxLength(
+			MAX_IMAGE_DATA_LENGTH,
+			`File data exceeds the ${MAX_IMAGE_DATA_LENGTH} character limit.`,
+		),
+	),
+	mimeType: v.picklist(
+		[...FILE_MIME_TYPES],
+		`File mimeType must be one of: ${[...FILE_MIME_TYPES].join(', ')}.`,
+	),
+	filename: v.optional(v.string()),
+});
+
 /** Attachment shape for a `DeliveredMessage`'s `attachments`. */
 const DeliveredAttachmentSchema = v.variant('type', [
 	DeliveredImageAttachmentSchema,
 	DeliveredDocumentAttachmentSchema,
+	DeliveredFileAttachmentSchema,
 ]);
 
 const DeliveredUserMessageSchema = v.object({
