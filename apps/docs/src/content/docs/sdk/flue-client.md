@@ -274,7 +274,7 @@ revokeToolEscalation(
 ): Promise<{ revoked: boolean }>;
 ```
 
-`DELETE <conversation url>/tool-escalations/<group>`. Revokes the instance's active grant for one group, so the next call in it asks again. Idempotent: resolves `{ revoked: false }` when nothing was active.
+`DELETE <conversation url>/tool-escalations/<group>`. Revokes the instance's grant for one group (expired grants included), so the next call in it asks again. Approvals already made stand. Idempotent: resolves `{ revoked: false }` when nothing was left to revoke.
 
 ## `history()`
 
@@ -339,6 +339,7 @@ interface FlueToolApproval {
   presentation?: { title?: string; description?: string };
   escalation?: {
     group: string;
+    mode: 'ask' | 'granted' | 'denied'; // mode of the render that produced the call
     expiresInMs?: number;
     presentation?: { title?: string; description?: string };
   };

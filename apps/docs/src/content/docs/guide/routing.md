@@ -110,7 +110,7 @@ There is no "wait for the reply" mode on this route. The agent's reply lands in 
 
 ### Resolving a tool approval
 
-Approval-gated tools use the same mounted agent surface. `createAgentRouter(...)` adds `POST /:id/tool-approvals/:proposalId` automatically; you do not need to add a ToT route or start a separate approval runtime. The body is a decision object with `status` (`approved`, `rejected`, `expired`, `canceled`, or `aborted`), an optional string `reason`, and, for tools in an [escalation group](/docs/guide/tools/#approve-a-group-of-tools-once), optional `escalate` (boolean, default `true`) and `actor` (an opaque principal string):
+Approval-gated tools use the same mounted agent surface. `createAgentRouter(...)` adds `POST /:id/tool-approvals/:proposalId` automatically; you do not need to add a ToT route or start a separate approval runtime. The body is a decision object with `status` (`approved`, `rejected`, `expired`, `canceled`, or `aborted`), an optional string `reason`, and, for tools in an [escalation group](/docs/guide/tools/#approve-a-group-of-tools-once), optional `escalate` (boolean, default `true`) and `actor` (an opaque principal string of at most 256 characters):
 
 ```http title="Approve a refund"
 POST /agents/support/ticket-8472/tool-approvals/approval_01HZX... HTTP/1.1

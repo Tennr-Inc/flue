@@ -211,7 +211,7 @@ describe('createAgentRouter tool escalation routes', () => {
 	it('forwards the escalation choice and actor with a decision', async () => {
 		const resolveToolApproval = vi.fn(async (input: ToolApprovalResolutionInput) => ({
 			...approvalRow,
-			escalation: { group: 'notion-edit' },
+			escalation: { group: 'notion-edit', mode: 'ask' as const },
 			status: input.status,
 			decidedAt: 2_000,
 			decidedVia: { kind: 'host' as const, actor: 'U123' },
@@ -224,7 +224,7 @@ describe('createAgentRouter tool escalation routes', () => {
 
 		expect(response.status).toBe(200);
 		expect(await response.json()).toMatchObject({
-			escalation: { group: 'notion-edit' },
+			escalation: { group: 'notion-edit', mode: 'ask' as const },
 			decidedVia: { kind: 'host', actor: 'U123' },
 		});
 		expect(resolveToolApproval).toHaveBeenCalledWith({

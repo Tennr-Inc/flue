@@ -10,7 +10,7 @@ import {
 } from '@earendil-works/pi-ai/providers/faux';
 import type { CallToolResult, Tool, Transport } from '@modelcontextprotocol/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { ToolApprovalDecisionInput } from './agent-execution-store.ts';
+import type { AgentSubmissionStore, ToolApprovalDecisionInput } from './agent-execution-store.ts';
 import { createFlueContext } from './client.ts';
 import type { ConversationRecord } from './conversation-records.ts';
 import { ConversationRecordWriter } from './conversation-writer.ts';
@@ -72,6 +72,8 @@ async function createFixture(options: { mcpConnections?: McpConnectionResolver }
 	// Process loss between persisting a grouped proposal and deciding it: the
 	// next escalation decision fails, and the batch's outcome append crashes.
 	let loseEscalationDecision = false;
+	// Runs after an automatic approval commits, before the tool executes.
+	let afterAutoApproval: ((submissions: AgentSubmissionStore) => Promise<void>) | undefined;
 	const harnesses: Harness[] = [];
 	const admitted = new Set<string>();
 	let attemptNumber = 0;
@@ -107,12 +109,23 @@ async function createFixture(options: { mcpConnections?: McpConnectionResolver }
 		const decide = submissions.decideToolApproval?.bind(submissions);
 		if (decide) {
 			submissions.decideToolApproval = async (input) => {
-				if (loseEscalationDecision && input.via === 'escalation') {
+				if (loseEscalationDecision && (input.via === 'escalation' || input.via === 'mode')) {
 					loseEscalationDecision = false;
 					fault = 'before';
 					throw new Error('injected decision loss');
 				}
-				return decide(input);
+				const result = await decide(input);
+				if (
+					afterAutoApproval &&
+					result.decisionApplied &&
+					result.approval.status === 'approved' &&
+					input.via !== 'host'
+				) {
+					const hook = afterAutoApproval;
+					afterAutoApproval = undefined;
+					await hook(submissions);
+				}
+				return result;
 			};
 		}
 		const store = new SqliteConversationStreamStore(sql, transaction);
@@ -152,6 +165,9 @@ async function createFixture(options: { mcpConnections?: McpConnectionResolver }
 		},
 		loseNextEscalationDecision() {
 			loseEscalationDecision = true;
+		},
+		afterNextAutoApproval(hook: (submissions: AgentSubmissionStore) => Promise<void>) {
+			afterAutoApproval = hook;
 		},
 		async reopen() {
 			await close();
@@ -320,12 +336,13 @@ describe('tool escalation lifecycle', () => {
 		const { pending, result } = await escalateOnce(fixture, agent);
 		expect(pending.escalation).toEqual({
 			group: 'notion-edit',
+			mode: 'ask',
 			presentation: { title: 'Allow Notion edits for this session' },
 		});
 		expect(provider.requested).toHaveBeenCalledTimes(1);
 		expect(provider.requested.mock.calls[0]?.[0]).toMatchObject({
 			proposalId: pending.proposalId,
-			escalation: { group: 'notion-edit' },
+			escalation: { group: 'notion-edit', mode: 'ask' },
 		});
 		expect(result.approval.decidedVia).toEqual({ kind: 'host', actor: 'U123' });
 		expect(result.grant).toMatchObject({
@@ -647,6 +664,57 @@ describe('tool escalation lifecycle', () => {
 		expect(provider.requested).toHaveBeenCalledTimes(1);
 	});
 
+	it('rejects a call made under denied on recovery, even once the render asks and a grant exists', async () => {
+		const fixture = await createFixture();
+		const asking = notionAgent();
+		await escalateOnce(fixture, asking.agent);
+		const denying = notionAgent({ mode: 'denied' });
+
+		fixture.model.setResponses([toolRequest(call('edit_page', 'edit-2'))]);
+		fixture.loseNextEscalationDecision();
+		await expect(fixture.attempt(denying.agent, 'submission-2')).rejects.toBe(fixture.crash);
+		expect(await fixture.approvals('submission-2')).toMatchObject([
+			{ status: 'pending', escalation: { group: 'notion-edit', mode: 'denied' } },
+		]);
+		await fixture.reopen();
+
+		fixture.model.setResponses([fauxAssistantMessage('Not allowed.')]);
+		expect(await fixture.attempt(asking.agent, 'submission-2')).toMatchObject({
+			status: 'settled',
+		});
+		expect(asking.edit).toHaveBeenCalledTimes(1);
+		expect(denying.edit).not.toHaveBeenCalled();
+		expect(await fixture.approvals('submission-2')).toMatchObject([
+			{ status: 'rejected', decidedVia: { kind: 'mode', mode: 'denied' } },
+		]);
+		expect(await outcomeFor(fixture, 'edit-2')).toMatchObject({ isError: true });
+	});
+
+	it('does not start an escalated call once an abort is recorded', async () => {
+		const fixture = await createFixture();
+		const { agent, edit } = notionAgent();
+		await escalateOnce(fixture, agent);
+
+		fixture.model.setResponses([toolRequest(call('edit_page', 'edit-2'))]);
+		fixture.afterNextAutoApproval(async (submissions) => {
+			const submission = await submissions.getSubmission('submission-2');
+			if (!submission) throw new Error('Expected submission-2.');
+			await submissions.requestSessionAbort(submission.sessionKey);
+		});
+		const settled = await fixture.attempt(agent, 'submission-2').catch((error: unknown) => error);
+		expect(settled).not.toBe(fixture.crash);
+		expect(edit).toHaveBeenCalledTimes(1);
+		const records = await fixture.records();
+		const [approval] = await fixture.approvals('submission-2');
+		expect(approval).toMatchObject({ status: 'approved' });
+		expect(records).not.toContainEqual(
+			expect.objectContaining({
+				type: 'tool_approval_execution_started',
+				proposalId: approval?.proposalId,
+			}),
+		);
+	});
+
 	it('survives a restart: a reopened store keeps the grant', async () => {
 		const fixture = await createFixture();
 		const { agent, edit } = notionAgent();
@@ -732,7 +800,7 @@ describe('MCP tool escalation', () => {
 		]);
 		expect(await fixture.attempt(agent)).toMatchObject({ status: 'waiting_for_approval' });
 		const [pending] = await fixture.approvals();
-		expect(pending?.escalation).toEqual({ group: 'notion-edit' });
+		expect(pending?.escalation).toEqual({ group: 'notion-edit', mode: 'ask' });
 		if (!pending) throw new Error('Expected a pending approval.');
 		await fixture.decide(pending.proposalId, { status: 'approved' });
 		fixture.model.setResponses([fauxAssistantMessage('Created A.')]);

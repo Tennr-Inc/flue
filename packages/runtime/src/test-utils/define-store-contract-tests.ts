@@ -164,7 +164,10 @@ function groupedProposal(
 	group: string,
 	overrides: Partial<ToolApprovalProposal> = {},
 ): ToolApprovalProposal {
-	return approvalProposal(submissionId, toolCallId, { escalation: { group }, ...overrides });
+	return approvalProposal(submissionId, toolCallId, {
+		escalation: { group, mode: 'ask' },
+		...overrides,
+	});
 }
 
 async function admitDispatchReady(store: AgentSubmissionStore, input: DispatchInput) {
@@ -701,7 +704,7 @@ export function defineStoreContractTests(label: string, backend: StoreContractTe
 					const store = escalationStore(await create());
 					await admitDispatchReady(store, dispatchInput());
 					const origin = groupedProposal('dispatch-1', 'origin', 'deploys', {
-						escalation: { group: 'deploys', expiresInMs: 60_000 },
+						escalation: { group: 'deploys', mode: 'ask', expiresInMs: 60_000 },
 					});
 					await store.createToolApproval(origin);
 					const { grant } = await store.decideToolApproval({
@@ -796,6 +799,76 @@ export function defineStoreContractTests(label: string, backend: StoreContractTe
 							via: 'escalation',
 						}),
 					).rejects.toThrow('can only approve');
+				});
+
+				it('never approves a call made under denied through a grant', async () => {
+					const store = escalationStore(await create());
+					await admitDispatchReady(store, dispatchInput());
+					const origin = groupedProposal('dispatch-1', 'origin', 'deploys');
+					const denied = groupedProposal('dispatch-1', 'denied', 'deploys', {
+						escalation: { group: 'deploys', mode: 'denied' },
+					});
+					await store.createToolApproval(origin);
+					await store.createToolApproval(denied);
+
+					const result = await store.decideToolApproval({
+						proposalId: origin.proposalId,
+						status: 'approved',
+						via: 'host',
+					});
+					expect(result.grant).toBeDefined();
+					expect(result.escalated).toBeUndefined();
+					expect((await store.getToolApproval(denied.proposalId))?.status).toBe('pending');
+				});
+
+				it('revokes an expired grant that still covers earlier requests', async () => {
+					const store = escalationStore(await create());
+					await admitDispatchReady(store, dispatchInput());
+					const origin = groupedProposal('dispatch-1', 'origin', 'deploys', {
+						escalation: { group: 'deploys', mode: 'ask', expiresInMs: 1 },
+					});
+					await store.createToolApproval(origin);
+					const { grant } = await store.decideToolApproval({
+						proposalId: origin.proposalId,
+						status: 'approved',
+						via: 'host',
+					});
+					if (grant?.expiresAt === undefined) throw new Error('Expected an expiring grant.');
+					await new Promise((resolve) => setTimeout(resolve, 5));
+					expect(await store.listToolEscalationGrants()).toEqual([]);
+
+					const earlier = groupedProposal('dispatch-1', 'earlier', 'deploys', {
+						requestedAt: grant.expiresAt - 1,
+					});
+					await store.createToolApproval(earlier);
+					expect(await store.revokeToolEscalation({ group: 'deploys' })).toEqual([
+						expect.objectContaining({ proposalId: origin.proposalId }),
+					]);
+					expect(
+						await store.decideToolApproval({
+							proposalId: earlier.proposalId,
+							status: 'approved',
+							via: 'escalation',
+						}),
+					).toMatchObject({ decisionApplied: false, approval: { status: 'pending' } });
+				});
+
+				it('bounds the recorded actor', async () => {
+					const store = escalationStore(await create());
+					await admitDispatchReady(store, dispatchInput());
+					const proposal = groupedProposal('dispatch-1', 'call-1', 'deploys');
+					await store.createToolApproval(proposal);
+					await expect(
+						store.decideToolApproval({
+							proposalId: proposal.proposalId,
+							status: 'approved',
+							via: 'host',
+							actor: 'x'.repeat(257),
+						}),
+					).rejects.toThrow('at most 256 characters');
+					await expect(
+						store.revokeToolEscalation({ group: 'deploys', actor: 'x'.repeat(257) }),
+					).rejects.toThrow('at most 256 characters');
 				});
 
 				it('tracks escalation projection repair for grants and revocations', async () => {

@@ -621,6 +621,8 @@ class CloudflareAgentCoordinator {
 			...(input.actor === undefined ? {} : { actor: input.actor }),
 			...(input.reason === undefined ? {} : { reason: input.reason }),
 		});
+		// The wake retries any revocation record the append below defers.
+		if (revoked.length > 0) await this.armDrain();
 		for (const grant of revoked) {
 			await this.repairToolEscalationRecords(grant);
 			this.emitCoordinatorEvent({
@@ -1129,8 +1131,10 @@ class CloudflareAgentCoordinator {
 		}
 		const listEscalations = this.submissions.listToolEscalationProjectionWork;
 		if (listEscalations) {
+			// Audit-only records: one that cannot be appended is logged and
+			// retried later, never allowed to stall submission reconciliation.
 			for (const work of await listEscalations.call(this.submissions)) {
-				await this.ensureToolEscalationRecords(work.grant);
+				await this.repairToolEscalationRecords(work.grant);
 			}
 		}
 	}

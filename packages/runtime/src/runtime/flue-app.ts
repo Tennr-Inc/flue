@@ -5,7 +5,7 @@ import type {
 	ToolApprovalDecisionStatus,
 	ToolEscalationGrant,
 } from '../tool-approval.ts';
-import { TOOL_ESCALATION_GROUP_PATTERN } from '../tool-approval.ts';
+import { MAX_TOOL_APPROVAL_ACTOR_LENGTH, TOOL_ESCALATION_GROUP_PATTERN } from '../tool-approval.ts';
 import type {
 	Agent,
 	AgentDispatchRequest,
@@ -118,8 +118,10 @@ export async function resolveToolApproval(
 			reason: 'A tool approval decision escalate flag must be a boolean.',
 		});
 	}
-	if (input.actor !== undefined && typeof input.actor !== 'string') {
-		throw new InvalidRequestError({ reason: 'A tool approval decision actor must be a string.' });
+	if (!isToolApprovalActor(input.actor)) {
+		throw new InvalidRequestError({
+			reason: `A tool approval decision actor must be a string of at most ${MAX_TOOL_APPROVAL_ACTOR_LENGTH} characters.`,
+		});
 	}
 	if (!('resolveToolApproval' in rt)) {
 		throw new Error('[flue] The configured runtime does not support tool approvals.');
@@ -170,6 +172,14 @@ export async function revokeToolEscalation(
 	});
 }
 
+/** Shared by the runtime APIs and the HTTP routes. */
+export function isToolApprovalActor(value: unknown): value is string | undefined {
+	return (
+		value === undefined ||
+		(typeof value === 'string' && value.length <= MAX_TOOL_APPROVAL_ACTOR_LENGTH)
+	);
+}
+
 /** Shared by the runtime API and the HTTP route. */
 export function assertToolEscalationRevocation(input: {
 	group?: unknown;
@@ -181,9 +191,9 @@ export function assertToolEscalationRevocation(input: {
 			reason: `A tool escalation group must match ${TOOL_ESCALATION_GROUP_PATTERN}.`,
 		});
 	}
-	if (input.actor !== undefined && typeof input.actor !== 'string') {
+	if (!isToolApprovalActor(input.actor)) {
 		throw new InvalidRequestError({
-			reason: 'A tool escalation revocation actor must be a string.',
+			reason: `A tool escalation revocation actor must be a string of at most ${MAX_TOOL_APPROVAL_ACTOR_LENGTH} characters.`,
 		});
 	}
 	if (input.reason !== undefined && typeof input.reason !== 'string') {

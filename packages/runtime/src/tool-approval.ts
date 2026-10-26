@@ -74,6 +74,12 @@ export interface ToolEscalationState {
 /** Escalation details frozen into a grouped proposal. */
 export interface ToolApprovalEscalation {
 	readonly group: string;
+	/**
+	 * The mode of the render that produced the call. Flue decides `granted` and
+	 * `denied` calls itself, so a proposal waiting for a host was made under
+	 * `ask`. A grant never approves a call made under `denied`.
+	 */
+	readonly mode: ToolEscalationMode;
 	/** Lifetime a grant created by approving this proposal would get. */
 	readonly expiresInMs?: number;
 	readonly presentation?: ToolApprovalPresentation;
@@ -143,6 +149,20 @@ export interface ToolApprovalProvider {
 	 * stream holds the durable record.
 	 */
 	decided?(approval: ToolApproval): void | Promise<void>;
+}
+
+/** Bounds the opaque host principal recorded on decisions, grants, and every record that copies it. */
+export const MAX_TOOL_APPROVAL_ACTOR_LENGTH = 256;
+
+export function assertToolApprovalActor(value: unknown, label: string): void {
+	if (
+		value !== undefined &&
+		(typeof value !== 'string' || value.length > MAX_TOOL_APPROVAL_ACTOR_LENGTH)
+	) {
+		throw new Error(
+			`[flue] ${label} must be a string of at most ${MAX_TOOL_APPROVAL_ACTOR_LENGTH} characters.`,
+		);
+	}
 }
 
 /** Escalation group names: lowercase letters, digits, `_` and `-`, at most 64 characters. */

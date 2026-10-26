@@ -365,7 +365,7 @@ describe('tool escalation through the coordinator', () => {
 				toolVersion: '1',
 				arguments: {},
 				requestedAt: 1,
-				escalation: { group: 'notion-edit' },
+				escalation: { group: 'notion-edit', mode: 'ask' },
 			});
 			for (const toolCallId of ['call-1', 'call-2']) {
 				await alice.store.createToolApproval?.(proposal(toolCallId));
@@ -388,6 +388,7 @@ describe('tool escalation through the coordinator', () => {
 				),
 			);
 
+			const wakesBefore = vi.mocked(alice.instance.schedule).mock.calls.length;
 			expect(
 				await runtime.revokeToolEscalation(alice.instance, {
 					agent: 'Support',
@@ -397,6 +398,8 @@ describe('tool escalation through the coordinator', () => {
 					reason: 'done editing',
 				}),
 			).toEqual({ revoked: true });
+			// A wake retries the revocation record if its append is deferred.
+			expect(vi.mocked(alice.instance.schedule).mock.calls.length).toBeGreaterThan(wakesBefore);
 			expect(
 				await runtime.revokeToolEscalation(alice.instance, {
 					agent: 'Support',

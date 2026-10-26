@@ -3345,8 +3345,8 @@ export class Session implements FlueSession, AgentSubmissionSession {
 			// pending proposal can park or a decided one can produce its outcome.
 			await this.ensureApprovalRequestedRecord(approval);
 			// A pending proposal here never parked (a crash or a race interrupted
-			// preflight), so no one has been asked yet: a grant or the render's
-			// mode decides it exactly as preflight would have.
+			// preflight), so no one has been asked yet: its frozen mode or a grant
+			// decides it exactly as preflight would have.
 			const escalated = await this.applyToolEscalation(approval);
 			if (escalated) {
 				approval = escalated;
@@ -5200,6 +5200,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		return {
 			escalation: {
 				group,
+				mode: declaration?.mode ?? 'ask',
 				...(declaration?.expiresInMs !== undefined ? { expiresInMs: declaration.expiresInMs } : {}),
 				...(declaration?.presentation !== undefined
 					? { presentation: declaration.presentation }
@@ -5209,19 +5210,18 @@ export class Session implements FlueSession, AgentSubmissionSession {
 	}
 
 	/**
-	 * Decide a pending grouped proposal without a host: the render's `granted`
-	 * or `denied` mode, or else an active grant covering the proposal. Returns
-	 * the decided approval, or `undefined` when it stays pending (mode `ask`
-	 * without a grant, or a decision that another writer won).
+	 * Decide a pending grouped proposal without a host: the `granted` or
+	 * `denied` mode frozen with the proposal (the mode of the render that
+	 * produced the call), or else an active grant covering the proposal.
+	 * Returns the decided approval, or `undefined` when it stays pending (mode
+	 * `ask` without a grant, or a decision that another writer won).
 	 */
 	private async applyToolEscalation(approval: ToolApproval): Promise<ToolApproval | undefined> {
-		const group = approval.escalation?.group;
-		if (group === undefined || approval.status !== 'pending') return undefined;
+		const escalation = approval.escalation;
+		if (escalation === undefined || approval.status !== 'pending') return undefined;
 		const decide = this.submissionStore?.decideToolApproval;
 		if (!decide) return undefined;
-		// A group the current render no longer declares asks; only a grant can
-		// still approve it.
-		const mode = this.toolEscalationDeclarations.get(group)?.mode ?? 'ask';
+		const { group, mode = 'ask' } = escalation;
 		const result = await decide.call(
 			this.submissionStore,
 			mode === 'denied'
@@ -5289,6 +5289,9 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		const approval = this.autoApprovedToolCalls.get(toolCallId);
 		if (!approval) return;
 		this.autoApprovedToolCalls.delete(toolCallId);
+		// Like a host-approved call: an abort or deadline recorded durably but
+		// not yet delivered to this attempt's signal must not start the tool.
+		await this.throwIfSubmissionHalted();
 		const recordId = `record_tool_approval_execution_started_${encodeCanonicalId(approval.proposalId)}`;
 		if (await this.conversationWriter.hasRecord(recordId)) {
 			throw new Error(

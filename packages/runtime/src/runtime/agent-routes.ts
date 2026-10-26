@@ -19,11 +19,15 @@ import {
 	ToolApprovalUnavailableError,
 } from '../errors.ts';
 import type { ToolApproval, ToolApprovalDecisionStatus } from '../tool-approval.ts';
-import { MAX_TOOL_APPROVAL_PROPOSAL_ID_LENGTH } from '../tool-approval.ts';
+import {
+	MAX_TOOL_APPROVAL_ACTOR_LENGTH,
+	MAX_TOOL_APPROVAL_PROPOSAL_ID_LENGTH,
+} from '../tool-approval.ts';
 import {
 	assertToolEscalationRevocation,
 	type CloudflareRuntime,
 	type FlueRuntime,
+	isToolApprovalActor,
 } from './flue-app.ts';
 import { handleAgentRequest } from './handle-agent.ts';
 import {
@@ -138,8 +142,10 @@ export async function executeAgentToolApprovalDecision(
 			reason: 'A tool approval decision escalate flag must be a boolean.',
 		});
 	}
-	if (actor !== undefined && typeof actor !== 'string') {
-		throw new InvalidRequestError({ reason: 'A tool approval decision actor must be a string.' });
+	if (!isToolApprovalActor(actor)) {
+		throw new InvalidRequestError({
+			reason: `A tool approval decision actor must be a string of at most ${MAX_TOOL_APPROVAL_ACTOR_LENGTH} characters.`,
+		});
 	}
 
 	const approval: ToolApproval = await rt.resolveToolApproval({

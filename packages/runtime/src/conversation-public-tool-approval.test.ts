@@ -196,7 +196,7 @@ describe('public tool approval projection', () => {
 	it('projects the escalation group and decision source, and ignores grant records', () => {
 		const grouped = {
 			...requested,
-			escalation: { group: 'payments', expiresInMs: 60_000 },
+			escalation: { group: 'payments', mode: 'ask', expiresInMs: 60_000 },
 		} satisfies ConversationRecord;
 		const escalated = {
 			...decided,
@@ -219,7 +219,7 @@ describe('public tool approval projection', () => {
 			expect.objectContaining({
 				proposalId: 'approval-1',
 				status: 'approved',
-				escalation: { group: 'payments', expiresInMs: 60_000 },
+				escalation: { group: 'payments', mode: 'ask', expiresInMs: 60_000 },
 				decidedVia: { kind: 'escalation', grantProposalId: 'approval-0', actor: 'U123' },
 			}),
 		]);

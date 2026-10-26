@@ -190,6 +190,8 @@ export type FlueToolApprovalDecisionStatus = Exclude<FlueToolApprovalStatus, 'pe
  */
 export interface FlueToolApprovalEscalation {
 	group: string;
+	/** The mode of the render that produced the call; a pending call was made under `ask`. */
+	mode: 'ask' | 'granted' | 'denied';
 	/** Lifetime a grant created by approving this call would get, in milliseconds. */
 	expiresInMs?: number;
 	presentation?: FlueToolApprovalPresentation;

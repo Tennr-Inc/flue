@@ -143,6 +143,7 @@ interface FlueToolApproval {
   presentation?: { title?: string; description?: string };
   escalation?: {
     group: string;
+    mode: 'ask' | 'granted' | 'denied';
     expiresInMs?: number;
     presentation?: { title?: string; description?: string };
   };

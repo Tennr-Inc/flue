@@ -62,7 +62,7 @@ import type {
 	ToolApprovalProposal,
 	ToolEscalationGrant,
 } from './tool-approval.ts';
-import { assertToolEscalationGroup } from './tool-approval.ts';
+import { assertToolApprovalActor, assertToolEscalationGroup } from './tool-approval.ts';
 import type { StoredToolEscalationGrant } from './tool-escalation.ts';
 
 export function ensureSqlAgentExecutionTables(
@@ -583,9 +583,7 @@ class AgentSubmissionStoreImpl implements AgentSubmissionStore {
 		if (input.reason !== undefined && typeof input.reason !== 'string') {
 			throw new Error('[flue] Tool approval decision reason must be a string.');
 		}
-		if (input.actor !== undefined && typeof input.actor !== 'string') {
-			throw new Error('[flue] Tool approval decision actor must be a string.');
-		}
+		assertToolApprovalActor(input.actor, 'Tool approval decision actor');
 		if (input.escalate !== undefined && typeof input.escalate !== 'boolean') {
 			throw new Error('[flue] Tool approval decision escalate must be a boolean.');
 		}
@@ -686,6 +684,9 @@ class AgentSubmissionStoreImpl implements AgentSubmissionStore {
 					.toArray()
 					.map(parseToolApproval);
 				for (const pending of pendingRows) {
+					// A call made under `denied` is pending only when a crash beat its
+					// rejection; recovery rejects it, and no grant may approve it.
+					if (pending.escalation?.mode === 'denied') continue;
 					// A proposal past its own deadline expires through the normal
 					// sweep; a grant never revives it.
 					if (pending.expiresAt !== undefined && pending.expiresAt <= now) continue;
@@ -806,30 +807,26 @@ class AgentSubmissionStoreImpl implements AgentSubmissionStore {
 		reason?: string;
 	}): Promise<StoredToolEscalationGrant[]> {
 		assertToolEscalationGroup(input.group, 'Tool escalation revocation group');
-		if (input.actor !== undefined && typeof input.actor !== 'string') {
-			throw new Error('[flue] Tool escalation revocation actor must be a string.');
-		}
+		assertToolApprovalActor(input.actor, 'Tool escalation revocation actor');
 		if (input.reason !== undefined && typeof input.reason !== 'string') {
 			throw new Error('[flue] Tool escalation revocation reason must be a string.');
 		}
-		return this.transactionSync(() => {
-			const now = Date.now();
-			return this.sql
-				.exec(
-					`UPDATE flue_tool_escalation_grants
-					 SET revoked_at = ?, revoked_by = ?, revoke_reason = ?
-					 WHERE escalation_group = ? AND revoked_at IS NULL
-					   AND (expires_at IS NULL OR expires_at > ?)
-					 RETURNING *`,
-					now,
-					input.actor ?? null,
-					input.reason ?? null,
-					input.group,
-					now,
-				)
-				.toArray()
-				.map(parseToolEscalationGrant);
-		});
+		// Expired grants are revoked too: coverage is judged at a call's
+		// request time, so an expired grant still covers a call requested
+		// before it expired until revocation says otherwise.
+		return this.sql
+			.exec(
+				`UPDATE flue_tool_escalation_grants
+				 SET revoked_at = ?, revoked_by = ?, revoke_reason = ?
+				 WHERE escalation_group = ? AND revoked_at IS NULL
+				 RETURNING *`,
+				Date.now(),
+				input.actor ?? null,
+				input.reason ?? null,
+				input.group,
+			)
+			.toArray()
+			.map(parseToolEscalationGrant);
 	}
 
 	async listToolEscalationProjectionWorkImpl(): Promise<ToolEscalationProjectionWork[]> {

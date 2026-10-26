@@ -200,13 +200,13 @@ function resolveToolApproval(input: {
   status: 'approved' | 'rejected' | 'expired' | 'canceled' | 'aborted';
   reason?: string;
   escalate?: boolean; // grouped proposals only; default true
-  actor?: string; // opaque host principal, recorded on the decision and any grant
+  actor?: string; // opaque host principal (≤ 256 characters), recorded on the decision and any grant
 }): Promise<ToolApproval>;
 ```
 
 Deliver a host decision for an approval-gated tool call. The proposal id is supplied by the configured [`ToolApprovalProvider`](#toolapprovalprovider) or by a persisted approval record. Decisions are durable and idempotent: once a proposal leaves `pending`, later decisions return the stored result and cannot overwrite it. `approved` resumes the parked submission after every approval in the current tool batch is decided; all other statuses record a deterministic tool error and never invoke the tool.
 
-For a proposal that carries `escalation`, approving with `escalate` unset or `true` grants its group to the agent instance and, in the same durable step, approves every other proposal of the group still pending. `escalate: false` approves only this call. The decision records `decidedVia: { kind: 'host', actor? }`. See [Approve a group of tools once](/docs/guide/tools/#approve-a-group-of-tools-once).
+For a proposal that carries `escalation`, approving with `escalate` unset or `true` grants its group to the agent instance and, in the same durable step, approves every other proposal of the group still pending, except calls made under `denied` and proposals past their deadline. `escalate: false` approves only this call. The decision records `decidedVia: { kind: 'host', actor? }`. See [Approve a group of tools once](/docs/guide/tools/#approve-a-group-of-tools-once).
 
 This API currently requires the Cloudflare target and its SQLite-backed Durable Object execution store. Node runtimes and the LibSQL, PostgreSQL, MySQL, MongoDB, and Redis adapters do not implement durable tool approvals.
 
@@ -254,7 +254,7 @@ function revokeToolEscalation(input: {
 }): Promise<{ revoked: boolean }>;
 ```
 
-Revoke the instance's active grant for `group`; the next call in the group asks again. Idempotent: `{ revoked: false }` when nothing was active. Revocation writes a `tool_escalation_revoked` record and emits the matching event. The mounted router serves it at `DELETE /:id/tool-escalations/:group` with an optional `{ actor?, reason? }` body. Both APIs share `resolveToolApproval()`'s Cloudflare requirement.
+Revoke the instance's grant for `group`; the next call in the group asks again. Every unrevoked grant for the group is revoked, expired ones included, since coverage is judged at each call's request time. Idempotent: `{ revoked: false }` when nothing was left to revoke. Approvals already made stand, so a call the grant already approved still runs. Revocation writes a `tool_escalation_revoked` record and emits the matching event. The mounted router serves it at `DELETE /:id/tool-escalations/:group` with an optional `{ actor?, reason? }` body. Both APIs share `resolveToolApproval()`'s Cloudflare requirement.
 
 ## Conditional sends
 

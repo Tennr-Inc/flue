@@ -351,8 +351,9 @@ export interface AgentSubmissionStore {
 	 * A host approval of a grouped proposal (`via: 'host'`, `escalate` not
 	 * `false`) escalates in the same atomic step: it records a grant for the
 	 * group unless an active one exists, and approves every other proposal of
-	 * the group still pending, resuming their parked submissions likewise. A
-	 * grant therefore exists exactly when the approval that created it does.
+	 * the group still pending, except calls made under `denied` and proposals
+	 * past their deadline, resuming their parked submissions likewise. A grant
+	 * therefore exists exactly when the approval that created it does.
 	 */
 	decideToolApproval?(input: ToolApprovalDecisionInput): Promise<ToolApprovalDecisionResult>;
 	/** Expire pending proposals whose deadline has passed. */
@@ -363,8 +364,9 @@ export interface AgentSubmissionStore {
 	 */
 	listToolEscalationGrants?(now?: number): Promise<ToolEscalationGrant[]>;
 	/**
-	 * Revoke every active grant for `group` and return them. Idempotent:
-	 * returns an empty array when nothing was active.
+	 * Revoke every unrevoked grant for `group`, expired ones included, and
+	 * return them. Idempotent: returns an empty array when nothing was left to
+	 * revoke. Decisions already made are unaffected.
 	 */
 	revokeToolEscalation?(input: {
 		group: string;
