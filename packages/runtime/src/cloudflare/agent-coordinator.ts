@@ -588,8 +588,10 @@ class CloudflareAgentCoordinator {
 		for (const { approval, resumed } of escalated) {
 			this.emitApprovalDecided(approval);
 			if (resumed) this.emitApprovalResumed(approval);
-			notifyToolApprovalDecided(approval, (error) =>
-				console.error('[flue:tool-approval] Host decision notification failed.', error),
+			this.instance.ctx.waitUntil?.(
+				notifyToolApprovalDecided(approval, (error) =>
+					console.error('[flue:tool-approval] Host decision notification failed.', error),
+				),
 			);
 		}
 		return result.approval;

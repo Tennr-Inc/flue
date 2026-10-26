@@ -23,19 +23,13 @@ import type { ToolDefinition } from './tool-types.ts';
 
 export type {
 	ToolApproval,
-	ToolApprovalDecidedVia,
 	ToolApprovalDecision,
 	ToolApprovalDecisionStatus,
-	ToolApprovalEscalation,
 	ToolApprovalPolicy,
 	ToolApprovalPresentation,
 	ToolApprovalProposal,
 	ToolApprovalProvider,
 	ToolApprovalStatus,
-	ToolEscalationGrant,
-	ToolEscalationMode,
-	ToolEscalationOptions,
-	ToolEscalationState,
 } from './tool-approval.ts';
 export type {
 	ToolContext,

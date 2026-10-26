@@ -15,19 +15,23 @@ export function setToolApprovalProvider(next: ToolApprovalProvider | undefined):
 
 /**
  * Tell the provider about a decision Flue made itself (an escalation grant or
- * mode). Best-effort and never awaited: a failing hook is reported through
- * `onError` and does not affect the call.
+ * mode). Best-effort: a failing hook is reported through `onError` and never
+ * affects the call. The returned promise never rejects; callers need not await
+ * it, but a host that can (`waitUntil`) should keep it alive.
  */
 export function notifyToolApprovalDecided(
 	approval: ToolApproval,
 	onError: (error: unknown) => void,
-): void {
+): Promise<void> {
 	const current = provider;
 	const decided = current?.decided;
-	if (!current || !decided) return;
-	void Promise.resolve()
+	if (!current || !decided) return Promise.resolve();
+	return Promise.resolve()
 		.then(() => decided.call(current, approval))
-		.catch(onError);
+		.then(
+			() => undefined,
+			(error: unknown) => onError(error),
+		);
 }
 
 /** Runtime-internal lookup used while constructing a session. */

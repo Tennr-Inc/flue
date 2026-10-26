@@ -5272,7 +5272,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 			...(approval.reason ? { reason: approval.reason } : {}),
 			...(approval.decidedVia ? { via: approval.decidedVia.kind } : {}),
 		});
-		notifyToolApprovalDecided(approval, (error) =>
+		void notifyToolApprovalDecided(approval, (error) =>
 			this.internalLog('error', '[flue:tool-approval] Host decision notification failed', {
 				proposalId: approval.proposalId,
 				error: error instanceof Error ? error.message : String(error),

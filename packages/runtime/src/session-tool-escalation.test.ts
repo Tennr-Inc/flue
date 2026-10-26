@@ -69,6 +69,9 @@ async function createFixture(options: { mcpConnections?: McpConnectionResolver }
 	const model = fauxProvider();
 	setProvider(model.provider);
 	let fault: 'before' | undefined;
+	// Process loss between persisting a grouped proposal and deciding it: the
+	// next escalation decision fails, and the batch's outcome append crashes.
+	let loseEscalationDecision = false;
 	const harnesses: Harness[] = [];
 	const admitted = new Set<string>();
 	let attemptNumber = 0;
@@ -101,6 +104,17 @@ async function createFixture(options: { mcpConnections?: McpConnectionResolver }
 		const submissions = createSqlAgentExecutionStoreFromSql(sql, transaction, {
 			toolApprovals: true,
 		});
+		const decide = submissions.decideToolApproval?.bind(submissions);
+		if (decide) {
+			submissions.decideToolApproval = async (input) => {
+				if (loseEscalationDecision && input.via === 'escalation') {
+					loseEscalationDecision = false;
+					fault = 'before';
+					throw new Error('injected decision loss');
+				}
+				return decide(input);
+			};
+		}
 		const store = new SqliteConversationStreamStore(sql, transaction);
 		const append = store.append.bind(store);
 		store.append = async (input) => {
@@ -135,6 +149,9 @@ async function createFixture(options: { mcpConnections?: McpConnectionResolver }
 		},
 		inject() {
 			fault = 'before';
+		},
+		loseNextEscalationDecision() {
+			loseEscalationDecision = true;
 		},
 		async reopen() {
 			await close();
@@ -570,6 +587,64 @@ describe('tool escalation lifecycle', () => {
 		const outcome = await outcomeFor(fixture, 'edit-2');
 		expect(outcome).toMatchObject({ isError: true });
 		expect(JSON.stringify(outcome?.content)).toContain('was not executed again');
+	});
+
+	it('runs an escalated call while a sibling in the same batch parks, and never reruns it', async () => {
+		const fixture = await createFixture();
+		const { agent, edit, remove } = notionAgent();
+		await escalateOnce(fixture, agent);
+
+		fixture.model.setResponses([
+			toolRequest(call('edit_page', 'edit-2'), call('delete_page', 'delete-2')),
+		]);
+		expect(await fixture.attempt(agent, 'submission-2')).toMatchObject({
+			status: 'waiting_for_approval',
+		});
+		expect(edit).toHaveBeenCalledTimes(2);
+		expect(remove).not.toHaveBeenCalled();
+		const pending = (await fixture.approvals('submission-2')).filter(
+			(approval) => approval.status === 'pending',
+		);
+		expect(pending.map((approval) => approval.toolCallId)).toEqual(['delete-2']);
+
+		const decision = await fixture.decide(pending[0]?.proposalId ?? '', { status: 'approved' });
+		expect(decision.grant).toBeUndefined();
+		fixture.model.setResponses([fauxAssistantMessage('Both done.')]);
+		expect(await fixture.attempt(agent, 'submission-2')).toMatchObject({ status: 'settled' });
+
+		expect(edit).toHaveBeenCalledTimes(2);
+		expect(remove).toHaveBeenCalledTimes(1);
+		expect(await outcomeFor(fixture, 'edit-2')).toMatchObject({ isError: false, output: 'edited' });
+		expect(await outcomeFor(fixture, 'delete-2')).toMatchObject({
+			isError: false,
+			output: 'removed',
+		});
+	});
+
+	it('decides a grouped proposal that a crash left pending before it parked', async () => {
+		const fixture = await createFixture();
+		const provider = installProvider();
+		const { agent, edit } = notionAgent();
+		const { pending: origin } = await escalateOnce(fixture, agent);
+
+		fixture.model.setResponses([toolRequest(call('edit_page', 'edit-2'))]);
+		fixture.loseNextEscalationDecision();
+		await expect(fixture.attempt(agent, 'submission-2')).rejects.toBe(fixture.crash);
+		expect(edit).toHaveBeenCalledTimes(1);
+		expect(await fixture.approvals('submission-2')).toMatchObject([{ status: 'pending' }]);
+		await fixture.reopen();
+
+		fixture.model.setResponses([fauxAssistantMessage('Recovered.')]);
+		expect(await fixture.attempt(agent, 'submission-2')).toMatchObject({ status: 'settled' });
+		expect(edit).toHaveBeenCalledTimes(2);
+		expect(await fixture.approvals('submission-2')).toMatchObject([
+			{
+				status: 'approved',
+				decidedVia: { kind: 'escalation', grantProposalId: origin.proposalId },
+			},
+		]);
+		// No one was asked about the recovered call.
+		expect(provider.requested).toHaveBeenCalledTimes(1);
 	});
 
 	it('survives a restart: a reopened store keeps the grant', async () => {
