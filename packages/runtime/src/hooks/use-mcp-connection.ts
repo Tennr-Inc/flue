@@ -1,4 +1,5 @@
 import type { McpConnectionDefinition, McpTransport } from '../mcp-types.ts';
+import { assertToolEscalationGroup } from '../tool-approval.ts';
 import { requireRenderFrame } from './frame.ts';
 
 const DEFINITION_KEYS = new Set<string>([
@@ -16,7 +17,7 @@ const DEFINITION_KEYS = new Set<string>([
 	'approval',
 ]);
 
-const APPROVAL_KEYS = new Set<string>(['required', 'tools', 'expiresInMs']);
+const APPROVAL_KEYS = new Set<string>(['required', 'tools', 'expiresInMs', 'escalation']);
 
 const TRANSPORTS: readonly McpTransport[] = ['streamable-http', 'sse'];
 
@@ -116,7 +117,9 @@ function assertMcpConnectionDefinition(
 
 function assertMcpApprovalPolicy(approval: unknown, label: string): void {
 	if (!approval || typeof approval !== 'object' || Array.isArray(approval)) {
-		throw new Error(`[flue] ${label} must be an object: { required: true, tools?, expiresInMs? }.`);
+		throw new Error(
+			`[flue] ${label} must be an object: { required: true, tools?, expiresInMs?, escalation? }.`,
+		);
 	}
 	for (const key of Object.keys(approval)) {
 		if (!APPROVAL_KEYS.has(key)) {
@@ -125,7 +128,12 @@ function assertMcpApprovalPolicy(approval: unknown, label: string): void {
 			);
 		}
 	}
-	const policy = approval as { required?: unknown; tools?: unknown; expiresInMs?: unknown };
+	const policy = approval as {
+		required?: unknown;
+		tools?: unknown;
+		expiresInMs?: unknown;
+		escalation?: unknown;
+	};
 	if (policy.required !== true) {
 		throw new Error(`[flue] ${label} must set required: true.`);
 	}
@@ -154,6 +162,9 @@ function assertMcpApprovalPolicy(approval: unknown, label: string): void {
 			policy.expiresInMs <= 0)
 	) {
 		throw new Error(`[flue] ${label} expiresInMs must be a positive number.`);
+	}
+	if (policy.escalation !== undefined) {
+		assertToolEscalationGroup(policy.escalation, `${label} escalation`);
 	}
 }
 
@@ -232,7 +243,9 @@ export function defineMcpConnection(definition: McpConnectionDefinition): McpCon
  *   the server does not expose are an error.
  * - `approval` parks gated calls on a durable host decision, like a
  *   `defineTool({ approval })` tool. Omit `approval.tools` to gate every
- *   mounted tool; names that are not mounted are an error.
+ *   mounted tool; names that are not mounted are an error. `approval.escalation`
+ *   puts every gated tool in one escalation group, which the render declares
+ *   with `useToolEscalation()`.
  *
  * To share one definition across agents, export it with
  * {@link defineMcpConnection} and mount the exported object. To filter or

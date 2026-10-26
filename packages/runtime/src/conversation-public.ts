@@ -13,7 +13,12 @@ import {
 	toolResultEntryId,
 } from './conversation-reducer.ts';
 import { toolResultOutput, toolResultText } from './message-rendering.ts';
-import type { ToolApprovalPresentation, ToolApprovalStatus } from './tool-approval.ts';
+import type {
+	ToolApprovalDecidedVia,
+	ToolApprovalEscalation,
+	ToolApprovalPresentation,
+	ToolApprovalStatus,
+} from './tool-approval.ts';
 
 interface AgentConversationSettlement {
 	submissionId: string;
@@ -50,9 +55,13 @@ export interface AgentConversationToolApproval {
 	requestedAt: number;
 	expiresAt?: number;
 	presentation?: ToolApprovalPresentation;
+	/** The call's escalation group; approving it grants the group unless the host opts out. */
+	escalation?: ToolApprovalEscalation;
 	/** Capture time of the canonical decision record, in Unix milliseconds. */
 	decidedAt?: number;
 	reason?: string;
+	/** Who decided; absent while pending and for decisions made on abort, expiry, or failure. */
+	decidedVia?: ToolApprovalDecidedVia;
 }
 
 /**
@@ -572,6 +581,7 @@ function pendingToolApproval(
 		requestedAt: record.requestedAt ?? canonicalTimestamp(record.timestamp),
 		...(record.expiresAt === undefined ? {} : { expiresAt: record.expiresAt }),
 		...(record.presentation === undefined ? {} : { presentation: record.presentation }),
+		...(record.escalation === undefined ? {} : { escalation: record.escalation }),
 	};
 }
 
@@ -604,6 +614,7 @@ function projectToolApprovals(
 						status: decision.status,
 						decidedAt: decision.decidedAt ?? canonicalTimestamp(decision.timestamp),
 						...(decision.reason === undefined ? {} : { reason: decision.reason }),
+						...(decision.decidedVia === undefined ? {} : { decidedVia: decision.decidedVia }),
 					}
 				: requested,
 		);

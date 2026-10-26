@@ -6,6 +6,8 @@ import type {
 	ResponseFinishDeclaration,
 	ResponseStartDeclaration,
 } from '../message-output.ts';
+import type { ToolEscalationGrant } from '../tool-approval.ts';
+import type { ToolEscalationDeclaration } from '../tool-escalation.ts';
 import type { ToolDefinition } from '../tool-types.ts';
 import type {
 	BeforeModelTurns,
@@ -72,6 +74,12 @@ export interface RenderStateContext {
 	 * subagent frames (delegates have no creation data of their own).
 	 */
 	initialData?: unknown;
+	/**
+	 * Active escalation grants by group, read before the render. Absent on
+	 * renders without an approval-capable store behind them, where
+	 * `useToolEscalation()` reports no grant.
+	 */
+	toolEscalationGrants?: ReadonlyMap<string, ToolEscalationGrant>;
 }
 
 /** The write channel `usePersistentState` setters push into; drained by the session. */
@@ -123,6 +131,8 @@ export interface RenderFrame {
 	subagents: SubagentDefinition[];
 	/** `useMcpConnection` declarations across the whole render, in call order; names unique. */
 	mcpConnections: McpConnectionDefinition[];
+	/** `useToolEscalation` declarations this render, by group; duplicates throw. */
+	toolEscalations: Map<string, ToolEscalationDeclaration>;
 	state: RenderStateContext | undefined;
 }
 
@@ -174,6 +184,7 @@ export function renderWithFrame<T>(
 		skills: [],
 		subagents: [],
 		mcpConnections: [],
+		toolEscalations: new Map(),
 		state,
 	};
 	currentFrame = frame;

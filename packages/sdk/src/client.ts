@@ -7,6 +7,7 @@ import type {
 	FlueConversationSnapshot,
 	FlueToolApproval,
 	FlueToolApprovalDecisionStatus,
+	FlueToolEscalationGrant,
 } from './public/conversation.ts';
 import {
 	assertConversationStreamChunk,
@@ -50,7 +51,29 @@ export interface AgentAbortResult {
 export interface ResolveToolApprovalOptions {
 	status: FlueToolApprovalDecisionStatus;
 	reason?: string;
+	/**
+	 * For an approval of a call with `escalation`: `true` (default) grants the
+	 * group to the agent instance, `false` approves only this call. Ignored
+	 * otherwise.
+	 */
+	escalate?: boolean;
+	/** Opaque principal recorded on the decision and on any grant it creates. */
+	actor?: string;
 	signal?: AbortSignal;
+}
+
+/** Options for revoking an escalation grant. */
+export interface RevokeToolEscalationOptions {
+	/** Opaque principal recorded on the revocation. */
+	actor?: string;
+	reason?: string;
+	signal?: AbortSignal;
+}
+
+/** Result of revoking an escalation grant. */
+export interface RevokeToolEscalationResult {
+	/** `false` when the group had no unrevoked grant, expired or not (revocation is idempotent). */
+	revoked: boolean;
 }
 
 /** Options for creating a client for one agent conversation. */
@@ -102,6 +125,16 @@ export interface FlueClient {
 		proposalId: string,
 		options: ResolveToolApprovalOptions,
 	): Promise<FlueToolApproval>;
+	/** Reads the agent instance's active escalation grants, the most recent per group. */
+	toolEscalations(options?: { signal?: AbortSignal }): Promise<FlueToolEscalationGrant[]>;
+	/**
+	 * Revokes the agent instance's active grant for one escalation group; the
+	 * next call in the group asks for approval again.
+	 */
+	revokeToolEscalation(
+		group: string,
+		options?: RevokeToolEscalationOptions,
+	): Promise<RevokeToolEscalationResult>;
 	/**
 	 * Reads one materialized conversation snapshot — the whole conversation,
 	 * or only its newest messages with `limit`.
@@ -198,9 +231,30 @@ export function createFlueClient(options: CreateFlueClientOptions): FlueClient {
 				body: {
 					status: opts.status,
 					...(opts.reason === undefined ? {} : { reason: opts.reason }),
+					...(opts.escalate === undefined ? {} : { escalate: opts.escalate }),
+					...(opts.actor === undefined ? {} : { actor: opts.actor }),
 				},
 				signal: opts.signal,
 			}),
+		toolEscalations: async (opts = {}) =>
+			(
+				await http.json<{ grants: FlueToolEscalationGrant[] }>({
+					path: '/tool-escalations',
+					signal: opts.signal,
+				})
+			).grants,
+		revokeToolEscalation: (group, opts = {}) => {
+			const body = {
+				...(opts.actor === undefined ? {} : { actor: opts.actor }),
+				...(opts.reason === undefined ? {} : { reason: opts.reason }),
+			};
+			return http.json<RevokeToolEscalationResult>({
+				method: 'DELETE',
+				path: `/tool-escalations/${encodeURIComponent(group)}`,
+				...(Object.keys(body).length > 0 ? { body } : {}),
+				signal: opts.signal,
+			});
+		},
 		history: async (opts = {}) => {
 			if (opts.limit !== undefined) assertHistoryLimit(opts.limit, 'history()');
 			return rewriteSnapshotAttachmentUrls(

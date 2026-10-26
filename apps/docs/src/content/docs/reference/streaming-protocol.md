@@ -141,9 +141,19 @@ interface FlueToolApproval {
   requestedAt: number;
   expiresAt?: number;
   presentation?: { title?: string; description?: string };
+  escalation?: {
+    group: string;
+    mode: 'ask' | 'granted' | 'denied';
+    expiresInMs?: number;
+    presentation?: { title?: string; description?: string };
+  };
   status: 'pending' | 'approved' | 'rejected' | 'expired' | 'canceled' | 'aborted';
   decidedAt?: number;
   reason?: string;
+  decidedVia?:
+    | { kind: 'host'; actor?: string }
+    | { kind: 'escalation'; grantProposalId: string; actor?: string }
+    | { kind: 'mode'; mode: 'granted' | 'denied' };
 }
 
 interface FlueConversationSettlement {

@@ -39,6 +39,10 @@ export type {
 	SubmissionClaimRef,
 	SubmissionDurability,
 	SubmissionSettlementObligation,
+	ToolApprovalDecisionInput,
+	ToolApprovalDecisionResult,
+	ToolApprovalProjectionWork,
+	ToolEscalationProjectionWork,
 } from './agent-execution-store.ts';
 export {
 	DURABILITY_DEFAULT_MAX_ATTEMPTS,
@@ -47,15 +51,22 @@ export {
 } from './agent-execution-store.ts';
 export type {
 	ToolApproval,
+	ToolApprovalDecidedVia,
 	ToolApprovalDecision,
 	ToolApprovalDecisionStatus,
+	ToolApprovalEscalation,
 	ToolApprovalPolicy,
 	ToolApprovalPresentation,
 	ToolApprovalProposal,
 	ToolApprovalProvider,
 	ToolApprovalStatus,
+	ToolEscalationGrant,
+	ToolEscalationMode,
+	ToolEscalationOptions,
+	ToolEscalationState,
 } from './tool-approval.ts';
 export { toolApprovalProposalId } from './tool-approval.ts';
+export type { StoredToolEscalationGrant } from './tool-escalation.ts';
 
 // ─── Submission input types ─────────────────────────────────────────────────
 

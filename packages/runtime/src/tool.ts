@@ -9,6 +9,7 @@ import type { McpToolAnnotations } from './mcp-types.ts';
 import { generateToolCallId } from './runtime/ids.ts';
 import { isTopLevelObjectSchema, isValibotSchema, parseValibot } from './schema.ts';
 import type { ToolApprovalPolicy } from './tool-approval.ts';
+import { assertToolEscalationGroup } from './tool-approval.ts';
 import type {
 	ToolContext,
 	ToolDefinition,
@@ -74,7 +75,7 @@ const TOOL_DEFINITION_FIELDS = new Set([
 	'annotations',
 	'run',
 ]);
-const TOOL_APPROVAL_FIELDS = new Set(['required', 'expiresInMs', 'presentation']);
+const TOOL_APPROVAL_FIELDS = new Set(['required', 'expiresInMs', 'presentation', 'escalation']);
 const TOOL_APPROVAL_PRESENTATION_FIELDS = new Set(['title', 'description']);
 
 const MCP_ANNOTATION_FIELDS = new Set([
@@ -160,6 +161,9 @@ export function assertToolDefinition(
 				assertString(presentation.title, `${label} approval.presentation.title`);
 			if (presentation.description !== undefined)
 				assertString(presentation.description, `${label} approval.presentation.description`);
+		}
+		if (tool.approval.escalation !== undefined) {
+			assertToolEscalationGroup(tool.approval.escalation, `${label} approval.escalation`);
 		}
 	}
 	if (tool.annotations !== undefined) {

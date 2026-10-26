@@ -90,11 +90,18 @@ export type {
 	FlueRuntime,
 	NodeRuntime,
 	ToolApprovalResolutionInput,
+	ToolEscalationRevocationInput,
+	ToolEscalationTarget,
 } from './runtime/flue-app.ts';
 // `configureFlueRuntime` seeds the module-scoped config that mounted
 // agent-router handlers read at request time. Called once per generated entry,
 // before the listener (Node) or `default.fetch` (Cloudflare) takes traffic.
-export { configureFlueRuntime, resolveToolApproval } from './runtime/flue-app.ts';
+export {
+	configureFlueRuntime,
+	getToolEscalations,
+	resolveToolApproval,
+	revokeToolEscalation,
+} from './runtime/flue-app.ts';
 export type {
 	CreateAgentContextFn,
 	CreateAgentContextOptions,
@@ -140,8 +147,10 @@ export { parseSkillMarkdown } from './skill-frontmatter.ts';
 export { buildPackagedSkill, createSkillReference } from './skill-package.ts';
 export type {
 	ToolApproval,
+	ToolApprovalDecidedVia,
 	ToolApprovalDecision,
 	ToolApprovalDecisionStatus,
 	ToolApprovalProposal,
 	ToolApprovalStatus,
+	ToolEscalationGrant,
 } from './tool-approval.ts';

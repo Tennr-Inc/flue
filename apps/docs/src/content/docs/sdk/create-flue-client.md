@@ -34,7 +34,7 @@ const approval = await conversation.resolveToolApproval('approval_01HZX...', {
 });
 ```
 
-This sends `POST <url>/tool-approvals/<proposalId>` with the JSON body `{ status, reason? }` and returns the durable approval row. `status` is one of `approved`, `rejected`, `expired`, `canceled`, or `aborted`; `reason` is optional. `createAgentRouter(...)` mounts this endpoint automatically, so a host application needs no extra ToT route or approval runtime. The same client headers and token are sent, allowing the host's mount middleware to authenticate and authorize the decision. Durable approval state currently requires Cloudflare Durable Object SQLite; `ToolApprovalProvider` is optional when a server also wants notification delivery.
+This sends `POST <url>/tool-approvals/<proposalId>` with the JSON body `{ status, reason?, escalate?, actor? }` and returns the durable approval row. `status` is one of `approved`, `rejected`, `expired`, `canceled`, or `aborted`; `reason` is optional. `createAgentRouter(...)` mounts this endpoint automatically, so a host application needs no extra ToT route or approval runtime. The same client headers and token are sent, allowing the host's mount middleware to authenticate and authorize the decision. Durable approval state currently requires Cloudflare Durable Object SQLite; `ToolApprovalProvider` is optional when a server also wants notification delivery.
 
 ## `CreateFlueClientOptions`
 
@@ -58,7 +58,7 @@ interface HttpClientOptions {
 | `headers` | Headers merged into every request. Merged after the `token`-derived header, so a `headers` entry named `authorization` wins over `token`.                                                                                                                                                                                                                                                    |
 | `token`   | Bearer token, sent as `authorization: Bearer <token>` on every request.                                                                                                                                                                                                                                                                                                                      |
 
-The options deliberately carry no retry or timeout configuration. Each JSON request (`send()`, `abort()`, `history()`, `resolveToolApproval()`) is a single fetch cancelled per call via `AbortSignal`; the reconnecting stream reads take `backoffOptions` per call on [`wait()`](/docs/sdk/flue-client/#wait) and [`observe()`](/docs/sdk/flue-client/#observe).
+The options deliberately carry no retry or timeout configuration. Each JSON request (`send()`, `abort()`, `history()`, `resolveToolApproval()`, `toolEscalations()`, `revokeToolEscalation()`) is a single fetch cancelled per call via `AbortSignal`; the reconnecting stream reads take `backoffOptions` per call on [`wait()`](/docs/sdk/flue-client/#wait) and [`observe()`](/docs/sdk/flue-client/#observe).
 
 ### Service bindings and other custom transports
 

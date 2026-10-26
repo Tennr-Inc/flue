@@ -39,6 +39,8 @@ import {
 	executeAgentConversationRead,
 	executeAgentPrompt,
 	executeAgentToolApprovalDecision,
+	executeAgentToolEscalationList,
+	executeAgentToolEscalationRevoke,
 } from './agent-routes.ts';
 import { getFlueRuntime } from './flue-app.ts';
 
@@ -250,6 +252,8 @@ export function resetFlueAgentRegistrationForTests(): void {
  * - `GET|HEAD /:id` — DS conversation stream read
  * - `POST /:id/abort` — abort in-flight/queued work
  * - `POST /:id/tool-approvals/:proposalId` — resolve a durable tool approval
+ * - `GET /:id/tool-escalations` — list active escalation grants
+ * - `DELETE /:id/tool-escalations/:group` — revoke one group's grant
  * - `ALL /:id/attachments/:attachmentId` — attachment byte download
  *
  * Mounting is the exposure decision; auth and other middleware compose in
@@ -315,6 +319,39 @@ export function createAgentRouter(agent: Agent): Hono {
 			agentName: identity,
 			instanceId: id,
 			proposalId: c.req.param('proposalId') ?? '',
+			request: c.req.raw.clone(),
+			env: c.env,
+		});
+	});
+
+	// Escalation grants share the approval routes' exposure: host middleware
+	// at the agent mount guards them like every other agent route.
+	app.all('/:id/tool-escalations', async (c) => {
+		const rt = requireRuntime();
+		if (c.req.method !== 'GET') {
+			throw new MethodNotAllowedError({ method: c.req.method, allowed: ['GET'] });
+		}
+		const id = c.req.param('id') ?? '';
+		assertAgentInstanceId(id);
+		return executeAgentToolEscalationList(rt, {
+			agentName: identity,
+			instanceId: id,
+			request: c.req.raw.clone(),
+			env: c.env,
+		});
+	});
+
+	app.all('/:id/tool-escalations/:group', async (c) => {
+		const rt = requireRuntime();
+		if (c.req.method !== 'DELETE') {
+			throw new MethodNotAllowedError({ method: c.req.method, allowed: ['DELETE'] });
+		}
+		const id = c.req.param('id') ?? '';
+		assertAgentInstanceId(id);
+		return executeAgentToolEscalationRevoke(rt, {
+			agentName: identity,
+			instanceId: id,
+			group: c.req.param('group') ?? '',
 			request: c.req.raw.clone(),
 			env: c.env,
 		});

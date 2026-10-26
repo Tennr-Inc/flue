@@ -78,6 +78,8 @@ Each conversation lives at the mount path plus a conversation id you choose: `/a
 | `HEAD /:id`                            | Read conversation stream metadata.                         |
 | `POST /:id/abort`                      | Abort in-flight and queued work.                           |
 | `POST /:id/tool-approvals/:proposalId` | Resolve one durable tool approval.                         |
+| `GET /:id/tool-escalations`            | List the instance's active escalation grants.              |
+| `DELETE /:id/tool-escalations/:group`  | Revoke one escalation group's grant.                       |
 | `GET /:id/attachments/:attachmentId`   | Download one attachment's bytes.                           |
 
 ### Sending a message
@@ -108,7 +110,7 @@ There is no "wait for the reply" mode on this route. The agent's reply lands in 
 
 ### Resolving a tool approval
 
-Approval-gated tools use the same mounted agent surface. `createAgentRouter(...)` adds `POST /:id/tool-approvals/:proposalId` automatically; you do not need to add a ToT route or start a separate approval runtime. The body is a decision object with `status` (`approved`, `rejected`, `expired`, `canceled`, or `aborted`) and an optional string `reason`:
+Approval-gated tools use the same mounted agent surface. `createAgentRouter(...)` adds `POST /:id/tool-approvals/:proposalId` automatically; you do not need to add a ToT route or start a separate approval runtime. The body is a decision object with `status` (`approved`, `rejected`, `expired`, `canceled`, or `aborted`), an optional string `reason`, and, for tools in an [escalation group](/docs/guide/tools/#approve-a-group-of-tools-once), optional `escalate` (boolean, default `true`) and `actor` (an opaque principal string of at most 256 characters):
 
 ```http title="Approve a refund"
 POST /agents/support/ticket-8472/tool-approvals/approval_01HZX... HTTP/1.1
@@ -128,7 +130,7 @@ The response is the durable approval row, including the proposal, its status, an
 
 ### The SDK wraps this surface
 
-A [`createFlueClient(...)`](/docs/sdk/create-flue-client/) client addresses exactly one conversation URL and packages the whole surface — `send()`, `wait()`, `observe()`, `history()`, `abort()`, `resolveToolApproval()`, and `attachmentUrl()` — over the routes above:
+A [`createFlueClient(...)`](/docs/sdk/create-flue-client/) client addresses exactly one conversation URL and packages the whole surface — `send()`, `wait()`, `observe()`, `history()`, `abort()`, `resolveToolApproval()`, `toolEscalations()`, `revokeToolEscalation()`, and `attachmentUrl()` — over the routes above:
 
 ```ts
 import { createFlueClient } from '@flue/sdk';

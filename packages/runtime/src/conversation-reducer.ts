@@ -710,6 +710,11 @@ export function applyConversationRecord(
 			// entries; the approval table is the lifecycle projection and the
 			// canonical body is retained for audit/recovery.
 			break;
+		case 'tool_escalation_granted':
+		case 'tool_escalation_revoked':
+			// Audit-only: the execution store's grant rows are authoritative, and
+			// nothing reads these back, so they index as digest stubs.
+			break;
 		case 'tool_results_committed': {
 			const assistant = conversation.entries.get(record.assistantMessageId);
 			if (

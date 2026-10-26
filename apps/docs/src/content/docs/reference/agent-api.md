@@ -199,10 +199,14 @@ function resolveToolApproval(input: {
   proposalId: string;
   status: 'approved' | 'rejected' | 'expired' | 'canceled' | 'aborted';
   reason?: string;
+  escalate?: boolean; // grouped proposals only; default true
+  actor?: string; // opaque host principal (≤ 256 characters), recorded on the decision and any grant
 }): Promise<ToolApproval>;
 ```
 
 Deliver a host decision for an approval-gated tool call. The proposal id is supplied by the configured [`ToolApprovalProvider`](#toolapprovalprovider) or by a persisted approval record. Decisions are durable and idempotent: once a proposal leaves `pending`, later decisions return the stored result and cannot overwrite it. `approved` resumes the parked submission after every approval in the current tool batch is decided; all other statuses record a deterministic tool error and never invoke the tool.
+
+For a proposal that carries `escalation`, approving with `escalate` unset or `true` grants its group to the agent instance and, in the same durable step, approves every other proposal of the group still pending, except calls made under `denied` and proposals past their deadline. `escalate: false` approves only this call. The decision records `decidedVia: { kind: 'host', actor? }`. Approving a call made under `denied`, which is pending only when a crash beat its rejection, records that mode's rejection instead (`decidedVia: { kind: 'mode', mode: 'denied' }`) and grants nothing. See [Approve a group of tools once](/docs/guide/tools/#approve-a-group-of-tools-once).
 
 This API currently requires the Cloudflare target and its SQLite-backed Durable Object execution store. Node runtimes and the LibSQL, PostgreSQL, MySQL, MongoDB, and Redis adapters do not implement durable tool approvals.
 
@@ -213,10 +217,44 @@ The proposal stores the exact validated arguments and tool `version`. Flue execu
 ```ts
 interface ToolApprovalProvider {
   requested(proposal: ToolApprovalProposal): void | Promise<void>;
+  decided?(approval: ToolApproval): void | Promise<void>;
 }
 ```
 
-Install one process-wide host notification adapter with `setToolApprovalProvider(provider)` before the runtime starts. Delivery is at-least-once: Flue replays pending parked proposals during reconciliation, including after a process restart or Cloudflare isolate replacement. Make `requested()` idempotent by `proposalId`. Notification is not the durable decision; after performing your own authorization, the host must call `resolveToolApproval()` to release the submission. The provider receives presentation hints, the exact arguments, the tool version, and the proposal deadline.
+Install one process-wide host notification adapter with `setToolApprovalProvider(provider)` before the runtime starts. Delivery is at-least-once: Flue replays pending parked proposals during reconciliation, including after a process restart or Cloudflare isolate replacement. Make `requested()` idempotent by `proposalId`. Notification is not the durable decision; after performing your own authorization, the host must call `resolveToolApproval()` to release the submission. The provider receives presentation hints, the exact arguments, the tool version, the proposal deadline, and, for a grouped tool, its `escalation`.
+
+`decided()` is optional. Flue calls it for decisions it makes itself, through an escalation grant or a render's escalation mode, with `decidedVia` set. It is best-effort (not replayed after a crash) and never asked to decide; the canonical `tool_approval_decided` record is the durable audit trail.
+
+## `getToolEscalations()`
+
+```ts
+function getToolEscalations(input: { agent: string; id: string }): Promise<ToolEscalationGrant[]>;
+
+interface ToolEscalationGrant {
+  group: string;
+  instanceId: string;
+  proposalId: string; // the approval whose decision created the grant
+  grantedAt: number;
+  expiresAt?: number;
+  actor?: string;
+}
+```
+
+Read an agent instance's active escalation grants (unexpired and unrevoked), the most recent per group. The mounted router serves the same list at `GET /:id/tool-escalations` as `{ grants }`.
+
+## `revokeToolEscalation()`
+
+```ts
+function revokeToolEscalation(input: {
+  agent: string;
+  id: string;
+  group: string;
+  actor?: string;
+  reason?: string;
+}): Promise<{ revoked: boolean }>;
+```
+
+Revoke the instance's grant for `group`; the next call in the group asks again. Every unrevoked grant for the group is revoked, expired ones included, since coverage is judged at each call's request time. Idempotent: `{ revoked: false }` when nothing was left to revoke. Approvals already made stand, so a call the grant already approved still runs. Revocation writes a `tool_escalation_revoked` record and emits the matching event. The mounted router serves it at `DELETE /:id/tool-escalations/:group` with an optional `{ actor?, reason? }` body. Both APIs share `resolveToolApproval()`'s Cloudflare requirement.
 
 ## Conditional sends
 
@@ -527,7 +565,12 @@ function defineTool<...>(options: {
   version?: string;          // stable approval/recovery identity; defaults to "1"
   input?: ToolInputSchema;   // Valibot schema; top-level object
   output?: ToolOutputSchema; // Valibot schema
-  approval?: { required: true; expiresInMs?: number; presentation?: ToolApprovalPresentation };
+  approval?: {
+    required: true;
+    expiresInMs?: number;
+    presentation?: ToolApprovalPresentation;
+    escalation?: string;     // escalation group, declared with useToolEscalation()
+  };
   timeoutMs?: number;        // execution deadline; approval wait is not counted
   harness?: boolean;
   durable?: boolean;
@@ -542,7 +585,7 @@ A typing and validation helper: it validates the definition and returns it froze
 - `version` — a non-empty, application-defined version string. An approval records it with the exact validated arguments; after a deploy, Flue refuses to execute an approved call if the mounted definition's version differs. Defaults to `"1"`.
 - `input` — a Valibot schema for the call's arguments. Must be a top-level object schema (the model sends a JSON object); anything else throws. When present, the parsed output arrives as `context.data`, typed by inference. When absent, the tool receives no `data` property and callers' arguments are ignored.
 - `output` — a Valibot schema for the return value. When present, the runtime parses the returned value through it before recording; a mismatch throws `ToolOutputValidationError`, and a schema producing `undefined` throws `ToolOutputSerializationError`.
-- `approval` — set `{ required: true }` to require a durable host decision before `run` is entered. `expiresInMs` sets an optional proposal deadline, and `presentation` carries optional UI text. Approval waiting is parked durable work: the model does not receive a placeholder tool result and does not continue to another turn. In a mixed batch, non-approval tools may finish, while the batch remains uncommitted until every approval is decided. Approval-gated tools must be mounted by the agent with `useTool()`; ephemeral per-call tools are rejected because durable recovery cannot reconstruct them.
+- `approval` — set `{ required: true }` to require a durable host decision before `run` is entered. `expiresInMs` sets an optional proposal deadline, and `presentation` carries optional UI text. Approval waiting is parked durable work: the model does not receive a placeholder tool result and does not continue to another turn. In a mixed batch, non-approval tools may finish, while the batch remains uncommitted until every approval is decided. Approval-gated tools must be mounted by the agent with `useTool()`; ephemeral per-call tools are rejected because durable recovery cannot reconstruct them. `escalation` names the tool's [escalation group](/docs/guide/tools/#approve-a-group-of-tools-once); the render that mounts the tool must declare it with [`useToolEscalation()`](/docs/reference/agent-hooks-api/#usetoolescalation).
 - `harness`, `durable` — capability flags, detailed below. Must be booleans when present.
 - `timeoutMs` — an optional positive finite bound on one call's execution, in milliseconds, starting when execution begins and excluding approval waiting. On expiry the harness aborts the tool's `context.signal` and settles the call with a `ToolTimeoutError` (a tool error the model sees, so the conversation continues); the submission's durability timeout remains the outer backstop. See [Bounded tools](/docs/guide/tools/#bounded-tools).
 - `annotations` — optional MCP-compatible tool hints: `title`, `readOnlyHint`, `destructiveHint`, `idempotentHint`, and `openWorldHint`. [`createMcpConnection()`](#createmcpconnection) copies these from each server `tools/list` entry; wrappers can preserve them and application code can use them when deciding whether a call needs approval. The runtime does not alter execution from these hints. Treat them as untrusted unless you trust the MCP server that supplied them.
@@ -721,6 +764,7 @@ interface McpApprovalPolicy {
   required: true;
   tools?: string[]; // the server's own names; omit to gate every mounted tool
   expiresInMs?: number;
+  escalation?: string; // escalation group for every gated tool
 }
 
 interface McpConnectionDefinition {
@@ -752,7 +796,7 @@ One MCP server, as `defineMcpConnection(...)`, `useMcpConnection(...)`, and [`cr
 - `resetTimeoutOnProgress` — reset the per-request timeout whenever the server sends a progress notification. Default `false`.
 - `tools` — allowlist of tools to adapt, by the server's own tool names, in this order. Unknown, repeated, and task-required names reject the connection.
 - `optional` — let the agent run without this server when it fails to resolve. Default `false`: a failed connection fails the submission before the model runs. With `optional: true`, any resolve failure mounts zero tools for the submission instead — announced to the model as a [`resources` signal](#dynamic-resources) and to observers as a `log`-level warning event — and the next submission retries.
-- `approval` — require a durable host decision before a gated tool calls the server, with the same parking, decision, and recovery semantics as a [`defineTool()`](#definetool) `approval`. `required` must be `true`. `tools` names the gated tools by the server's own names; omitted, every mounted tool is gated, including tools the server adds later. A name that is not mounted rejects the connection. `expiresInMs` sets each gated call's proposal deadline. Approval-gated execution currently requires the Cloudflare target. See [Require approval for MCP tools](/docs/guide/mcp/#require-approval-for-mcp-tools).
+- `approval` — require a durable host decision before a gated tool calls the server, with the same parking, decision, and recovery semantics as a [`defineTool()`](#definetool) `approval`. `required` must be `true`. `tools` names the gated tools by the server's own names; omitted, every mounted tool is gated, including tools the server adds later. A name that is not mounted rejects the connection. `expiresInMs` sets each gated call's proposal deadline. `escalation` puts every gated tool in one escalation group, which the render declares with [`useToolEscalation()`](/docs/reference/agent-hooks-api/#usetoolescalation). Approval-gated execution currently requires the Cloudflare target. See [Require approval for MCP tools](/docs/guide/mcp/#require-approval-for-mcp-tools).
 - Unknown fields throw; so do malformed values, with the offending field named.
 
 ## `createMcpConnection()`

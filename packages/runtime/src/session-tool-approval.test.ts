@@ -544,6 +544,7 @@ describe('MCP approval proposal recovery', () => {
 			conversationId: 'conversation-1',
 			name: 'default',
 			ensureApprovalRequestedRecord: vi.fn(async () => {}),
+			toolApprovalEscalationField: () => ({}),
 		};
 		const recreateMissingToolApproval = Reflect.get(
 			Session.prototype,

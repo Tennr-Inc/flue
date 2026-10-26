@@ -45,6 +45,12 @@ export interface McpApprovalPolicy {
 	readonly tools?: readonly string[];
 	/** Optional deadline for each gated call's proposal, in milliseconds. */
 	readonly expiresInMs?: number;
+	/**
+	 * Escalation group for every tool this policy gates. The render must
+	 * declare it with `useToolEscalation()`. A connection whose tools belong to
+	 * two groups is two connection definitions.
+	 */
+	readonly escalation?: string;
 }
 
 /**
