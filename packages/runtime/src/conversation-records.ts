@@ -3,9 +3,12 @@ import type { ResourceSnapshot } from './resources.ts';
 import { generateEntryId, generateRecordId } from './runtime/ids.ts';
 import type {
 	ToolApproval,
+	ToolApprovalDecidedVia,
 	ToolApprovalDecisionStatus,
+	ToolApprovalEscalation,
 	ToolApprovalPresentation,
 } from './tool-approval.ts';
+import type { StoredToolEscalationGrant } from './tool-escalation.ts';
 import type { PromptUsage, ThinkingLevel } from './types.ts';
 
 interface ConversationRecordEnvelope {
@@ -288,6 +291,8 @@ export interface ToolApprovalRequestedRecord extends ConversationRecordEnvelope 
 	expiresAt?: number;
 	/** Frozen definition-level UI hints for durable public reconstruction. */
 	presentation?: ToolApprovalPresentation;
+	/** The escalation group the call belongs to, when it has one. */
+	escalation?: ToolApprovalEscalation;
 }
 
 export interface ToolApprovalDecidedRecord extends ConversationRecordEnvelope {
@@ -302,6 +307,34 @@ export interface ToolApprovalDecidedRecord extends ConversationRecordEnvelope {
 	status: ToolApprovalDecisionStatus;
 	/** Exact durable approval-row decision time. Older records fall back to the envelope timestamp. */
 	decidedAt?: number;
+	reason?: string;
+	/** Who decided. Absent for decisions made on abort, expiry, or failure, and on older records. */
+	decidedVia?: ToolApprovalDecidedVia;
+}
+
+/**
+ * A host approval escalated its group for the agent instance. Written to the
+ * conversation of the approval that created the grant; operational, like the
+ * approval records — the execution store's grant row is authoritative.
+ */
+export interface ToolEscalationGrantedRecord extends ConversationRecordEnvelope {
+	type: 'tool_escalation_granted';
+	group: string;
+	/** The approval whose decision created the grant. */
+	proposalId: string;
+	grantedAt: number;
+	expiresAt?: number;
+	actor?: string;
+}
+
+/** A grant was revoked. Written to the same conversation as its grant record. */
+export interface ToolEscalationRevokedRecord extends ConversationRecordEnvelope {
+	type: 'tool_escalation_revoked';
+	group: string;
+	/** The approval that created the revoked grant. */
+	proposalId: string;
+	revokedAt: number;
+	actor?: string;
 	reason?: string;
 }
 
@@ -330,6 +363,7 @@ export function toolApprovalRequestedRecord(approval: ToolApproval): ToolApprova
 		requestedAt: approval.requestedAt,
 		...(approval.expiresAt !== undefined ? { expiresAt: approval.expiresAt } : {}),
 		...(approval.presentation !== undefined ? { presentation: approval.presentation } : {}),
+		...(approval.escalation !== undefined ? { escalation: approval.escalation } : {}),
 	};
 }
 
@@ -349,6 +383,55 @@ export function toolApprovalDecisionRecord(approval: ToolApproval): ToolApproval
 		status: approval.status,
 		decidedAt: approval.decidedAt,
 		...(approval.reason !== undefined ? { reason: approval.reason } : {}),
+		...(approval.decidedVia !== undefined ? { decidedVia: approval.decidedVia } : {}),
+	};
+}
+
+/**
+ * Escalation records are built from the immutable grant row and the approval
+ * that created it, so the coordinator's projection and its repair pass write
+ * byte-identical records.
+ */
+export function toolEscalationGrantedRecord(
+	approval: ToolApproval,
+	grant: StoredToolEscalationGrant,
+): ToolEscalationGrantedRecord {
+	return {
+		v: 1,
+		id: `record_tool_escalation_granted_${encodeCanonicalId(grant.proposalId)}`,
+		type: 'tool_escalation_granted',
+		conversationId: approval.conversationId,
+		harness: approval.harness,
+		session: approval.session,
+		timestamp: new Date(grant.grantedAt).toISOString(),
+		group: grant.group,
+		proposalId: grant.proposalId,
+		grantedAt: grant.grantedAt,
+		...(grant.expiresAt !== undefined ? { expiresAt: grant.expiresAt } : {}),
+		...(grant.actor !== undefined ? { actor: grant.actor } : {}),
+	};
+}
+
+export function toolEscalationRevokedRecord(
+	approval: ToolApproval,
+	grant: StoredToolEscalationGrant,
+): ToolEscalationRevokedRecord {
+	if (grant.revokedAt === undefined) {
+		throw new Error('[flue] An active tool escalation grant has no revocation record.');
+	}
+	return {
+		v: 1,
+		id: `record_tool_escalation_revoked_${encodeCanonicalId(grant.proposalId)}`,
+		type: 'tool_escalation_revoked',
+		conversationId: approval.conversationId,
+		harness: approval.harness,
+		session: approval.session,
+		timestamp: new Date(grant.revokedAt).toISOString(),
+		group: grant.group,
+		proposalId: grant.proposalId,
+		revokedAt: grant.revokedAt,
+		...(grant.revokedBy !== undefined ? { actor: grant.revokedBy } : {}),
+		...(grant.revokeReason !== undefined ? { reason: grant.revokeReason } : {}),
 	};
 }
 
@@ -566,6 +649,8 @@ export type ConversationRecord =
 	| ToolApprovalRequestedRecord
 	| ToolApprovalDecidedRecord
 	| ToolApprovalExecutionStartedRecord
+	| ToolEscalationGrantedRecord
+	| ToolEscalationRevokedRecord
 	| CompactionRecord
 	| ChildSessionRetainedRecord
 	| SubmissionSettledRecord

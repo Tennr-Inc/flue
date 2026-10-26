@@ -193,6 +193,41 @@ describe('public tool approval projection', () => {
 		});
 	});
 
+	it('projects the escalation group and decision source, and ignores grant records', () => {
+		const grouped = {
+			...requested,
+			escalation: { group: 'payments', expiresInMs: 60_000 },
+		} satisfies ConversationRecord;
+		const escalated = {
+			...decided,
+			decidedVia: { kind: 'escalation', grantProposalId: 'approval-0', actor: 'U123' },
+		} satisfies ConversationRecord;
+		const granted = {
+			...envelope('tool_escalation_granted', 'record-grant-0', '2026-09-03T12:00:30.000Z'),
+			group: 'payments',
+			proposalId: 'approval-0',
+			grantedAt: 1_788_437_430_000,
+			actor: 'U123',
+		} satisfies ConversationRecord;
+		const state = reduceConversationRecords(
+			createReducedInstanceState(),
+			[created, granted, grouped, escalated],
+			'3',
+		);
+
+		expect(projectAgentConversationSnapshot(state)?.toolApprovals).toEqual([
+			expect.objectContaining({
+				proposalId: 'approval-1',
+				status: 'approved',
+				escalation: { group: 'payments', expiresInMs: 60_000 },
+				decidedVia: { kind: 'escalation', grantProposalId: 'approval-0', actor: 'U123' },
+			}),
+		]);
+		expect(projectAgentConversationBatch({ state, records: [granted], batchOrdinal: 4 })).toEqual(
+			[],
+		);
+	});
+
 	it('projects approval changes as legacy-compatible snapshot resets', () => {
 		const initial = reduceConversationRecords(createReducedInstanceState(), [created], '0');
 		const pending = reduceConversationRecords(initial, [requested], '1');

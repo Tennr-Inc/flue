@@ -145,6 +145,31 @@ Mount a model-callable tool for the current render. Accepts a [`defineTool(...)`
 - Duplicate tool names across the whole render throw `ToolNameConflictError`.
 - Invalid definitions throw at mount with the same messages as `defineTool()`.
 
+## `useToolEscalation()`
+
+```ts
+function useToolEscalation(
+  group: string,
+  options?: {
+    mode?: 'ask' | 'granted' | 'denied'; // default 'ask'
+    expiresInMs?: number; // grant lifetime from the approval that creates it
+    presentation?: { title?: string; description?: string };
+  },
+): ToolEscalationState;
+
+interface ToolEscalationState {
+  group: string;
+  mode: 'ask' | 'granted' | 'denied';
+  grant: ToolEscalationGrant | null; // active (unexpired, unrevoked) grant
+}
+```
+
+Declare an escalation group for this render and read its state. Approval-gated tools join a group with `approval: { required: true, escalation: '<group>' }` (or `approval.escalation` on an MCP connection). A host approval of a grouped call grants the group to the agent instance, and later calls in it are approved by Flue without asking; see [Approve a group of tools once](/docs/guide/tools/#approve-a-group-of-tools-once).
+
+- `mode` is read from the render that produced each call: `granted` approves and `denied` rejects every call in the group without asking anyone; `ask` waits for a grant. A new mode applies to later calls only.
+- The returned state is a render-time snapshot, like `usePersistentState`; grants are re-read before every re-render.
+- Group names match `/^[a-z0-9][a-z0-9_-]{0,63}$/`. Declaring a group twice in one render throws, and so does mounting a tool (including an MCP-adapted tool) whose group the render did not declare. Subagent renders throw.
+
 ## `useMcpConnection()`
 
 ```ts
@@ -155,7 +180,7 @@ Declare a remote MCP server whose tools this agent uses. Accepts an [`McpConnect
 
 - Definitions are read once per submission at initialization. A conditional declaration takes effect on the next submission, narrated as a [`resources` signal](/docs/reference/agent-api/#dynamic-resources).
 - Connections are reused for the instance's in-memory lifetime; definitions are read at first connect (`auth` excepted — resolved per request). A failed connect fails the submission before the model runs and is never cached — unless the definition sets `optional: true`, which mounts zero tools for the submission and announces the gap to the model instead (see [`McpConnectionDefinition`](/docs/reference/agent-api/#mcpconnectiondefinition)).
-- `approval` parks gated calls on a durable host decision, like a `defineTool()` approval; see [`McpConnectionDefinition`](/docs/reference/agent-api/#mcpconnectiondefinition).
+- `approval` parks gated calls on a durable host decision, like a `defineTool()` approval; see [`McpConnectionDefinition`](/docs/reference/agent-api/#mcpconnectiondefinition). `approval.escalation` names the gated tools' escalation group, which the render declares with [`useToolEscalation()`](#usetoolescalation).
 - Duplicate server names in one render throw. Subagent renders throw — declare the connection on the root agent.
 
 ## `useSkill()`

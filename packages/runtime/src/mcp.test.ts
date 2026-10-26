@@ -135,7 +135,13 @@ describe('MCP tool approval', () => {
 		tools: Tool[],
 		selection: Parameters<typeof createMcpConnectionWithClient>[4],
 	) {
-		return createMcpConnectionWithClient('linear', stubClient(tools), {} as Transport, {}, selection);
+		return createMcpConnectionWithClient(
+			'linear',
+			stubClient(tools),
+			{} as Transport,
+			{},
+			selection,
+		);
 	}
 
 	it('gates every mounted tool when the policy names none', async () => {
@@ -218,10 +224,16 @@ describe('MCP tool approval', () => {
 			},
 		};
 		await expect(
-			createMcpConnectionWithClient('linear', client, {} as Transport, {}, {
-				tools: ['search_issues'],
-				approval: { required: true, tools: ['create_issue'] },
-			}),
+			createMcpConnectionWithClient(
+				'linear',
+				client,
+				{} as Transport,
+				{},
+				{
+					tools: ['search_issues'],
+					approval: { required: true, tools: ['create_issue'] },
+				},
+			),
 		).rejects.toThrow(/approval names "create_issue", which is not mounted/);
 		expect(closed).toBe(true);
 	});
@@ -251,5 +263,21 @@ describe('MCP tool approval', () => {
 		expect(() => invalid({ required: true, expiresInMs: 0 })).toThrow(
 			/approval expiresInMs must be a positive number/,
 		);
+		expect(() => invalid({ required: true, escalation: 'Notion Edit' })).toThrow(
+			/approval escalation must be an escalation group name/,
+		);
+	});
+
+	it('puts every gated tool in the policy escalation group', async () => {
+		const connection = await connect([createIssue, searchIssues], {
+			approval: { required: true, tools: ['create_issue'], escalation: 'linear-write' },
+		});
+		const [create, search] = connection.tools;
+		expect(create?.approval).toEqual({
+			required: true,
+			escalation: 'linear-write',
+			presentation: { title: 'Create issue' },
+		});
+		expect(search?.approval).toBeUndefined();
 	});
 });

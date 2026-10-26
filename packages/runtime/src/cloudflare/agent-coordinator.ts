@@ -5,6 +5,8 @@ import {
 	type ConversationRecord,
 	toolApprovalDecisionRecord,
 	toolApprovalRequestedRecord,
+	toolEscalationGrantedRecord,
+	toolEscalationRevokedRecord,
 } from '../conversation-records.ts';
 import { ConversationRecordWriter } from '../conversation-writer.ts';
 import {
@@ -45,7 +47,11 @@ import {
 	createCoordinatorEventEmitter,
 	drainGlobalEventDeliveries,
 } from '../runtime/events.ts';
-import type { ToolApprovalResolutionInput } from '../runtime/flue-app.ts';
+import type {
+	ToolApprovalResolutionInput,
+	ToolEscalationRevocationInput,
+	ToolEscalationTarget,
+} from '../runtime/flue-app.ts';
 import { assertAgentDispatchAdmissionInput, handleAgentRequest } from '../runtime/handle-agent.ts';
 import {
 	handleAgentAttachmentRead,
@@ -55,9 +61,13 @@ import {
 import { generateAttemptId, isKeyDerivedSubmissionId } from '../runtime/ids.ts';
 import { resolveAgentIdentity } from '../runtime/registration.ts';
 import { agentStreamPath } from '../runtime/stream-offsets.ts';
-import { getToolApprovalProvider } from '../runtime/tool-approval-provider.ts';
+import {
+	getToolApprovalProvider,
+	notifyToolApprovalDecided,
+} from '../runtime/tool-approval-provider.ts';
 import { createSessionStorageKey } from '../session-identity.ts';
-import type { ToolApproval } from '../tool-approval.ts';
+import type { ToolApproval, ToolEscalationGrant } from '../tool-approval.ts';
+import type { StoredToolEscalationGrant } from '../tool-escalation.ts';
 import type { Agent, DeliveredMessage } from '../types.ts';
 import {
 	createSqlAgentExecutionStore,
@@ -67,6 +77,9 @@ import {
 export const CLOUDFLARE_AGENT_INTERNAL_DISPATCH_PATH = '/__flue/internal/dispatch';
 export const CLOUDFLARE_AGENT_INTERNAL_INSTANCE_INFO_PATH = '/__flue/internal/instance-info';
 export const CLOUDFLARE_AGENT_INTERNAL_APPROVAL_PATH = '/__flue/internal/tool-approval';
+export const CLOUDFLARE_AGENT_INTERNAL_ESCALATIONS_PATH = '/__flue/internal/tool-escalations';
+export const CLOUDFLARE_AGENT_INTERNAL_ESCALATION_REVOKE_PATH =
+	'/__flue/internal/tool-escalations/revoke';
 
 const FLUE_AGENT_SUBMISSION_WAKE_CALLBACK = '__flueWakeAgentSubmissions';
 const FLUE_AGENT_SUBMISSION_WAKE_SECONDS = 30;
@@ -223,6 +236,14 @@ export interface CloudflareAgentRuntime {
 		instance: CloudflareAgentInstance,
 		input: ToolApprovalResolutionInput,
 	): Promise<ToolApproval>;
+	listToolEscalations(
+		instance: CloudflareAgentInstance,
+		input: ToolEscalationTarget,
+	): Promise<ToolEscalationGrant[]>;
+	revokeToolEscalation(
+		instance: CloudflareAgentInstance,
+		input: ToolEscalationRevocationInput,
+	): Promise<{ revoked: boolean }>;
 	onFiberRecovered(
 		instance: CloudflareAgentInstance,
 		ctx: CloudflareAgentRecoveredFiberContext,
@@ -278,6 +299,12 @@ export function createCloudflareAgentRuntime(
 		},
 		resolveToolApproval(instance, input) {
 			return getCoordinator(instance).resolveToolApproval(input);
+		},
+		listToolEscalations(instance, input) {
+			return getCoordinator(instance).listToolEscalations(input);
+		},
+		revokeToolEscalation(instance, input) {
+			return getCoordinator(instance).revokeToolEscalation(input);
 		},
 		onFiberRecovered(instance, ctx, inherited) {
 			return getCoordinator(instance).onFiberRecovered(ctx, inherited);
@@ -518,7 +545,15 @@ class CloudflareAgentCoordinator {
 		if (targetAgent !== input.agent || targetId !== input.id || existing.instanceId !== input.id) {
 			throw new Error('[flue] Tool approval target does not match the persisted proposal.');
 		}
-		const result = await decide.call(this.submissions, input);
+		const result = await decide.call(this.submissions, {
+			proposalId: input.proposalId,
+			status: input.status,
+			via: 'host',
+			...(input.reason === undefined ? {} : { reason: input.reason }),
+			...(input.escalate === undefined ? {} : { escalate: input.escalate }),
+			...(input.actor === undefined ? {} : { actor: input.actor }),
+		});
+		const escalated = result.escalated ?? [];
 		const drainArm = this.armDrain();
 		// The approval table is authoritative, but public history/updates are
 		// projected from canonical conversation records. Persist the decision
@@ -527,6 +562,8 @@ class CloudflareAgentCoordinator {
 		// this append.
 		try {
 			await this.repairToolApprovalRecords(result.approval);
+			if (result.grant) await this.repairToolEscalationRecords(result.grant);
+			for (const { approval } of escalated) await this.repairToolApprovalRecords(approval);
 		} finally {
 			// Schedule the durable wake even if the public record append fails. A
 			// retry/reconcile pass can repair projection without leaving an approved
@@ -534,24 +571,86 @@ class CloudflareAgentCoordinator {
 			await drainArm;
 		}
 		if (result.decisionApplied) {
+			this.emitApprovalDecided(result.approval);
+		}
+		if (result.grant) {
 			this.emitCoordinatorEvent({
-				type: 'tool_approval_decided',
-				proposalId: result.approval.proposalId,
-				toolName: result.approval.toolName,
-				toolCallId: result.approval.toolCallId,
-				status: result.approval.status === 'pending' ? 'canceled' : result.approval.status,
-				reason: result.approval.reason,
+				type: 'tool_escalation_granted',
+				group: result.grant.group,
+				proposalId: result.grant.proposalId,
+				...(result.grant.expiresAt === undefined ? {} : { expiresAt: result.grant.expiresAt }),
+				...(result.grant.actor === undefined ? {} : { actor: result.grant.actor }),
 			});
 		}
 		if (result.decisionApplied && result.resumed) {
-			this.emitCoordinatorEvent({
-				type: 'tool_approval_resumed',
-				proposalId: result.approval.proposalId,
-				toolName: result.approval.toolName,
-				toolCallId: result.approval.toolCallId,
-			});
+			this.emitApprovalResumed(result.approval);
+		}
+		for (const { approval, resumed } of escalated) {
+			this.emitApprovalDecided(approval);
+			if (resumed) this.emitApprovalResumed(approval);
+			notifyToolApprovalDecided(approval, (error) =>
+				console.error('[flue:tool-approval] Host decision notification failed.', error),
+			);
 		}
 		return result.approval;
+	}
+
+	async listToolEscalations(input: ToolEscalationTarget): Promise<ToolEscalationGrant[]> {
+		if (input.agent !== this.agentName || input.id !== this.instance.name) {
+			throw new Error('[flue] Tool escalation target does not match this agent instance.');
+		}
+		const list = this.submissions.listToolEscalationGrants;
+		if (!list) {
+			throw new Error('[flue] The configured persistence adapter does not support tool approvals.');
+		}
+		return list.call(this.submissions);
+	}
+
+	async revokeToolEscalation(input: ToolEscalationRevocationInput): Promise<{ revoked: boolean }> {
+		if (input.agent !== this.agentName || input.id !== this.instance.name) {
+			throw new Error('[flue] Tool escalation target does not match this agent instance.');
+		}
+		const revoke = this.submissions.revokeToolEscalation;
+		if (!revoke) {
+			throw new Error('[flue] The configured persistence adapter does not support tool approvals.');
+		}
+		const revoked = await revoke.call(this.submissions, {
+			group: input.group,
+			...(input.actor === undefined ? {} : { actor: input.actor }),
+			...(input.reason === undefined ? {} : { reason: input.reason }),
+		});
+		for (const grant of revoked) {
+			await this.repairToolEscalationRecords(grant);
+			this.emitCoordinatorEvent({
+				type: 'tool_escalation_revoked',
+				group: grant.group,
+				proposalId: grant.proposalId,
+				...(grant.revokedBy === undefined ? {} : { actor: grant.revokedBy }),
+				...(grant.revokeReason === undefined ? {} : { reason: grant.revokeReason }),
+			});
+		}
+		return { revoked: revoked.length > 0 };
+	}
+
+	private emitApprovalDecided(approval: ToolApproval): void {
+		this.emitCoordinatorEvent({
+			type: 'tool_approval_decided',
+			proposalId: approval.proposalId,
+			toolName: approval.toolName,
+			toolCallId: approval.toolCallId,
+			status: approval.status === 'pending' ? 'canceled' : approval.status,
+			reason: approval.reason,
+			...(approval.decidedVia ? { via: approval.decidedVia.kind } : {}),
+		});
+	}
+
+	private emitApprovalResumed(approval: ToolApproval): void {
+		this.emitCoordinatorEvent({
+			type: 'tool_approval_resumed',
+			proposalId: approval.proposalId,
+			toolName: approval.toolName,
+			toolCallId: approval.toolCallId,
+		});
 	}
 
 	async onAlarm(inherited: () => Promise<unknown> | unknown): Promise<unknown> {
@@ -563,14 +662,17 @@ class CloudflareAgentCoordinator {
 		if (isInternalInstanceInfoRequest(request)) return this.instanceInfo();
 		if (isInternalApprovalRequest(request)) {
 			const input = (await request.json()) as ToolApprovalResolutionInput;
-			try {
-				return Response.json(await this.resolveToolApproval(input));
-			} catch (error) {
-				return Response.json(
-					{ error: error instanceof Error ? error.message : String(error) },
-					{ status: 400 },
-				);
-			}
+			return internalApprovalResponse(() => this.resolveToolApproval(input));
+		}
+		if (isInternalEscalationsRequest(request)) {
+			const input = (await request.json()) as ToolEscalationTarget;
+			return internalApprovalResponse(async () => ({
+				grants: await this.listToolEscalations(input),
+			}));
+		}
+		if (isInternalEscalationRevokeRequest(request)) {
+			const input = (await request.json()) as ToolEscalationRevocationInput;
+			return internalApprovalResponse(() => this.revokeToolEscalation(input));
 		}
 
 		if (isAbortRequest(request, this.agentName, this.instance.name)) {
@@ -777,7 +879,9 @@ class CloudflareAgentCoordinator {
 
 	private async hasToolApprovalProjectionWork(): Promise<boolean> {
 		const list = this.submissions.listToolApprovalProjectionWork;
-		return list ? (await list.call(this.submissions)).length > 0 : false;
+		if (list && (await list.call(this.submissions)).length > 0) return true;
+		const listEscalations = this.submissions.listToolEscalationProjectionWork;
+		return listEscalations ? (await listEscalations.call(this.submissions)).length > 0 : false;
 	}
 
 	/**
@@ -1013,12 +1117,49 @@ class CloudflareAgentCoordinator {
 	/** Repair canonical projections even after their submission has settled. */
 	private async reconcileToolApprovalProjection(): Promise<void> {
 		const list = this.submissions.listToolApprovalProjectionWork;
-		if (!list) return;
-		for (const work of await list.call(this.submissions)) {
-			if (!work.requestProjected) await this.ensureToolApprovalRequestedRecord(work.approval);
-			if (!work.decisionProjected && work.approval.status !== 'pending') {
-				await this.ensureToolApprovalDecisionRecord(work.approval);
+		if (list) {
+			for (const work of await list.call(this.submissions)) {
+				if (!work.requestProjected) await this.ensureToolApprovalRequestedRecord(work.approval);
+				if (!work.decisionProjected && work.approval.status !== 'pending') {
+					await this.ensureToolApprovalDecisionRecord(work.approval);
+				}
 			}
+		}
+		const listEscalations = this.submissions.listToolEscalationProjectionWork;
+		if (listEscalations) {
+			for (const work of await listEscalations.call(this.submissions)) {
+				await this.ensureToolEscalationRecords(work.grant);
+			}
+		}
+	}
+
+	/**
+	 * Project a grant (and its revocation, once revoked) into the conversation
+	 * of the approval that created it. Deterministic like the approval records.
+	 */
+	private async ensureToolEscalationRecords(grant: StoredToolEscalationGrant): Promise<void> {
+		const approval = await this.submissions.getToolApproval?.(grant.proposalId);
+		if (!approval) {
+			throw new Error(
+				`[flue] Tool escalation grant "${grant.proposalId}" has no approval to project into.`,
+			);
+		}
+		const writer = await this.ensureConversationWriter();
+		const granted = toolEscalationGrantedRecord(approval, grant);
+		if (!(await writer.hasRecord(granted.id))) await writer.append([granted]);
+		await this.submissions.markToolEscalationProjected?.(grant.proposalId, 'granted');
+		if (grant.revokedAt === undefined) return;
+		const revoked = toolEscalationRevokedRecord(approval, grant);
+		if (!(await writer.hasRecord(revoked.id))) await writer.append([revoked]);
+		await this.submissions.markToolEscalationProjected?.(grant.proposalId, 'revoked');
+	}
+
+	/** Like {@link repairToolApprovalRecords}: the grant row is the repair source. */
+	private async repairToolEscalationRecords(grant: StoredToolEscalationGrant): Promise<void> {
+		try {
+			await this.ensureToolEscalationRecords(grant);
+		} catch (error) {
+			console.error('[flue:tool-approval] Deferred canonical escalation projection.', error);
 		}
 	}
 
@@ -1705,6 +1846,32 @@ function isInternalApprovalRequest(request: Request): boolean {
 		request.method === 'POST' &&
 		isBindingOnlyInternalUrl(request, CLOUDFLARE_AGENT_INTERNAL_APPROVAL_PATH)
 	);
+}
+
+function isInternalEscalationsRequest(request: Request): boolean {
+	return (
+		request.method === 'POST' &&
+		isBindingOnlyInternalUrl(request, CLOUDFLARE_AGENT_INTERNAL_ESCALATIONS_PATH)
+	);
+}
+
+function isInternalEscalationRevokeRequest(request: Request): boolean {
+	return (
+		request.method === 'POST' &&
+		isBindingOnlyInternalUrl(request, CLOUDFLARE_AGENT_INTERNAL_ESCALATION_REVOKE_PATH)
+	);
+}
+
+/** Internal approval-surface failures cross the binding as 400 with the message. */
+async function internalApprovalResponse(run: () => Promise<unknown>): Promise<Response> {
+	try {
+		return Response.json(await run());
+	} catch (error) {
+		return Response.json(
+			{ error: error instanceof Error ? error.message : String(error) },
+			{ status: 400 },
+		);
+	}
 }
 
 export function isBindingOnlyInternalUrl(request: Request, pathname: string): boolean {

@@ -29,6 +29,11 @@ import type {
 	SessionResourceRuntime,
 } from './session.ts';
 import { getPreparedToolAdapter } from './tool-adapter.ts';
+import {
+	assertToolEscalationsDeclared,
+	indexToolEscalationGrants,
+	type ToolEscalationDeclaration,
+} from './tool-escalation.ts';
 import type {
 	Agent,
 	AgentConfig,
@@ -323,6 +328,11 @@ async function initializeRootHarness(
 	const initialData = reduced.initialData.value;
 	const hookState = createHookStateBuffer(reduced.state);
 	const outputChannel = createAgentOutputChannel();
+	// `useToolEscalation()` reads active grants as a render-time snapshot; the
+	// session refreshes them before every re-render.
+	const store = config.submissionStore;
+	const loadToolEscalationGrants = async () =>
+		indexToolEscalationGrants((await store?.listToolEscalationGrants?.call(store)) ?? []);
 	// The delivery is a CURSOR over the messages put in front of the model:
 	// it starts as the waking delivery and the session advances it when a
 	// delivery joins the live response or a lifecycle callback appends a
@@ -335,6 +345,7 @@ async function initializeRootHarness(
 		instanceId: config.id,
 		...(config.agentName === undefined ? {} : { agentName: config.agentName }),
 		initialData,
+		toolEscalationGrants: await loadToolEscalationGrants(),
 	};
 	const first = renderAgentFunctionWithStructure(agent, renderState);
 	// The render composes the whole config: hooks validated every value when
@@ -366,6 +377,10 @@ async function initializeRootHarness(
 			resolveMcpTools(config, definition.mcpConnections),
 			resolveSandbox(config.id, definition.sandbox),
 		]);
+	// The render validated its own tools' groups; MCP tools join after it.
+	const initialToolEscalations: ReadonlyMap<string, ToolEscalationDeclaration> =
+		definition.toolEscalations ?? new Map();
+	assertToolEscalationsDeclared(mcpTools, initialToolEscalations);
 	for (const entry of mcpUnavailable) {
 		emitEvent({
 			type: 'log',
@@ -468,6 +483,8 @@ async function initializeRootHarness(
 		const next = renderAgentFunctionWithStructure(agent, renderState);
 		assertRenderStructureInvariance(lastStructure, next.structure);
 		lastStructure = next.structure;
+		const toolEscalations = next.config.toolEscalations ?? new Map();
+		assertToolEscalationsDeclared(mcpTools, toolEscalations);
 		return {
 			// `promptContext` is read at call time: frozen across environment
 			// swaps, refreshed by the compaction rebaseline's rediscover.
@@ -477,6 +494,7 @@ async function initializeRootHarness(
 			resources: renderedResources(next),
 			sandbox: next.config.sandbox,
 			cwd: next.config.cwd,
+			toolEscalations,
 		};
 	};
 	const resourceRuntime: SessionResourceRuntime = {
@@ -513,6 +531,12 @@ async function initializeRootHarness(
 		resources: resourceRuntime,
 		envSlot,
 		envRuntime,
+		toolEscalations: {
+			initial: initialToolEscalations,
+			refreshGrants: async () => {
+				renderState.toolEscalationGrants = await loadToolEscalationGrants();
+			},
+		},
 	});
 }
 

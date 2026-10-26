@@ -75,6 +75,7 @@ export { type UseSandboxOptions, useSandbox } from './hooks/use-sandbox.ts';
 export { useSkill } from './hooks/use-skill.ts';
 export { defineSubagent, GeneralSubagent, useSubagent } from './hooks/use-subagent.ts';
 export { useTool } from './hooks/use-tool.ts';
+export { useToolEscalation } from './hooks/use-tool-escalation.ts';
 export { type FlueInstrumentation, instrument } from './instrumentation.ts';
 export type { JsonValue } from './json-snapshot.ts';
 export type {
@@ -105,8 +106,12 @@ export {
 	type AgentInstanceInfo,
 	dispatch,
 	getAgentInstance,
+	getToolEscalations,
 	resolveToolApproval,
+	revokeToolEscalation,
 	type ToolApprovalResolutionInput,
+	type ToolEscalationRevocationInput,
+	type ToolEscalationTarget,
 } from './runtime/flue-app.ts';
 export { isDynamicModel, setProvider } from './runtime/providers.ts';
 export type { AgentIdentityBinding } from './runtime/registration.ts';
@@ -126,13 +131,19 @@ export { defineSkill } from './skill-definition.ts';
 export { defineTool } from './tool.ts';
 export type {
 	ToolApproval,
+	ToolApprovalDecidedVia,
 	ToolApprovalDecision,
 	ToolApprovalDecisionStatus,
+	ToolApprovalEscalation,
 	ToolApprovalPolicy,
 	ToolApprovalPresentation,
 	ToolApprovalProposal,
 	ToolApprovalProvider,
 	ToolApprovalStatus,
+	ToolEscalationGrant,
+	ToolEscalationMode,
+	ToolEscalationOptions,
+	ToolEscalationState,
 } from './tool-approval.ts';
 export { toolApprovalProposalId } from './tool-approval.ts';
 export type {

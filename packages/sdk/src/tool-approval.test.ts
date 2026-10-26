@@ -113,6 +113,72 @@ describe('resolveToolApproval', () => {
 	});
 });
 
+describe('tool escalations', () => {
+	function recordingClient(response: unknown) {
+		const requests: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
+		const client = createFlueClient({
+			url: 'https://example.test/agents/notion/conversation-1',
+			fetch: async (input, init) => {
+				requests.push({ input, init });
+				return Response.json(response);
+			},
+		});
+		return { client, requests };
+	}
+
+	it('sends the escalation choice and actor with a decision', async () => {
+		const { client, requests } = recordingClient({ ...approval, status: 'approved' });
+
+		await client.resolveToolApproval('approval-1', {
+			status: 'approved',
+			escalate: false,
+			actor: 'U123',
+		});
+
+		expect(requests[0]?.init?.body).toBe(
+			JSON.stringify({ status: 'approved', escalate: false, actor: 'U123' }),
+		);
+	});
+
+	it('reads the active grants', async () => {
+		const grant = {
+			group: 'notion-edit',
+			instanceId: 'conversation-1',
+			proposalId: 'approval-1',
+			grantedAt: 1_700_000_000_000,
+		};
+		const { client, requests } = recordingClient({ grants: [grant] });
+
+		await expect(client.toolEscalations()).resolves.toEqual([grant]);
+		expect(requests[0]?.input).toBe(
+			'https://example.test/agents/notion/conversation-1/tool-escalations',
+		);
+		expect(requests[0]?.init?.method).toBe('GET');
+	});
+
+	it('revokes a group with an optional actor and reason', async () => {
+		const { client, requests } = recordingClient({ revoked: true });
+
+		await expect(
+			client.revokeToolEscalation('notion-edit', { actor: 'U9', reason: 'done' }),
+		).resolves.toEqual({ revoked: true });
+		await client.revokeToolEscalation('notion-edit');
+
+		expect(requests.map(({ input, init }) => [input, init?.method, init?.body])).toEqual([
+			[
+				'https://example.test/agents/notion/conversation-1/tool-escalations/notion-edit',
+				'DELETE',
+				JSON.stringify({ actor: 'U9', reason: 'done' }),
+			],
+			[
+				'https://example.test/agents/notion/conversation-1/tool-escalations/notion-edit',
+				'DELETE',
+				undefined,
+			],
+		]);
+	});
+});
+
 describe('approval snapshot compatibility', () => {
 	it('normalizes a pre-approval server snapshot to an empty approval list', async () => {
 		const client = createFlueClient({

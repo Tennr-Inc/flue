@@ -184,6 +184,35 @@ export type FlueToolApprovalStatus =
 export type FlueToolApprovalDecisionStatus = Exclude<FlueToolApprovalStatus, 'pending'>;
 
 /**
+ * The escalation group of a grouped tool call. Approving the call grants the
+ * group to the agent instance (unless the decision passes `escalate: false`),
+ * and later calls in the group run without asking.
+ */
+export interface FlueToolApprovalEscalation {
+	group: string;
+	/** Lifetime a grant created by approving this call would get, in milliseconds. */
+	expiresInMs?: number;
+	presentation?: FlueToolApprovalPresentation;
+}
+
+/** Who decided a tool approval. */
+export type FlueToolApprovalDecidedVia =
+	| { kind: 'host'; actor?: string }
+	| { kind: 'escalation'; grantProposalId: string; actor?: string }
+	| { kind: 'mode'; mode: 'granted' | 'denied' };
+
+/** An active escalation grant on an agent instance. */
+export interface FlueToolEscalationGrant {
+	group: string;
+	instanceId: string;
+	/** The approval whose decision created the grant. */
+	proposalId: string;
+	grantedAt: number;
+	expiresAt?: number;
+	actor?: string;
+}
+
+/**
  * One durable request to approve a tool invocation before it can run.
  *
  * The proposal fields identify the exact assistant tool call; decision fields
@@ -200,9 +229,17 @@ export interface FlueToolApproval {
 	requestedAt: number;
 	expiresAt?: number;
 	presentation?: FlueToolApprovalPresentation;
+	/** Present when the call belongs to an escalation group. */
+	escalation?: FlueToolApprovalEscalation;
 	status: FlueToolApprovalStatus;
 	decidedAt?: number;
 	reason?: string;
+	/**
+	 * Who decided: the host, an active escalation grant, or the agent's
+	 * escalation mode. Absent while pending and for decisions made on abort,
+	 * expiry, or failure.
+	 */
+	decidedVia?: FlueToolApprovalDecidedVia;
 }
 
 /**

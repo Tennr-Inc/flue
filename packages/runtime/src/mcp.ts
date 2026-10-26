@@ -354,6 +354,7 @@ function createMcpToolApproval(tool: Tool, policy: McpApprovalPolicy): ToolAppro
 	return Object.freeze({
 		required: true,
 		...(policy.expiresInMs !== undefined ? { expiresInMs: policy.expiresInMs } : {}),
+		...(policy.escalation !== undefined ? { escalation: policy.escalation } : {}),
 		// Server-supplied text: a label for the approval UI, never a substitute
 		// for showing the tool name and arguments.
 		...(title ? { presentation: Object.freeze({ title }) } : {}),

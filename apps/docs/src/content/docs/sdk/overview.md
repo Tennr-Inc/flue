@@ -55,7 +55,8 @@ Every client method is a typed wrapper over one route of the conversation URL (s
 - `historyBefore()` — `GET <url>?view=history&before=<cursor>`; one page of older messages.
 - `observe()` — `history()` to hydrate, then the `updates` stream to stay live, with reconnection, rehydration, and duplicate-chunk suppression handled internally. Its snapshot includes `conversation.toolApprovals`.
 - `abort()` — `POST <url>/abort`.
-- `resolveToolApproval()` — `POST <url>/tool-approvals/<proposalId>` with `{ status, reason? }`; returns the durable approval row.
+- `resolveToolApproval()` — `POST <url>/tool-approvals/<proposalId>` with `{ status, reason?, escalate?, actor? }`; returns the durable approval row.
+- `toolEscalations()` and `revokeToolEscalation()` — read and revoke the instance's [escalation grants](/docs/guide/tools/#approve-a-group-of-tools-once).
 - `attachmentUrl()` — resolves `<url>/attachments/<attachmentId>` for one `file` part's bytes.
 
 Any HTTP client can call these routes directly — the wire protocol is documented in the [Streaming Protocol](/docs/reference/streaming-protocol/) reference. What the SDK adds is the typed contract plus the stream mechanics you would otherwise reimplement: offset-based resume, reconnection backoff, per-request header resolution, and at-least-once redelivery dedup.

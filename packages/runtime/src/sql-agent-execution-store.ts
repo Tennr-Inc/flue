@@ -27,6 +27,9 @@ import type {
 	SubmissionAttemptRef,
 	SubmissionClaimRef,
 	SubmissionSettlementObligation,
+	ToolApprovalDecisionInput,
+	ToolApprovalDecisionResult,
+	ToolEscalationProjectionWork,
 } from './agent-execution-store.ts';
 import {
 	DURABILITY_DEFAULT_MAX_ATTEMPTS,
@@ -55,9 +58,12 @@ import {
 } from './sql-persisted-chunk-store.ts';
 import type {
 	ToolApproval,
-	ToolApprovalDecisionStatus,
+	ToolApprovalDecidedVia,
 	ToolApprovalProposal,
+	ToolEscalationGrant,
 } from './tool-approval.ts';
+import { assertToolEscalationGroup } from './tool-approval.ts';
+import type { StoredToolEscalationGrant } from './tool-escalation.ts';
 
 export function ensureSqlAgentExecutionTables(
 	sql: SqlStorage,
@@ -69,7 +75,10 @@ export function ensureSqlAgentExecutionTables(
 		// runtime must still refuse to open the partially upgraded store.
 		if (options.toolApprovals) markFlueSqlDurableToolApprovalFormat(sql);
 		ensureSubmissionTable(sql, options.toolApprovals === true);
-		if (options.toolApprovals) ensureToolApprovalTable(sql);
+		if (options.toolApprovals) {
+			ensureToolApprovalTable(sql);
+			ensureToolEscalationGrantTable(sql);
+		}
 		ensureSqlSubmissionChunkTable(sql);
 	});
 }
@@ -104,12 +113,14 @@ export function createSqlAgentExecutionStoreFromSql(
 			store.claimToolApprovalNotificationImpl(proposalId, now),
 		completeToolApprovalNotification: (proposalId: string, now?: number) =>
 			store.completeToolApprovalNotificationImpl(proposalId, now),
-		decideToolApproval: (input: {
-			proposalId: string;
-			status: ToolApprovalDecisionStatus;
-			reason?: string;
-		}) => store.decideToolApprovalImpl(input),
+		decideToolApproval: (input: ToolApprovalDecisionInput) => store.decideToolApprovalImpl(input),
 		expireToolApprovals: (now?: number) => store.expireToolApprovalsImpl(now),
+		listToolEscalationGrants: (now?: number) => store.listToolEscalationGrantsImpl(now),
+		revokeToolEscalation: (input: { group: string; actor?: string; reason?: string }) =>
+			store.revokeToolEscalationImpl(input),
+		listToolEscalationProjectionWork: () => store.listToolEscalationProjectionWorkImpl(),
+		markToolEscalationProjected: (proposalId: string, projection: 'granted' | 'revoked') =>
+			store.markToolEscalationProjectedImpl(proposalId, projection),
 	});
 }
 
@@ -424,13 +435,14 @@ class AgentSubmissionStoreImpl implements AgentSubmissionStore {
 		return this.transactionSync(() => {
 			this.sql.exec(
 				`INSERT OR IGNORE INTO flue_tool_approvals
-				 (proposal_id, submission_id, status, proposal_json, requested_at, expires_at)
-				 VALUES (?, ?, 'pending', ?, ?, ?)`,
+				 (proposal_id, submission_id, status, proposal_json, requested_at, expires_at, escalation_group)
+				 VALUES (?, ?, 'pending', ?, ?, ?, ?)`,
 				proposal.proposalId,
 				proposal.submissionId,
 				proposalJson,
 				proposal.requestedAt,
 				proposal.expiresAt ?? null,
+				proposal.escalation?.group ?? null,
 			);
 			const row = this.sql
 				.exec(`SELECT * FROM flue_tool_approvals WHERE proposal_id = ?`, proposal.proposalId)
@@ -556,11 +568,9 @@ class AgentSubmissionStoreImpl implements AgentSubmissionStore {
 		);
 	}
 
-	async decideToolApprovalImpl(input: {
-		proposalId: string;
-		status: ToolApprovalDecisionStatus;
-		reason?: string;
-	}): Promise<{ approval: ToolApproval; decisionApplied: boolean; resumed: boolean }> {
+	async decideToolApprovalImpl(
+		input: ToolApprovalDecisionInput,
+	): Promise<ToolApprovalDecisionResult> {
 		if (
 			input.status !== 'approved' &&
 			input.status !== 'rejected' &&
@@ -573,60 +583,288 @@ class AgentSubmissionStoreImpl implements AgentSubmissionStore {
 		if (input.reason !== undefined && typeof input.reason !== 'string') {
 			throw new Error('[flue] Tool approval decision reason must be a string.');
 		}
+		if (input.actor !== undefined && typeof input.actor !== 'string') {
+			throw new Error('[flue] Tool approval decision actor must be a string.');
+		}
+		if (input.escalate !== undefined && typeof input.escalate !== 'boolean') {
+			throw new Error('[flue] Tool approval decision escalate must be a boolean.');
+		}
+		if (
+			input.via !== undefined &&
+			input.via !== 'host' &&
+			input.via !== 'escalation' &&
+			input.via !== 'mode'
+		) {
+			throw new Error('[flue] Tool approval decision source is invalid.');
+		}
+		if (input.via === 'escalation' && input.status !== 'approved') {
+			throw new Error('[flue] An escalation grant can only approve a tool call.');
+		}
+		if (input.via === 'mode' && input.status !== 'approved' && input.status !== 'rejected') {
+			throw new Error('[flue] An escalation mode can only approve or reject a tool call.');
+		}
 		return this.transactionSync(() => {
-			const before = this.sql
-				.exec(`SELECT * FROM flue_tool_approvals WHERE proposal_id = ?`, input.proposalId)
-				.toArray()[0];
-			if (!before) throw new Error(`[flue] Unknown tool approval proposal "${input.proposalId}".`);
-			const existing = parseToolApproval(before);
+			const existing = this.readToolApproval(input.proposalId);
+			if (!existing)
+				throw new Error(`[flue] Unknown tool approval proposal "${input.proposalId}".`);
 			if (existing.status !== 'pending') {
 				return { approval: existing, decisionApplied: false, resumed: false };
 			}
 			const now = Date.now();
-			const expired = existing.expiresAt !== undefined && existing.expiresAt <= now;
-			const status: ToolApprovalDecisionStatus = expired ? 'expired' : input.status;
-			const reason = expired
-				? 'Approval expired before a decision was delivered.'
-				: (input.reason ?? null);
-			this.sql.exec(
-				`UPDATE flue_tool_approvals SET status = ?, decided_at = ?, reason = ?
-				 WHERE proposal_id = ? AND status = 'pending'`,
-				status,
-				now,
-				reason,
-				input.proposalId,
-			);
-			const updatedRow = this.sql
-				.exec(`SELECT * FROM flue_tool_approvals WHERE proposal_id = ?`, input.proposalId)
-				.toArray()[0];
-			if (!updatedRow) throw new Error('[flue] Tool approval decision was not persisted.');
-			const approval = parseToolApproval(updatedRow);
-			const pending =
-				this.sql
-					.exec(
-						`SELECT 1 FROM flue_tool_approvals WHERE submission_id = ? AND status = 'pending' LIMIT 1`,
-						approval.submissionId,
-					)
-					.toArray().length > 0;
-			let resumed = false;
-			if (!pending) {
-				const resumedRow = this.sql
-					.exec(
-						`UPDATE flue_agent_submissions
-						 SET status = 'queued',
-						     attempt_count = MAX(attempt_count - 1, 0),
-						     timeout_at = 0,
-						     approval_timeout_remaining_ms = COALESCE(approval_timeout_remaining_ms, 1),
-						     attempt_id = NULL, started_at = NULL, owner_id = NULL, lease_expires_at = 0
-						 WHERE submission_id = ? AND status = 'waiting_for_approval'
-						 RETURNING submission_id`,
-						approval.submissionId,
-					)
-					.toArray()[0];
-				resumed = Boolean(resumedRow);
+			const group = existing.escalation?.group;
+			let decidedVia: ToolApprovalDecidedVia | undefined;
+			if (input.via === 'host') {
+				decidedVia = { kind: 'host', ...(input.actor !== undefined ? { actor: input.actor } : {}) };
+			} else if (input.via === 'mode') {
+				decidedVia = { kind: 'mode', mode: input.status === 'approved' ? 'granted' : 'denied' };
+			} else if (input.via === 'escalation') {
+				const grant = group
+					? this.readActiveToolEscalationGrant(group, existing.requestedAt)
+					: null;
+				if (!grant) return { approval: existing, decisionApplied: false, resumed: false };
+				decidedVia = {
+					kind: 'escalation',
+					grantProposalId: grant.proposalId,
+					...(grant.actor !== undefined ? { actor: grant.actor } : {}),
+				};
 			}
-			return { approval, decisionApplied: true, resumed };
+			const expired = existing.expiresAt !== undefined && existing.expiresAt <= now;
+			const approval = expired
+				? this.writeToolApprovalDecision(
+						input.proposalId,
+						'expired',
+						now,
+						'Approval expired before a decision was delivered.',
+						undefined,
+					)
+				: this.writeToolApprovalDecision(
+						input.proposalId,
+						input.status,
+						now,
+						input.reason,
+						decidedVia,
+					);
+			let grant: StoredToolEscalationGrant | undefined;
+			const escalated: ToolApproval[] = [];
+			if (
+				group !== undefined &&
+				approval.status === 'approved' &&
+				input.via === 'host' &&
+				input.escalate !== false
+			) {
+				let active = this.readActiveToolEscalationGrant(group, now);
+				if (!active) {
+					const expiresInMs = existing.escalation?.expiresInMs;
+					this.sql.exec(
+						`INSERT INTO flue_tool_escalation_grants
+						 (proposal_id, escalation_group, instance_id, granted_at, expires_at, actor)
+						 VALUES (?, ?, ?, ?, ?, ?)`,
+						approval.proposalId,
+						group,
+						approval.instanceId,
+						now,
+						expiresInMs !== undefined ? now + expiresInMs : null,
+						input.actor ?? null,
+					);
+					active = this.readToolEscalationGrant(approval.proposalId);
+					if (!active) throw new Error('[flue] Tool escalation grant was not persisted.');
+					grant = active;
+				}
+				const escalationVia: ToolApprovalDecidedVia = {
+					kind: 'escalation',
+					grantProposalId: active.proposalId,
+					...(active.actor !== undefined ? { actor: active.actor } : {}),
+				};
+				const pendingRows = this.sql
+					.exec(
+						`SELECT * FROM flue_tool_approvals
+						 WHERE escalation_group = ? AND status = 'pending' AND proposal_id <> ?
+						 ORDER BY requested_at ASC, proposal_id ASC`,
+						group,
+						approval.proposalId,
+					)
+					.toArray()
+					.map(parseToolApproval);
+				for (const pending of pendingRows) {
+					// A proposal past its own deadline expires through the normal
+					// sweep; a grant never revives it.
+					if (pending.expiresAt !== undefined && pending.expiresAt <= now) continue;
+					if (active.expiresAt !== undefined && active.expiresAt <= pending.requestedAt) continue;
+					escalated.push(
+						this.writeToolApprovalDecision(
+							pending.proposalId,
+							'approved',
+							now,
+							undefined,
+							escalationVia,
+						),
+					);
+				}
+			}
+			const resumedSubmissions = new Set<string>();
+			const resume = (submissionId: string): boolean => {
+				if (resumedSubmissions.has(submissionId)) return false;
+				resumedSubmissions.add(submissionId);
+				return this.resumeIfNoPendingApprovals(submissionId);
+			};
+			const resumed = resume(approval.submissionId);
+			return {
+				approval,
+				decisionApplied: true,
+				resumed,
+				...(grant ? { grant } : {}),
+				...(escalated.length > 0
+					? {
+							escalated: escalated.map((decided) => ({
+								approval: decided,
+								resumed: resume(decided.submissionId),
+							})),
+						}
+					: {}),
+			};
 		});
+	}
+
+	private readToolApproval(proposalId: string): ToolApproval | null {
+		const row = this.sql
+			.exec(`SELECT * FROM flue_tool_approvals WHERE proposal_id = ?`, proposalId)
+			.toArray()[0];
+		return row ? parseToolApproval(row) : null;
+	}
+
+	/** Decide one pending row in the caller's transaction and return the updated approval. */
+	private writeToolApprovalDecision(
+		proposalId: string,
+		status: ToolApproval['status'],
+		decidedAt: number,
+		reason: string | undefined,
+		decidedVia: ToolApprovalDecidedVia | undefined,
+	): ToolApproval {
+		this.sql.exec(
+			`UPDATE flue_tool_approvals SET status = ?, decided_at = ?, reason = ?, decided_via = ?
+			 WHERE proposal_id = ? AND status = 'pending'`,
+			status,
+			decidedAt,
+			reason ?? null,
+			decidedVia ? JSON.stringify(decidedVia) : null,
+			proposalId,
+		);
+		const approval = this.readToolApproval(proposalId);
+		if (!approval) throw new Error('[flue] Tool approval decision was not persisted.');
+		return approval;
+	}
+
+	/** The most recent unrevoked grant for `group` that has not expired by `at`. */
+	private readActiveToolEscalationGrant(
+		group: string,
+		at: number,
+	): StoredToolEscalationGrant | null {
+		const row = this.sql
+			.exec(
+				`SELECT * FROM flue_tool_escalation_grants
+				 WHERE escalation_group = ? AND revoked_at IS NULL
+				   AND (expires_at IS NULL OR expires_at > ?)
+				 ORDER BY granted_at DESC, proposal_id DESC
+				 LIMIT 1`,
+				group,
+				at,
+			)
+			.toArray()[0];
+		return row ? parseToolEscalationGrant(row) : null;
+	}
+
+	private readToolEscalationGrant(proposalId: string): StoredToolEscalationGrant | null {
+		const row = this.sql
+			.exec(`SELECT * FROM flue_tool_escalation_grants WHERE proposal_id = ?`, proposalId)
+			.toArray()[0];
+		return row ? parseToolEscalationGrant(row) : null;
+	}
+
+	async listToolEscalationGrantsImpl(now = Date.now()): Promise<ToolEscalationGrant[]> {
+		const grants = this.sql
+			.exec(
+				`SELECT * FROM flue_tool_escalation_grants
+				 WHERE revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)
+				 ORDER BY granted_at DESC, proposal_id DESC`,
+				now,
+			)
+			.toArray()
+			.map(parseToolEscalationGrant);
+		const seen = new Set<string>();
+		const active: ToolEscalationGrant[] = [];
+		for (const grant of grants) {
+			if (seen.has(grant.group)) continue;
+			seen.add(grant.group);
+			active.push(publicToolEscalationGrant(grant));
+		}
+		return active;
+	}
+
+	async revokeToolEscalationImpl(input: {
+		group: string;
+		actor?: string;
+		reason?: string;
+	}): Promise<StoredToolEscalationGrant[]> {
+		assertToolEscalationGroup(input.group, 'Tool escalation revocation group');
+		if (input.actor !== undefined && typeof input.actor !== 'string') {
+			throw new Error('[flue] Tool escalation revocation actor must be a string.');
+		}
+		if (input.reason !== undefined && typeof input.reason !== 'string') {
+			throw new Error('[flue] Tool escalation revocation reason must be a string.');
+		}
+		return this.transactionSync(() => {
+			const now = Date.now();
+			return this.sql
+				.exec(
+					`UPDATE flue_tool_escalation_grants
+					 SET revoked_at = ?, revoked_by = ?, revoke_reason = ?
+					 WHERE escalation_group = ? AND revoked_at IS NULL
+					   AND (expires_at IS NULL OR expires_at > ?)
+					 RETURNING *`,
+					now,
+					input.actor ?? null,
+					input.reason ?? null,
+					input.group,
+					now,
+				)
+				.toArray()
+				.map(parseToolEscalationGrant);
+		});
+	}
+
+	async listToolEscalationProjectionWorkImpl(): Promise<ToolEscalationProjectionWork[]> {
+		return this.sql
+			.exec(
+				`SELECT * FROM flue_tool_escalation_grants
+				 WHERE grant_projected_at IS NULL
+				    OR (revoked_at IS NOT NULL AND revoke_projected_at IS NULL)
+				 ORDER BY granted_at ASC, proposal_id ASC`,
+			)
+			.toArray()
+			.map((row) => ({
+				grant: parseToolEscalationGrant(row),
+				grantProjected: typeof row.grant_projected_at === 'number',
+				revocationProjected: typeof row.revoke_projected_at === 'number',
+			}));
+	}
+
+	async markToolEscalationProjectedImpl(
+		proposalId: string,
+		projection: 'granted' | 'revoked',
+	): Promise<boolean> {
+		const column = projection === 'granted' ? 'grant_projected_at' : 'revoke_projected_at';
+		const guard = projection === 'revoked' ? ' AND revoked_at IS NOT NULL' : '';
+		return (
+			this.sql
+				.exec(
+					`UPDATE flue_tool_escalation_grants SET ${column} = COALESCE(${column}, ?)
+					 WHERE proposal_id = ?${guard}
+					 RETURNING proposal_id`,
+					Date.now(),
+					proposalId,
+				)
+				.toArray().length > 0
+		);
 	}
 
 	async expireToolApprovalsImpl(
@@ -1341,7 +1579,9 @@ function ensureToolApprovalTable(sql: SqlStorage): void {
 			decision_projected_at INTEGER,
 			notification_attempt_count INTEGER NOT NULL DEFAULT 0,
 			notification_next_attempt_at INTEGER NOT NULL DEFAULT 0,
-			notification_delivered_at INTEGER
+			notification_delivered_at INTEGER,
+			escalation_group TEXT,
+			decided_via TEXT
 		)`,
 	);
 	ensureSqlColumn(sql, 'flue_tool_approvals', 'request_projected_at', 'INTEGER');
@@ -1359,6 +1599,8 @@ function ensureToolApprovalTable(sql: SqlStorage): void {
 		'INTEGER NOT NULL DEFAULT 0',
 	);
 	ensureSqlColumn(sql, 'flue_tool_approvals', 'notification_delivered_at', 'INTEGER');
+	ensureSqlColumn(sql, 'flue_tool_approvals', 'escalation_group', 'TEXT');
+	ensureSqlColumn(sql, 'flue_tool_approvals', 'decided_via', 'TEXT');
 	sql.exec(
 		'CREATE INDEX IF NOT EXISTS flue_tool_approvals_submission_idx ON flue_tool_approvals (submission_id, requested_at ASC)',
 	);
@@ -1368,10 +1610,45 @@ function ensureToolApprovalTable(sql: SqlStorage): void {
 	sql.exec(
 		'CREATE INDEX IF NOT EXISTS flue_tool_approvals_projection_idx ON flue_tool_approvals (request_projected_at, decision_projected_at, status)',
 	);
+	sql.exec(
+		'CREATE INDEX IF NOT EXISTS flue_tool_approvals_escalation_idx ON flue_tool_approvals (escalation_group, status) WHERE escalation_group IS NOT NULL',
+	);
+}
+
+/**
+ * One row per grant, keyed by the approval that created it. A group's active
+ * grant is its most recent unrevoked, unexpired row; older rows stay as
+ * history until their canonical records are projected (and after).
+ */
+function ensureToolEscalationGrantTable(sql: SqlStorage): void {
+	sql.exec(
+		`CREATE TABLE IF NOT EXISTS flue_tool_escalation_grants (
+			proposal_id TEXT PRIMARY KEY,
+			escalation_group TEXT NOT NULL,
+			instance_id TEXT NOT NULL,
+			granted_at INTEGER NOT NULL,
+			expires_at INTEGER,
+			actor TEXT,
+			revoked_at INTEGER,
+			revoked_by TEXT,
+			revoke_reason TEXT,
+			grant_projected_at INTEGER,
+			revoke_projected_at INTEGER
+		)`,
+	);
+	sql.exec(
+		'CREATE INDEX IF NOT EXISTS flue_tool_escalation_grants_group_idx ON flue_tool_escalation_grants (escalation_group, granted_at DESC)',
+	);
 }
 
 function stripApprovalState(approval: ToolApproval): ToolApprovalProposal {
-	const { status: _status, decidedAt: _decidedAt, reason: _reason, ...proposal } = approval;
+	const {
+		status: _status,
+		decidedAt: _decidedAt,
+		reason: _reason,
+		decidedVia: _decidedVia,
+		...proposal
+	} = approval;
 	return proposal;
 }
 
@@ -1402,10 +1679,55 @@ function parseToolApproval(row: SqlRow): ToolApproval {
 	) {
 		throw new Error('[flue] Persisted tool approval proposal is malformed.');
 	}
+	const decidedVia =
+		typeof row.decided_via === 'string' ? parseDecidedVia(row.decided_via) : undefined;
 	return {
 		...proposal,
 		status: row.status as ToolApproval['status'],
 		...(typeof row.decided_at === 'number' ? { decidedAt: row.decided_at } : {}),
 		...(typeof row.reason === 'string' ? { reason: row.reason } : {}),
+		...(decidedVia ? { decidedVia } : {}),
 	};
+}
+
+function parseDecidedVia(json: string): ToolApprovalDecidedVia {
+	const value = JSON.parse(json) as Partial<Record<string, unknown>> | null;
+	if (
+		value &&
+		((value.kind === 'host' && (value.actor === undefined || typeof value.actor === 'string')) ||
+			(value.kind === 'escalation' &&
+				typeof value.grantProposalId === 'string' &&
+				(value.actor === undefined || typeof value.actor === 'string')) ||
+			(value.kind === 'mode' && (value.mode === 'granted' || value.mode === 'denied')))
+	) {
+		return value as ToolApprovalDecidedVia;
+	}
+	throw new Error('[flue] Persisted tool approval decision source is malformed.');
+}
+
+function parseToolEscalationGrant(row: SqlRow): StoredToolEscalationGrant {
+	if (
+		typeof row.proposal_id !== 'string' ||
+		typeof row.escalation_group !== 'string' ||
+		typeof row.instance_id !== 'string' ||
+		typeof row.granted_at !== 'number'
+	) {
+		throw new Error('[flue] Persisted tool escalation grant is malformed.');
+	}
+	return {
+		group: row.escalation_group,
+		instanceId: row.instance_id,
+		proposalId: row.proposal_id,
+		grantedAt: row.granted_at,
+		...(typeof row.expires_at === 'number' ? { expiresAt: row.expires_at } : {}),
+		...(typeof row.actor === 'string' ? { actor: row.actor } : {}),
+		...(typeof row.revoked_at === 'number' ? { revokedAt: row.revoked_at } : {}),
+		...(typeof row.revoked_by === 'string' ? { revokedBy: row.revoked_by } : {}),
+		...(typeof row.revoke_reason === 'string' ? { revokeReason: row.revoke_reason } : {}),
+	};
+}
+
+function publicToolEscalationGrant(grant: StoredToolEscalationGrant): ToolEscalationGrant {
+	const { revokedAt: _revokedAt, revokedBy: _revokedBy, revokeReason: _reason, ...active } = grant;
+	return active;
 }

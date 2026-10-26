@@ -34,7 +34,7 @@ const approval = await conversation.resolveToolApproval('approval_01HZX...', {
 });
 ```
 
-This sends `POST <url>/tool-approvals/<proposalId>` with the JSON body `{ status, reason? }` and returns the durable approval row. `status` is one of `approved`, `rejected`, `expired`, `canceled`, or `aborted`; `reason` is optional. `createAgentRouter(...)` mounts this endpoint automatically, so a host application needs no extra ToT route or approval runtime. The same client headers and token are sent, allowing the host's mount middleware to authenticate and authorize the decision. Durable approval state currently requires Cloudflare Durable Object SQLite; `ToolApprovalProvider` is optional when a server also wants notification delivery.
+This sends `POST <url>/tool-approvals/<proposalId>` with the JSON body `{ status, reason?, escalate?, actor? }` and returns the durable approval row. `status` is one of `approved`, `rejected`, `expired`, `canceled`, or `aborted`; `reason` is optional. `createAgentRouter(...)` mounts this endpoint automatically, so a host application needs no extra ToT route or approval runtime. The same client headers and token are sent, allowing the host's mount middleware to authenticate and authorize the decision. Durable approval state currently requires Cloudflare Durable Object SQLite; `ToolApprovalProvider` is optional when a server also wants notification delivery.
 
 ## `CreateFlueClientOptions`
 

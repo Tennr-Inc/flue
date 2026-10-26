@@ -196,7 +196,10 @@ import {
 	generateTurnId,
 } from './runtime/ids.ts';
 import { getRuntimeModels, providerTelemetryName } from './runtime/providers.ts';
-import { getToolApprovalProvider } from './runtime/tool-approval-provider.ts';
+import {
+	getToolApprovalProvider,
+	notifyToolApprovalDecided,
+} from './runtime/tool-approval-provider.ts';
 import { createCwdSandbox } from './sandbox.ts';
 import { valibotToJsonSchema } from './schema.ts';
 import { execShellWithEvents, getErrorMessage } from './shell.ts';
@@ -217,8 +220,13 @@ import {
 	resolveToolRun,
 } from './tool.ts';
 import { getPreparedToolAdapter } from './tool-adapter.ts';
-import type { ToolApproval, ToolApprovalProposal } from './tool-approval.ts';
-import { toolApprovalProposalId } from './tool-approval.ts';
+import type {
+	ToolApproval,
+	ToolApprovalEscalation,
+	ToolApprovalProposal,
+} from './tool-approval.ts';
+import { toolApprovalProposalId, toolEscalationDeniedReason } from './tool-approval.ts';
+import type { SessionToolEscalationRuntime, ToolEscalationDeclaration } from './tool-escalation.ts';
 import type {
 	AgentConfig,
 	BeforeModelTurns,
@@ -503,6 +511,12 @@ interface SessionInitOptions {
 	envSlot: SandboxSlot;
 	/** Environment-swap wiring (function agents only); same routing as hookState. */
 	envRuntime?: SandboxRuntime;
+	/**
+	 * Escalation wiring (function agents only): the initial render's
+	 * `useToolEscalation()` declarations and the grant refresh the session
+	 * runs before each re-render. Same routing as hookState.
+	 */
+	toolEscalations?: SessionToolEscalationRuntime;
 }
 
 /** One re-render's session-facing output: what the next turn runs with. */
@@ -519,6 +533,8 @@ export type SessionRerender = () => {
 	 */
 	sandbox?: SandboxFactory;
 	cwd?: string;
+	/** The render's `useToolEscalation()` declarations, by group. */
+	toolEscalations: ReadonlyMap<string, ToolEscalationDeclaration>;
 };
 
 /**
@@ -900,6 +916,15 @@ export class Session implements FlueSession, AgentSubmissionSession {
 	private approvalParked = false;
 	/** True only after the durable submission claim has actually been released. */
 	private approvalSubmissionParked = false;
+	/**
+	 * Calls approved by an escalation grant or mode during preflight. Pi runs
+	 * them like ordinary tools; the wrapper writes each one's execution fence
+	 * before entering tool code.
+	 */
+	private autoApprovedToolCalls = new Map<string, ToolApproval>();
+	/** The latest applied render's escalation declarations, by group. */
+	private toolEscalationDeclarations: ReadonlyMap<string, ToolEscalationDeclaration>;
+	private toolEscalationRuntime: SessionToolEscalationRuntime | undefined;
 
 	private emitTurnRequestAndStream: StreamFn = async (model, requestContext, requestOptions) => {
 		// Documents ride pi's image carrier; rewrite them into native document
@@ -1134,6 +1159,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		// approved successor starts.
 		if (this.approvalParked) return undefined;
 		if (!this.rerender) return undefined;
+		await this.toolEscalationRuntime?.refreshGrants();
 		let next = this.rerender();
 		// Environment swap: a conditional useSandbox() whose presence flipped
 		// since initialization takes effect HERE, at the turn boundary — the
@@ -1145,6 +1171,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		if (swapped) next = this.rerender();
 		this.beforeModelTurns = next.beforeModelTurns;
 		this.agentTools = next.tools;
+		this.toolEscalationDeclarations = next.toolEscalations;
 		// Live resource sets follow the render: skill activation and task
 		// resolution always see what the agent declares NOW, even while the
 		// frozen presentation surfaces still show the baseline.
@@ -1452,11 +1479,13 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		}
 		// Render fresh so the recorded baseline and the recomposed surfaces
 		// come from the same evaluation.
+		await this.toolEscalationRuntime?.refreshGrants();
 		const refreshed = this.rerender();
 		const current = refreshed.resources.snapshot;
 		await this.appendCanonical([compactionRecord, this.resourceSnapshotRecord(current, true)]);
 		this.lastNarratedResources = current;
 		this.agentTools = refreshed.tools;
+		this.toolEscalationDeclarations = refreshed.toolEscalations;
 		this.beforeModelTurns = refreshed.beforeModelTurns;
 		this.liveSkills = refreshed.resources.skills;
 		this.liveSubagents = refreshed.resources.subagents;
@@ -2473,6 +2502,8 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		this.executionIdentity = options.executionContext ?? {};
 		this.hookState = options.hookState;
 		this.rerender = options.rerender;
+		this.toolEscalationRuntime = options.toolEscalations;
+		this.toolEscalationDeclarations = options.toolEscalations?.initial ?? new Map();
 		this.outputChannel = options.output;
 		this.advanceDelivery = options.advanceDelivery;
 		this.getDelivery = options.getDelivery;
@@ -3313,6 +3344,14 @@ export class Session implements FlueSession, AgentSubmissionSession {
 			// whose canonical requested record was not. This must happen before a
 			// pending proposal can park or a decided one can produce its outcome.
 			await this.ensureApprovalRequestedRecord(approval);
+			// A pending proposal here never parked (a crash or a race interrupted
+			// preflight), so no one has been asked yet: a grant or the render's
+			// mode decides it exactly as preflight would have.
+			const escalated = await this.applyToolEscalation(approval);
+			if (escalated) {
+				approval = escalated;
+				await this.recordAutoDecidedApproval(approval);
+			}
 			approvals.set(call.id, approval);
 			if (approval.status === 'pending') {
 				pendingApprovals.push(approval);
@@ -3443,6 +3482,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 				? { expiresAt: requestedAt + toolDef.approval.expiresInMs }
 				: {}),
 			...(toolDef.approval.presentation ? { presentation: toolDef.approval.presentation } : {}),
+			...this.toolApprovalEscalationField(toolDef),
 		};
 		const approval = await approvalStore.createToolApproval(proposal);
 		await this.ensureApprovalRequestedRecord(approval);
@@ -4958,6 +4998,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 					call.startEmitted = true;
 				}
 				try {
+					await this.fenceAutoApprovedToolCall(toolCallId);
 					// Abandon-on-abort: a signal-deaf tool must not wedge the turn
 					// past an abort or durability deadline; its orphaned promise
 					// keeps running under the at-least-once contract while the
@@ -5080,6 +5121,12 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		// that repair into a false conflict.
 		const existing = await approvalStore.getToolApproval(proposalId);
 		const requestedAt = existing?.requestedAt ?? Date.now();
+		// The escalation snapshot is frozen with the proposal like its deadline.
+		const escalationField = existing
+			? existing.escalation
+				? { escalation: existing.escalation }
+				: {}
+			: this.toolApprovalEscalationField(toolDef);
 		const proposal: ToolApprovalProposal = {
 			proposalId,
 			submissionId: this.activeSubmissionId,
@@ -5100,8 +5147,26 @@ export class Session implements FlueSession, AgentSubmissionSession {
 					? { expiresAt: requestedAt + toolDef.approval.expiresInMs }
 					: {}),
 			...(toolDef.approval.presentation ? { presentation: toolDef.approval.presentation } : {}),
+			...escalationField,
 		};
 		const approval = await approvalStore.createToolApproval(proposal);
+		// An escalation grant or the render's mode decides a grouped call here.
+		// Neither parks: an approved call runs through Pi like an ordinary tool
+		// (behind its execution fence), and a denied one gets Pi's blocked
+		// result, which persists as its ordinary error outcome.
+		const autoDecided = await this.applyToolEscalation(approval);
+		if (autoDecided) {
+			await this.recordAutoDecidedApproval(autoDecided);
+			if (autoDecided.status === 'approved') {
+				this.autoApprovedToolCalls.set(context.toolCall.id, autoDecided);
+				return undefined;
+			}
+			return {
+				block: true,
+				reason:
+					autoDecided.reason ?? `Tool approval ${autoDecided.status}; the tool was not executed.`,
+			};
+		}
 		await this.ensureApprovalRequestedRecord(approval);
 		this.approvalToolCalls.add(context.toolCall.id);
 		this.approvalBatch.set(context.toolCall.id, approval);
@@ -5123,6 +5188,123 @@ export class Session implements FlueSession, AgentSubmissionSession {
 			await this.appendCanonical([record]);
 		}
 		await this.submissionStore?.markToolApprovalProjected?.(approval.proposalId, 'requested');
+	}
+
+	/** The escalation snapshot a grouped tool's proposal carries, from the current render. */
+	private toolApprovalEscalationField(toolDef: ToolDefinition): {
+		escalation?: ToolApprovalEscalation;
+	} {
+		const group = toolDef.approval?.escalation;
+		if (group === undefined) return {};
+		const declaration = this.toolEscalationDeclarations.get(group);
+		return {
+			escalation: {
+				group,
+				...(declaration?.expiresInMs !== undefined ? { expiresInMs: declaration.expiresInMs } : {}),
+				...(declaration?.presentation !== undefined
+					? { presentation: declaration.presentation }
+					: {}),
+			},
+		};
+	}
+
+	/**
+	 * Decide a pending grouped proposal without a host: the render's `granted`
+	 * or `denied` mode, or else an active grant covering the proposal. Returns
+	 * the decided approval, or `undefined` when it stays pending (mode `ask`
+	 * without a grant, or a decision that another writer won).
+	 */
+	private async applyToolEscalation(approval: ToolApproval): Promise<ToolApproval | undefined> {
+		const group = approval.escalation?.group;
+		if (group === undefined || approval.status !== 'pending') return undefined;
+		const decide = this.submissionStore?.decideToolApproval;
+		if (!decide) return undefined;
+		// A group the current render no longer declares asks; only a grant can
+		// still approve it.
+		const mode = this.toolEscalationDeclarations.get(group)?.mode ?? 'ask';
+		const result = await decide.call(
+			this.submissionStore,
+			mode === 'denied'
+				? {
+						proposalId: approval.proposalId,
+						status: 'rejected',
+						reason: toolEscalationDeniedReason(group),
+						via: 'mode',
+					}
+				: {
+						proposalId: approval.proposalId,
+						status: 'approved',
+						via: mode === 'granted' ? 'mode' : 'escalation',
+					},
+		);
+		return result.decisionApplied ? result.approval : undefined;
+	}
+
+	/**
+	 * Project a decision Flue made itself: the canonical request and decision
+	 * land in one append, then observers and the provider's optional `decided`
+	 * hook hear about it. `requested` is never called — no one is asked.
+	 */
+	private async recordAutoDecidedApproval(approval: ToolApproval): Promise<void> {
+		const requested = toolApprovalRequestedRecord(approval);
+		const decided = toolApprovalDecisionRecord(approval);
+		const records: ConversationRecord[] = [];
+		if (!(await this.conversationWriter.hasRecord(requested.id))) records.push(requested);
+		if (!(await this.conversationWriter.hasRecord(decided.id))) records.push(decided);
+		if (records.length > 0) await this.appendCanonical(records);
+		await this.submissionStore?.markToolApprovalProjected?.(approval.proposalId, 'requested');
+		await this.submissionStore?.markToolApprovalProjected?.(approval.proposalId, 'decided');
+		this.emit({
+			type: 'tool_approval_requested',
+			proposalId: approval.proposalId,
+			toolName: approval.toolName,
+			toolCallId: approval.toolCallId,
+			toolVersion: approval.toolVersion,
+			args: approval.arguments as Record<string, unknown>,
+			...(approval.expiresAt !== undefined ? { expiresAt: approval.expiresAt } : {}),
+		});
+		this.emit({
+			type: 'tool_approval_decided',
+			proposalId: approval.proposalId,
+			toolName: approval.toolName,
+			toolCallId: approval.toolCallId,
+			status: approval.status === 'pending' ? 'canceled' : approval.status,
+			...(approval.reason ? { reason: approval.reason } : {}),
+			...(approval.decidedVia ? { via: approval.decidedVia.kind } : {}),
+		});
+		notifyToolApprovalDecided(approval, (error) =>
+			this.internalLog('error', '[flue:tool-approval] Host decision notification failed', {
+				proposalId: approval.proposalId,
+				error: error instanceof Error ? error.message : String(error),
+			}),
+		);
+	}
+
+	/**
+	 * The invocation fence for a call approved during preflight, written right
+	 * before tool code runs. Recovery treats a fenced call without an outcome
+	 * as interrupted and never runs it again (durable tools replay their steps).
+	 */
+	private async fenceAutoApprovedToolCall(toolCallId: string): Promise<void> {
+		const approval = this.autoApprovedToolCalls.get(toolCallId);
+		if (!approval) return;
+		this.autoApprovedToolCalls.delete(toolCallId);
+		const recordId = `record_tool_approval_execution_started_${encodeCanonicalId(approval.proposalId)}`;
+		if (await this.conversationWriter.hasRecord(recordId)) {
+			throw new Error(
+				'Approved tool execution already started once; the tool was not executed again.',
+			);
+		}
+		await this.appendCanonical([
+			{
+				...this.canonicalEnvelope('tool_approval_execution_started', recordId),
+				type: 'tool_approval_execution_started',
+				proposalId: approval.proposalId,
+				submissionId: approval.submissionId,
+				assistantMessageId: approval.assistantMessageId,
+				toolCallId,
+			},
+		]);
 	}
 
 	/** Persist completed outcomes and their state together before parking or abort repair. */
@@ -6842,6 +7024,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 			this.approvalParked = false;
 			this.approvalToolCalls.clear();
 			this.approvalBatch.clear();
+			this.autoApprovedToolCalls.clear();
 			this.pendingToolOutcomeRecords.clear();
 			await this.rebuildCanonicalContext();
 			await this.resumeConversationToCompletion(options);
@@ -7137,6 +7320,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 					this.approvalSubmissionParked = false;
 					this.approvalToolCalls.clear();
 					this.approvalBatch.clear();
+					this.autoApprovedToolCalls.clear();
 					this.pendingToolOutcomeRecords.clear();
 				}
 			},

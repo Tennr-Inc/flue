@@ -91,7 +91,7 @@ const refund = defineTool({
 });
 ```
 
-For a mounted agent, approval is part of the native agent HTTP surface. `createAgentRouter(...)` automatically mounts `POST /:id/tool-approvals/:proposalId` alongside the send, history, updates, and abort routes. The request body is `{ status, reason? }`, and the response is the durable approval row. The host middleware you put around the agent mount protects this route too, so you do not need a second ToT route or a separate approval runtime.
+For a mounted agent, approval is part of the native agent HTTP surface. `createAgentRouter(...)` automatically mounts `POST /:id/tool-approvals/:proposalId` alongside the send, history, updates, and abort routes. The request body is `{ status, reason?, escalate?, actor? }`, and the response is the durable approval row. The host middleware you put around the agent mount protects this route too, so you do not need a second ToT route or a separate approval runtime.
 
 The Flue Agent SDK exposes the same flow: observe `toolApprovals` on the conversation, then resolve one proposal with `client.resolveToolApproval(proposalId, { status, reason? })`. The decision is idempotent and durable. `approved` resumes the submission; `rejected`, `expired`, `canceled`, and `aborted` create a deterministic tool error and never call `run`. This durable approval state machine currently requires the Cloudflare target and each agent instance's Durable Object SQLite store.
 
@@ -102,6 +102,48 @@ Approval waiting does not send a fake result to the model or let it continue to 
 To gate tools from an MCP server, set `approval` on the `useMcpConnection()` definition instead; see [Require approval for MCP tools](/docs/guide/mcp/#require-approval-for-mcp-tools).
 
 `timeoutMs` is separate from approval waiting and starts only when the approved tool begins execution. The tool's `signal` is aborted at the deadline. Signal-aware code should pass it to downstream APIs; a signal-deaf operation is abandoned by the runtime and may still finish externally, so make side effects idempotent. Flue writes a durable invocation fence immediately before an approved call enters `run`: a non-durable call interrupted before its outcome commits is reported as unknown rather than run again. This is an at-most-once safety boundary, not a general exactly-once guarantee; use `toolCallId` as the stable idempotency key for an external operation. A `durable: true` approval tool instead resumes through its recorded `step.do(...)` values.
+
+### Approve a group of tools once
+
+Approving every write one by one gets slow. An escalation group lets one approval cover a set of tools for the rest of the agent instance's life. Name the group on each tool's approval policy, and declare it in the render with [`useToolEscalation()`](/docs/reference/agent-hooks-api/#usetoolescalation):
+
+```ts
+const editPage = defineTool({
+  name: 'edit_page',
+  description: 'Edit a Notion page.',
+  version: 'edit-page-v1',
+  input: v.object({ pageId: v.string(), content: v.string() }),
+  approval: { required: true, escalation: 'notion-edit' },
+  async run({ data }) {
+    return { output: await notion.edit(data) };
+  },
+});
+
+export function Assistant() {
+  useModel('anthropic/claude-sonnet-4-6');
+  const notionEdit = useToolEscalation('notion-edit', {
+    expiresInMs: 2 * 60 * 60_000,
+    presentation: { title: 'Allow Notion edits for 2 hours' },
+  });
+  useTool(editPage);
+  useTool(publishPage); // also `escalation: 'notion-edit'`
+  return notionEdit.grant
+    ? 'You may edit Notion pages without asking.'
+    : 'Notion edits need approval; batch related edits into one request.';
+}
+```
+
+The first call in the group parks and asks like any approval-gated call; its proposal carries `escalation: { group, expiresInMs?, presentation? }` so the approval UI can offer "approve for this session". Approving it with `escalate` left at its default `true` grants the group to the agent instance. In the same durable transaction, Flue approves every other pending proposal in the group, including the rest of a parked batch. Later calls in the group are approved by Flue itself: they run without parking and without calling the provider's `requested()`. Their approval rows record `decidedVia: { kind: 'escalation', grantProposalId, actor }`, pointing back to the approval that created the grant. Pass `escalate: false` to approve only the one call.
+
+The render also sets a `mode` per group, read from the render that produced each call:
+
+- `ask` (default): ask until a grant exists.
+- `granted`: approve every call in the group without asking; rows record `decidedVia: { kind: 'mode', mode: 'granted' }`.
+- `denied`: reject every call without asking or entering `run`; the model gets the usual rejection error.
+
+A mode change applies to calls made after it; pending approvals keep their state. Only an approval escalates: `rejected`, `expired`, `canceled`, and `aborted` never create a grant. A grant lasts until its `expiresInMs` (counted from the approval, and checked against each call's request time) or until revoked with `revokeToolEscalation()`, the SDK's `revokeToolEscalation(group)`, or `DELETE /:id/tool-escalations/:group`. Grants are durable per agent instance, so they survive restarts and deploys and cover every conversation and session of the instance. Tools stay mounted throughout; only the approval requirement changes, so the provider's tool list, and its prompt cache, never change.
+
+Flue-made decisions still go through the approved-execution fence, so a crash never runs an escalated side effect twice. Install `decided(approval)` on your `ToolApprovalProvider` to hear about them for audit or UI; it is best-effort, and the canonical conversation stream holds the durable `tool_approval_decided`, `tool_escalation_granted`, and `tool_escalation_revoked` records. Every mounted tool that names a group must find it declared in the same render, or the render throws; declaring a group twice throws too. Escalation groups belong to the root agent.
 
 **The rest of the context.** Alongside `data`, every `run` receives:
 

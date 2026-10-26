@@ -27,6 +27,7 @@ import {
 	createActionScopeName,
 	createTaskSessionName,
 } from './session-identity.ts';
+import type { SessionToolEscalationRuntime } from './tool-escalation.ts';
 import type {
 	AgentConfig,
 	CallHandle,
@@ -101,6 +102,8 @@ export interface HarnessOptions {
 	envSlot?: SandboxSlot;
 	/** Environment-swap wiring (function agents only); same routing as hookState. */
 	envRuntime?: SandboxRuntime;
+	/** Escalation declarations and grant refresh (function agents only); same routing as hookState. */
+	toolEscalations?: SessionToolEscalationRuntime;
 }
 
 export class Harness implements FlueHarness {
@@ -156,6 +159,7 @@ export class Harness implements FlueHarness {
 	private getDelivery: (() => DeliveredMessage | undefined) | undefined;
 	private resources: SessionResourceRuntime | undefined;
 	private envRuntime: SandboxRuntime | undefined;
+	private toolEscalations: SessionToolEscalationRuntime | undefined;
 
 	constructor(options: HarnessOptions) {
 		this.name = options.name;
@@ -178,6 +182,7 @@ export class Harness implements FlueHarness {
 		this.getDelivery = options.getDelivery;
 		this.resources = options.resources;
 		this.envRuntime = options.envRuntime;
+		this.toolEscalations = options.toolEscalations;
 		this.envSlot = options.envSlot ?? {
 			env: options.env,
 			toolFactory: options.toolFactory,
@@ -327,6 +332,7 @@ export class Harness implements FlueHarness {
 			resources: this.resources,
 			envSlot: this.envSlot,
 			envRuntime: this.envRuntime,
+			toolEscalations: this.toolEscalations,
 			submissionStore: this.submissionStore,
 		});
 		await session.initializeCanonicalContext();

@@ -3,11 +3,19 @@ import { fauxAssistantMessage, fauxProvider, fauxText } from '@earendil-works/pi
 import * as v from 'valibot';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createFlueContext } from '../client.ts';
+import type { ConversationRecord } from '../conversation-records.ts';
 import { useModel } from '../hooks/use-model.ts';
+import { observe } from '../runtime/events.ts';
 import { resetModelsForTests, resolveModel, setProvider } from '../runtime/providers.ts';
 import { registerFlueAgents, resetFlueAgentRegistrationForTests } from '../runtime/registration.ts';
+import { agentStreamPath } from '../runtime/stream-offsets.ts';
+import {
+	resetToolApprovalProvider,
+	setToolApprovalProvider,
+} from '../runtime/tool-approval-provider.ts';
 import type { SqlStorage } from '../sql-storage.ts';
-import type { Agent } from '../types.ts';
+import type { ToolApprovalProposal } from '../tool-approval.ts';
+import type { Agent, FlueEvent } from '../types.ts';
 import {
 	CLOUDFLARE_AGENT_INTERNAL_DISPATCH_PATH,
 	type CloudflareAgentResolver,
@@ -20,6 +28,7 @@ afterEach(() => {
 	for (const database of databases.splice(0)) database.close();
 	resetModelsForTests();
 	resetFlueAgentRegistrationForTests();
+	resetToolApprovalProvider();
 	vi.restoreAllMocks();
 });
 
@@ -104,6 +113,11 @@ function fixture(resolveAgentForInstance?: CloudflareAgentResolver) {
 			instance,
 			sql,
 			store: prepared.submissionStore,
+			async records(): Promise<ConversationRecord[]> {
+				return (
+					await prepared.conversationStreamStore.read(agentStreamPath('Support', name))
+				).batches.flatMap((batch) => batch.records);
+			},
 			restart() {
 				runtime.attach(instance, prepared);
 			},
@@ -316,4 +330,136 @@ describe('per-instance agent resolution', () => {
 			expect((await alice.store.getSubmission(submissionId))?.error).toBeUndefined();
 		},
 	);
+});
+
+describe('tool escalation through the coordinator', () => {
+	it('projects and announces a grant, its escalated approvals, and its revocation', async () => {
+		vi.spyOn(console, 'error').mockImplementation(() => {});
+		const decided = vi.fn();
+		setToolApprovalProvider({ requested: vi.fn(), decided });
+		const events: FlueEvent[] = [];
+		const stop = observe((event) => {
+			if (event.type.startsWith('tool_')) events.push(event);
+		});
+		try {
+			const { cell, runtime } = fixture();
+			const alice = cell('alice');
+			await alice.send();
+			await alice.drain();
+			const created = (await alice.records()).find(
+				(record): record is Extract<ConversationRecord, { type: 'conversation_created' }> =>
+					record.type === 'conversation_created',
+			);
+			if (!created) throw new Error('Expected the root conversation.');
+			const proposal = (toolCallId: string): ToolApprovalProposal => ({
+				proposalId: `approval_${toolCallId}`,
+				submissionId: 'parked',
+				agentName: 'Support',
+				instanceId: 'alice',
+				conversationId: created.conversationId,
+				harness: created.harness,
+				session: created.session,
+				assistantMessageId: 'assistant-1',
+				toolCallId,
+				toolName: 'edit_page',
+				toolVersion: '1',
+				arguments: {},
+				requestedAt: 1,
+				escalation: { group: 'notion-edit' },
+			});
+			for (const toolCallId of ['call-1', 'call-2']) {
+				await alice.store.createToolApproval?.(proposal(toolCallId));
+			}
+
+			const approval = await runtime.resolveToolApproval(alice.instance, {
+				agent: 'Support',
+				id: 'alice',
+				proposalId: 'approval_call-1',
+				status: 'approved',
+				actor: 'U1',
+			});
+			expect(approval.decidedVia).toEqual({ kind: 'host', actor: 'U1' });
+			expect(
+				await runtime.listToolEscalations(alice.instance, { agent: 'Support', id: 'alice' }),
+			).toEqual([expect.objectContaining({ group: 'notion-edit', proposalId: 'approval_call-1' })]);
+			await vi.waitFor(() =>
+				expect(decided).toHaveBeenCalledWith(
+					expect.objectContaining({ proposalId: 'approval_call-2', status: 'approved' }),
+				),
+			);
+
+			expect(
+				await runtime.revokeToolEscalation(alice.instance, {
+					agent: 'Support',
+					id: 'alice',
+					group: 'notion-edit',
+					actor: 'U2',
+					reason: 'done editing',
+				}),
+			).toEqual({ revoked: true });
+			expect(
+				await runtime.revokeToolEscalation(alice.instance, {
+					agent: 'Support',
+					id: 'alice',
+					group: 'notion-edit',
+				}),
+			).toEqual({ revoked: false });
+
+			const records = await alice.records();
+			expect(records).toContainEqual(
+				expect.objectContaining({
+					type: 'tool_approval_decided',
+					proposalId: 'approval_call-2',
+					decidedVia: { kind: 'escalation', grantProposalId: 'approval_call-1', actor: 'U1' },
+				}),
+			);
+			expect(records).toContainEqual(
+				expect.objectContaining({
+					type: 'tool_escalation_granted',
+					group: 'notion-edit',
+					proposalId: 'approval_call-1',
+					actor: 'U1',
+				}),
+			);
+			expect(records).toContainEqual(
+				expect.objectContaining({
+					type: 'tool_escalation_revoked',
+					group: 'notion-edit',
+					proposalId: 'approval_call-1',
+					actor: 'U2',
+					reason: 'done editing',
+				}),
+			);
+			expect(await alice.store.listToolEscalationProjectionWork?.()).toEqual([]);
+			expect(
+				events.map((event) =>
+					event.type === 'tool_approval_decided'
+						? [event.type, event.proposalId, event.via]
+						: [event.type, 'proposalId' in event ? event.proposalId : undefined],
+				),
+			).toEqual([
+				['tool_approval_decided', 'approval_call-1', 'host'],
+				['tool_escalation_granted', 'approval_call-1'],
+				['tool_approval_decided', 'approval_call-2', 'escalation'],
+				['tool_escalation_revoked', 'approval_call-1'],
+			]);
+		} finally {
+			stop();
+		}
+	});
+
+	it('rejects a grant read or revocation addressed to another instance', async () => {
+		const { cell, runtime } = fixture();
+		const alice = cell('alice');
+		await expect(
+			runtime.listToolEscalations(alice.instance, { agent: 'Support', id: 'bob' }),
+		).rejects.toThrow('does not match this agent instance');
+		await expect(
+			runtime.revokeToolEscalation(alice.instance, {
+				agent: 'Support',
+				id: 'alice',
+				group: 'Not A Group',
+			}),
+		).rejects.toThrow('revocation group must be an escalation group name');
+	});
 });

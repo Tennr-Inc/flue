@@ -136,6 +136,37 @@ function approvalStore(
 		>;
 }
 
+function escalationStore(store: AgentSubmissionStore) {
+	const approvals = approvalStore(store);
+	if (
+		!store.listToolEscalationGrants ||
+		!store.revokeToolEscalation ||
+		!store.listToolEscalationProjectionWork ||
+		!store.markToolEscalationProjected
+	) {
+		throw new Error('[flue] This backend does not implement tool escalation grants.');
+	}
+	return approvals as typeof approvals &
+		Required<
+			Pick<
+				AgentSubmissionStore,
+				| 'listToolEscalationGrants'
+				| 'revokeToolEscalation'
+				| 'listToolEscalationProjectionWork'
+				| 'markToolEscalationProjected'
+			>
+		>;
+}
+
+function groupedProposal(
+	submissionId: string,
+	toolCallId: string,
+	group: string,
+	overrides: Partial<ToolApprovalProposal> = {},
+): ToolApprovalProposal {
+	return approvalProposal(submissionId, toolCallId, { escalation: { group }, ...overrides });
+}
+
 async function admitDispatchReady(store: AgentSubmissionStore, input: DispatchInput) {
 	const admission = await store.admitDispatch(input);
 	if (admission.kind !== 'submission') return admission;
@@ -552,6 +583,261 @@ export function defineStoreContractTests(label: string, backend: StoreContractTe
 				});
 			});
 		});
+
+		if (backend.durableToolApprovals)
+			describe('tool escalation grants', () => {
+				it('grants on a host approval and approves the group still pending in the same step', async () => {
+					const store = escalationStore(await create());
+					await admitDispatchReady(store, dispatchInput());
+					const first = groupedProposal('dispatch-1', 'call-1', 'deploys');
+					const sibling = groupedProposal('dispatch-1', 'call-2', 'deploys');
+					const elsewhere = groupedProposal('dispatch-1', 'call-3', 'billing');
+					const ungrouped = approvalProposal('dispatch-1', 'call-4');
+					for (const proposal of [first, sibling, elsewhere, ungrouped]) {
+						await store.createToolApproval(proposal);
+					}
+
+					const result = await store.decideToolApproval({
+						proposalId: first.proposalId,
+						status: 'approved',
+						via: 'host',
+						actor: 'U1',
+					});
+
+					expect(result.approval).toMatchObject({
+						status: 'approved',
+						decidedVia: { kind: 'host', actor: 'U1' },
+					});
+					expect(result.grant).toMatchObject({
+						group: 'deploys',
+						instanceId: 'agent-1',
+						proposalId: first.proposalId,
+						actor: 'U1',
+					});
+					expect(result.escalated).toEqual([
+						{
+							approval: expect.objectContaining({
+								proposalId: sibling.proposalId,
+								status: 'approved',
+								decidedVia: { kind: 'escalation', grantProposalId: first.proposalId, actor: 'U1' },
+							}),
+							resumed: false,
+						},
+					]);
+					expect((await store.getToolApproval(elsewhere.proposalId))?.status).toBe('pending');
+					expect((await store.getToolApproval(ungrouped.proposalId))?.status).toBe('pending');
+					expect(await store.listToolEscalationGrants()).toEqual([
+						expect.objectContaining({ group: 'deploys', proposalId: first.proposalId }),
+					]);
+				});
+
+				it('lets the first decision on each proposal win against an escalation', async () => {
+					const store = escalationStore(await create());
+					await admitDispatchReady(store, dispatchInput());
+					const approved = groupedProposal('dispatch-1', 'call-1', 'deploys');
+					const rejected = groupedProposal('dispatch-1', 'call-2', 'deploys');
+					await store.createToolApproval(approved);
+					await store.createToolApproval(rejected);
+
+					await store.decideToolApproval({
+						proposalId: rejected.proposalId,
+						status: 'rejected',
+						via: 'host',
+					});
+					const result = await store.decideToolApproval({
+						proposalId: approved.proposalId,
+						status: 'approved',
+						via: 'host',
+					});
+					expect(result.grant).toBeDefined();
+					expect(result.escalated).toBeUndefined();
+					expect(await store.getToolApproval(rejected.proposalId)).toMatchObject({
+						status: 'rejected',
+						decidedVia: { kind: 'host' },
+					});
+					const replay = await store.decideToolApproval({
+						proposalId: approved.proposalId,
+						status: 'rejected',
+						via: 'host',
+					});
+					expect(replay).toMatchObject({
+						decisionApplied: false,
+						approval: { status: 'approved' },
+					});
+				});
+
+				it.each(['rejected', 'expired', 'canceled', 'aborted'] as const)(
+					'creates no grant for a %s decision or an approval that opts out',
+					async (status) => {
+						const store = escalationStore(await create());
+						await admitDispatchReady(store, dispatchInput());
+						const declined = groupedProposal('dispatch-1', 'call-1', 'deploys');
+						const once = groupedProposal('dispatch-1', 'call-2', 'deploys');
+						await store.createToolApproval(declined);
+						await store.createToolApproval(once);
+
+						expect(
+							(
+								await store.decideToolApproval({
+									proposalId: declined.proposalId,
+									status,
+									via: 'host',
+								})
+							).grant,
+						).toBeUndefined();
+						const result = await store.decideToolApproval({
+							proposalId: once.proposalId,
+							status: 'approved',
+							via: 'host',
+							escalate: false,
+						});
+						expect(result.grant).toBeUndefined();
+						expect(result.escalated).toBeUndefined();
+						expect(await store.listToolEscalationGrants()).toEqual([]);
+					},
+				);
+
+				it('approves through a grant only while it covers the request and is unrevoked', async () => {
+					const store = escalationStore(await create());
+					await admitDispatchReady(store, dispatchInput());
+					const origin = groupedProposal('dispatch-1', 'origin', 'deploys', {
+						escalation: { group: 'deploys', expiresInMs: 60_000 },
+					});
+					await store.createToolApproval(origin);
+					const { grant } = await store.decideToolApproval({
+						proposalId: origin.proposalId,
+						status: 'approved',
+						via: 'host',
+						actor: 'U1',
+					});
+					if (grant?.expiresAt === undefined) throw new Error('Expected an expiring grant.');
+
+					const covered = groupedProposal('dispatch-1', 'covered', 'deploys', {
+						requestedAt: grant.expiresAt - 1,
+					});
+					const late = groupedProposal('dispatch-1', 'late', 'deploys', {
+						requestedAt: grant.expiresAt,
+					});
+					const other = groupedProposal('dispatch-1', 'other', 'billing');
+					for (const proposal of [covered, late, other]) await store.createToolApproval(proposal);
+
+					expect(
+						await store.decideToolApproval({
+							proposalId: covered.proposalId,
+							status: 'approved',
+							via: 'escalation',
+						}),
+					).toMatchObject({
+						decisionApplied: true,
+						approval: {
+							status: 'approved',
+							decidedVia: { kind: 'escalation', grantProposalId: origin.proposalId, actor: 'U1' },
+						},
+					});
+					for (const proposal of [late, other]) {
+						expect(
+							await store.decideToolApproval({
+								proposalId: proposal.proposalId,
+								status: 'approved',
+								via: 'escalation',
+							}),
+						).toMatchObject({ decisionApplied: false, approval: { status: 'pending' } });
+					}
+
+					const revoked = await store.revokeToolEscalation({ group: 'deploys', actor: 'U2' });
+					expect(revoked).toEqual([
+						expect.objectContaining({ proposalId: origin.proposalId, revokedBy: 'U2' }),
+					]);
+					expect(await store.revokeToolEscalation({ group: 'deploys' })).toEqual([]);
+					expect(await store.listToolEscalationGrants()).toEqual([]);
+					const afterRevocation = groupedProposal('dispatch-1', 'after', 'deploys');
+					await store.createToolApproval(afterRevocation);
+					expect(
+						await store.decideToolApproval({
+							proposalId: afterRevocation.proposalId,
+							status: 'approved',
+							via: 'escalation',
+						}),
+					).toMatchObject({ decisionApplied: false });
+				});
+
+				it('records the escalation mode as the decision source', async () => {
+					const store = escalationStore(await create());
+					await admitDispatchReady(store, dispatchInput());
+					const granted = groupedProposal('dispatch-1', 'call-1', 'deploys');
+					const denied = groupedProposal('dispatch-1', 'call-2', 'deploys');
+					await store.createToolApproval(granted);
+					await store.createToolApproval(denied);
+
+					expect(
+						(
+							await store.decideToolApproval({
+								proposalId: granted.proposalId,
+								status: 'approved',
+								via: 'mode',
+							})
+						).approval.decidedVia,
+					).toEqual({ kind: 'mode', mode: 'granted' });
+					expect(
+						(
+							await store.decideToolApproval({
+								proposalId: denied.proposalId,
+								status: 'rejected',
+								reason: 'denied',
+								via: 'mode',
+							})
+						).approval,
+					).toMatchObject({ reason: 'denied', decidedVia: { kind: 'mode', mode: 'denied' } });
+					expect(await store.listToolEscalationGrants()).toEqual([]);
+					await expect(
+						store.decideToolApproval({
+							proposalId: denied.proposalId,
+							status: 'rejected',
+							via: 'escalation',
+						}),
+					).rejects.toThrow('can only approve');
+				});
+
+				it('tracks escalation projection repair for grants and revocations', async () => {
+					const store = escalationStore(await create());
+					await admitDispatchReady(store, dispatchInput());
+					const proposal = groupedProposal('dispatch-1', 'call-1', 'deploys');
+					await store.createToolApproval(proposal);
+					await store.decideToolApproval({
+						proposalId: proposal.proposalId,
+						status: 'approved',
+						via: 'host',
+					});
+
+					expect(await store.listToolEscalationProjectionWork()).toEqual([
+						{
+							grant: expect.objectContaining({ proposalId: proposal.proposalId }),
+							grantProjected: false,
+							revocationProjected: false,
+						},
+					]);
+					expect(await store.markToolEscalationProjected(proposal.proposalId, 'revoked')).toBe(
+						false,
+					);
+					expect(await store.markToolEscalationProjected(proposal.proposalId, 'granted')).toBe(
+						true,
+					);
+					expect(await store.listToolEscalationProjectionWork()).toEqual([]);
+
+					await store.revokeToolEscalation({ group: 'deploys', reason: 'done' });
+					expect(await store.listToolEscalationProjectionWork()).toEqual([
+						{
+							grant: expect.objectContaining({ revokeReason: 'done' }),
+							grantProjected: true,
+							revocationProjected: false,
+						},
+					]);
+					expect(await store.markToolEscalationProjected(proposal.proposalId, 'revoked')).toBe(
+						true,
+					);
+					expect(await store.listToolEscalationProjectionWork()).toEqual([]);
+				});
+			});
 
 		if (backend.durableToolApprovals)
 			describe('durable tool approvals', () => {

@@ -1,5 +1,6 @@
 import { DatabaseSync } from 'node:sqlite';
 import { afterEach, describe, expect, it } from 'vitest';
+import { toolApprovalDecisionRecord } from './conversation-records.ts';
 import {
 	assertSupportedFlueFormatVersion,
 	FLUE_DURABLE_TOOL_APPROVAL_FORMAT_VERSION,
@@ -117,6 +118,51 @@ describe('SQLite approval capability scope', () => {
 				sql.exec(`SELECT value FROM flue_meta WHERE key = 'format_version'`).toArray()[0]?.value,
 			),
 		).toBe(FLUE_DURABLE_TOOL_APPROVAL_FORMAT_VERSION);
+	});
+
+	it('adds escalation storage to an approval store from before escalations, keeping its rows', async () => {
+		database = new DatabaseSync(':memory:');
+		const sql = createSqlStorage(database);
+		ensureSqlAgentExecutionTables(sql, { toolApprovals: true });
+		// Reduce the schema to what the previous release created.
+		sql.exec('DROP INDEX flue_tool_approvals_escalation_idx');
+		sql.exec('ALTER TABLE flue_tool_approvals DROP COLUMN escalation_group');
+		sql.exec('ALTER TABLE flue_tool_approvals DROP COLUMN decided_via');
+		sql.exec('DROP TABLE flue_tool_escalation_grants');
+		const legacy = {
+			proposalId: 'approval_legacy',
+			submissionId: 'submission-1',
+			instanceId: 'agent-1',
+			conversationId: 'conversation-1',
+			harness: 'default',
+			session: 'default',
+			assistantMessageId: 'message-1',
+			toolCallId: 'call-1',
+			toolName: 'deploy',
+			toolVersion: '1',
+			arguments: {},
+			requestedAt: 1,
+		};
+		sql.exec(
+			`INSERT INTO flue_tool_approvals
+			 (proposal_id, submission_id, status, proposal_json, requested_at, decided_at, reason)
+			 VALUES (?, ?, 'approved', ?, 1, 2, NULL)`,
+			legacy.proposalId,
+			legacy.submissionId,
+			JSON.stringify(legacy),
+		);
+
+		ensureSqlAgentExecutionTables(sql, { toolApprovals: true });
+		const store = createSqlAgentExecutionStoreFromSql(sql, createTransaction(database), {
+			toolApprovals: true,
+		});
+
+		const approval = await store.getToolApproval?.(legacy.proposalId);
+		expect(approval).toEqual({ ...legacy, status: 'approved', decidedAt: 2 });
+		// The canonical decision rebuilds byte-identically to what the previous
+		// release appended, so projection repair never conflicts.
+		expect(approval && 'decidedVia' in toolApprovalDecisionRecord(approval)).toBe(false);
+		expect(await store.listToolEscalationGrants?.()).toEqual([]);
 	});
 
 	it('does not expose approval storage through the Node SQLite adapter', async () => {

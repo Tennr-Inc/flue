@@ -18,11 +18,13 @@ import {
 } from '../errors.ts';
 import type { DispatchInput, DispatchQueue } from '../runtime/dispatch-queue.ts';
 import type { CloudflareRuntime } from '../runtime/flue-app.ts';
-import type { ToolApproval } from '../tool-approval.ts';
+import type { ToolApproval, ToolEscalationGrant } from '../tool-approval.ts';
 import type { DispatchReceipt } from '../types.ts';
 import {
 	CLOUDFLARE_AGENT_INTERNAL_APPROVAL_PATH,
 	CLOUDFLARE_AGENT_INTERNAL_DISPATCH_PATH,
+	CLOUDFLARE_AGENT_INTERNAL_ESCALATION_REVOKE_PATH,
+	CLOUDFLARE_AGENT_INTERNAL_ESCALATIONS_PATH,
 	CLOUDFLARE_AGENT_INTERNAL_INSTANCE_INFO_PATH,
 } from './agent-coordinator.ts';
 
@@ -48,7 +50,12 @@ export interface CreateCloudflareWorkerConfigOptions {
 /** The Cloudflare-target seams the generated entry passes to `configureFlueRuntime`. */
 export type CloudflareWorkerConfig = Pick<
 	CloudflareRuntime,
-	'dispatchQueue' | 'routeAgentRequest' | 'instanceInfo' | 'resolveToolApproval'
+	| 'dispatchQueue'
+	| 'routeAgentRequest'
+	| 'instanceInfo'
+	| 'resolveToolApproval'
+	| 'listToolEscalations'
+	| 'revokeToolEscalation'
 >;
 
 export function createCloudflareWorkerConfig(
@@ -127,38 +134,82 @@ export function createCloudflareWorkerConfig(
 		return { id: instanceId, ...(typeof info.uid === 'string' ? { uid: info.uid } : {}) };
 	};
 
-	const resolveToolApproval: CloudflareRuntime['resolveToolApproval'] = async (input) => {
-		const binding = lookupBinding(input.agent, env);
-		if (!binding) throw new Error(`[flue] Approval target agent "${input.agent}" is unavailable.`);
-		// This is binding-only Durable Object RPC. Public agent requests retain
-		// their mounted route path, so they cannot match the exact private path
-		// handled by the Durable Object.
+	/**
+	 * Binding-only Durable Object RPC for the approval surface. Public agent
+	 * requests retain their mounted route path, so they cannot match the exact
+	 * private paths handled by the Durable Object.
+	 */
+	const callApprovalSurface = async <T>(
+		agent: string,
+		id: string,
+		path: string,
+		body: unknown,
+		failure: string,
+	): Promise<T> => {
+		const binding = lookupBinding(agent, env);
+		if (!binding) throw new Error(`[flue] Approval target agent "${agent}" is unavailable.`);
 		const response = await fetchAgent(
 			binding,
-			input.id,
-			new Request(`https://flue.invalid${CLOUDFLARE_AGENT_INTERNAL_APPROVAL_PATH}`, {
+			id,
+			new Request(`https://flue.invalid${path}`, {
 				method: 'POST',
 				headers: { 'content-type': 'application/json' },
-				body: JSON.stringify(input),
+				body: JSON.stringify(body),
 			}),
 		);
 		if (!response.ok) {
 			if (response.status >= 400 && response.status < 500) {
-				const body = (await response.json().catch(() => undefined)) as
+				const payload = (await response.json().catch(() => undefined)) as
 					{ error?: unknown } | undefined;
 				throw new InvalidRequestError({
 					reason:
-						typeof body?.error === 'string'
-							? body.error
-							: 'The tool approval decision was rejected by the target agent instance.',
+						typeof payload?.error === 'string'
+							? payload.error
+							: `The ${failure} was rejected by the target agent instance.`,
 				});
 			}
-			throw new Error(`[flue] Tool approval delivery failed with status ${response.status}.`);
+			throw new Error(`[flue] The ${failure} failed with status ${response.status}.`);
 		}
-		return (await response.json()) as ToolApproval;
+		return (await response.json()) as T;
 	};
 
-	return { dispatchQueue, routeAgentRequest, instanceInfo, resolveToolApproval };
+	const resolveToolApproval: CloudflareRuntime['resolveToolApproval'] = (input) =>
+		callApprovalSurface<ToolApproval>(
+			input.agent,
+			input.id,
+			CLOUDFLARE_AGENT_INTERNAL_APPROVAL_PATH,
+			input,
+			'tool approval decision',
+		);
+
+	const listToolEscalations: CloudflareRuntime['listToolEscalations'] = async (input) =>
+		(
+			await callApprovalSurface<{ grants: ToolEscalationGrant[] }>(
+				input.agent,
+				input.id,
+				CLOUDFLARE_AGENT_INTERNAL_ESCALATIONS_PATH,
+				input,
+				'tool escalation read',
+			)
+		).grants;
+
+	const revokeToolEscalation: CloudflareRuntime['revokeToolEscalation'] = (input) =>
+		callApprovalSurface<{ revoked: boolean }>(
+			input.agent,
+			input.id,
+			CLOUDFLARE_AGENT_INTERNAL_ESCALATION_REVOKE_PATH,
+			input,
+			'tool escalation revocation',
+		);
+
+	return {
+		dispatchQueue,
+		routeAgentRequest,
+		instanceInfo,
+		resolveToolApproval,
+		listToolEscalations,
+		revokeToolEscalation,
+	};
 }
 
 /**

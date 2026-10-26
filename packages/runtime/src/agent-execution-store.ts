@@ -16,7 +16,9 @@ import type {
 	ToolApproval,
 	ToolApprovalDecisionStatus,
 	ToolApprovalProposal,
+	ToolEscalationGrant,
 } from './tool-approval.ts';
+import type { StoredToolEscalationGrant } from './tool-escalation.ts';
 
 // ─── Durability defaults ────────────────────────────────────────────────────
 
@@ -142,6 +144,55 @@ export interface ToolApprovalProjectionWork {
 	readonly approval: ToolApproval;
 	readonly requestProjected: boolean;
 	readonly decisionProjected: boolean;
+}
+
+/** Input to {@link AgentSubmissionStore.decideToolApproval}. */
+export interface ToolApprovalDecisionInput {
+	readonly proposalId: string;
+	readonly status: ToolApprovalDecisionStatus;
+	readonly reason?: string;
+	/**
+	 * Who decides, recorded as the approval's `decidedVia`:
+	 *
+	 * - `host`: a host decision. Approving a grouped proposal grants its group
+	 *   unless `escalate` is `false`.
+	 * - `escalation`: approve only when an active, unrevoked grant for the
+	 *   proposal's group has not expired by the proposal's `requestedAt`;
+	 *   otherwise nothing is written and the proposal stays pending.
+	 * - `mode`: the render's escalation mode (`approved` = granted,
+	 *   `rejected` = denied).
+	 *
+	 * Omit for decisions the runtime makes on abort, expiry, or failure.
+	 */
+	readonly via?: 'host' | 'escalation' | 'mode';
+	readonly escalate?: boolean;
+	/** Opaque host principal, recorded for `via: 'host'`. */
+	readonly actor?: string;
+}
+
+export interface ToolApprovalDecisionResult {
+	readonly approval: ToolApproval;
+	readonly decisionApplied: boolean;
+	/** The decided proposal's parked submission became runnable. */
+	readonly resumed: boolean;
+	/** The grant this decision created, when it escalated the proposal's group. */
+	readonly grant?: StoredToolEscalationGrant;
+	/**
+	 * Other pending proposals in the group that this decision approved by
+	 * escalation, in the same transaction. `resumed` is reported once per
+	 * parked submission.
+	 */
+	readonly escalated?: ReadonlyArray<{
+		readonly approval: ToolApproval;
+		readonly resumed: boolean;
+	}>;
+}
+
+/** One escalation grant whose canonical records still need repair. */
+export interface ToolEscalationProjectionWork {
+	readonly grant: StoredToolEscalationGrant;
+	readonly grantProjected: boolean;
+	readonly revocationProjected: boolean;
 }
 
 // ─── Dispatch admission ─────────────────────────────────────────────────────
@@ -292,17 +343,41 @@ export interface AgentSubmissionStore {
 	/** Mark a claimed host notification as successfully delivered. */
 	completeToolApprovalNotification?(proposalId: string, now?: number): Promise<boolean>;
 	/**
-	 * Apply a decision idempotently. When the last pending proposal for a
-	 * parked submission is decided, the submission becomes runnable and its
-	 * remaining execution budget is preserved for the next claim.
+	 * Apply a decision idempotently; the first decision on a proposal wins.
+	 * When the last pending proposal for a parked submission is decided, the
+	 * submission becomes runnable and its remaining execution budget is
+	 * preserved for the next claim.
+	 *
+	 * A host approval of a grouped proposal (`via: 'host'`, `escalate` not
+	 * `false`) escalates in the same atomic step: it records a grant for the
+	 * group unless an active one exists, and approves every other proposal of
+	 * the group still pending, resuming their parked submissions likewise. A
+	 * grant therefore exists exactly when the approval that created it does.
 	 */
-	decideToolApproval?(input: {
-		proposalId: string;
-		status: ToolApprovalDecisionStatus;
-		reason?: string;
-	}): Promise<{ approval: ToolApproval; decisionApplied: boolean; resumed: boolean }>;
+	decideToolApproval?(input: ToolApprovalDecisionInput): Promise<ToolApprovalDecisionResult>;
 	/** Expire pending proposals whose deadline has passed. */
 	expireToolApprovals?(now?: number): Promise<Array<{ approval: ToolApproval; resumed: boolean }>>;
+	/**
+	 * Active escalation grants — unrevoked and unexpired at `now` — with the
+	 * most recent per group. The store holds one agent instance.
+	 */
+	listToolEscalationGrants?(now?: number): Promise<ToolEscalationGrant[]>;
+	/**
+	 * Revoke every active grant for `group` and return them. Idempotent:
+	 * returns an empty array when nothing was active.
+	 */
+	revokeToolEscalation?(input: {
+		group: string;
+		actor?: string;
+		reason?: string;
+	}): Promise<StoredToolEscalationGrant[]>;
+	/** Grants whose canonical granted or revoked record is not acknowledged yet. */
+	listToolEscalationProjectionWork?(): Promise<ToolEscalationProjectionWork[]>;
+	/** Acknowledge that one deterministic canonical escalation record is durable. */
+	markToolEscalationProjected?(
+		proposalId: string,
+		projection: 'granted' | 'revoked',
+	): Promise<boolean>;
 	/**
 	 * Record an abort request for every unsettled submission in a session.
 	 * Atomically stamps `abortRequestedAt` (COALESCE — first request wins) on

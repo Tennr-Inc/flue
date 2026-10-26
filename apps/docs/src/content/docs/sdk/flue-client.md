@@ -1,6 +1,6 @@
 ---
 title: FlueClient
-description: The Flue Agent SDK conversation client — send(), read(), wait(), abort(), approvals, history(), historyBefore(), observe(), and attachments.
+description: The Flue Agent SDK conversation client — send(), read(), wait(), abort(), approvals and escalations, history(), historyBefore(), observe(), and attachments.
 lastReviewedAt: 2026-07-21
 ---
 
@@ -17,6 +17,11 @@ interface FlueClient {
     proposalId: string,
     options: ResolveToolApprovalOptions,
   ): Promise<FlueToolApproval>;
+  toolEscalations(options?: { signal?: AbortSignal }): Promise<FlueToolEscalationGrant[]>;
+  revokeToolEscalation(
+    group: string,
+    options?: RevokeToolEscalationOptions,
+  ): Promise<RevokeToolEscalationResult>;
   history(options?: FlueConversationHistoryOptions): Promise<FlueConversationSnapshot>;
   historyBefore(
     cursor: string,
@@ -230,6 +235,8 @@ resolveToolApproval(
   options: {
     status: 'approved' | 'rejected' | 'expired' | 'canceled' | 'aborted';
     reason?: string;
+    escalate?: boolean;
+    actor?: string;
     signal?: AbortSignal;
   },
 ): Promise<FlueToolApproval>;
@@ -238,6 +245,36 @@ resolveToolApproval(
 `POST <conversation url>/tool-approvals/<proposalId>`. Resolves one durable proposal exposed by [`history()`](#history) or [`observe()`](#observe). The first non-pending decision wins; repeating a decision returns the stored row without changing it. The endpoint is mounted automatically by `createAgentRouter(...)` and is protected by the same host middleware as the rest of the conversation. Durable approval execution currently requires Cloudflare Durable Object SQLite.
 
 `approved` resumes the parked submission after every approval in its tool batch is decided. All other statuses record a deterministic tool error without entering the tool's `run` function. `signal` cancels only this HTTP request; it does not undo a decision already accepted by the Durable Object.
+
+For a proposal with `escalation`, approving grants the group to the agent instance unless `escalate` is `false`, and approves the group's other pending proposals in the same step. `actor` is an opaque principal recorded on the decision and on any grant. See [Approve a group of tools once](/docs/guide/tools/#approve-a-group-of-tools-once).
+
+## `toolEscalations()`
+
+```ts
+toolEscalations(options?: { signal?: AbortSignal }): Promise<FlueToolEscalationGrant[]>;
+
+interface FlueToolEscalationGrant {
+  group: string;
+  instanceId: string;
+  proposalId: string;
+  grantedAt: number;
+  expiresAt?: number;
+  actor?: string;
+}
+```
+
+`GET <conversation url>/tool-escalations`. Reads the agent instance's active escalation grants, the most recent per group.
+
+## `revokeToolEscalation()`
+
+```ts
+revokeToolEscalation(
+  group: string,
+  options?: { actor?: string; reason?: string; signal?: AbortSignal },
+): Promise<{ revoked: boolean }>;
+```
+
+`DELETE <conversation url>/tool-escalations/<group>`. Revokes the instance's active grant for one group, so the next call in it asks again. Idempotent: resolves `{ revoked: false }` when nothing was active.
 
 ## `history()`
 
@@ -300,13 +337,22 @@ interface FlueToolApproval {
   requestedAt: number;
   expiresAt?: number;
   presentation?: { title?: string; description?: string };
+  escalation?: {
+    group: string;
+    expiresInMs?: number;
+    presentation?: { title?: string; description?: string };
+  };
   status: 'pending' | 'approved' | 'rejected' | 'expired' | 'canceled' | 'aborted';
   decidedAt?: number;
   reason?: string;
+  decidedVia?:
+    | { kind: 'host'; actor?: string }
+    | { kind: 'escalation'; grantProposalId: string; actor?: string }
+    | { kind: 'mode'; mode: 'granted' | 'denied' };
 }
 ```
 
-The exact validated arguments and tool version are frozen when the proposal is created. `requestedAt`, `expiresAt`, and `decidedAt` are Unix milliseconds. Decision fields are absent while `status` is `pending`.
+The exact validated arguments and tool version are frozen when the proposal is created. `escalation` is present for a tool in an escalation group. `decidedVia` says who decided, and is absent for decisions made on abort, expiry, or failure. `requestedAt`, `expiresAt`, and `decidedAt` are Unix milliseconds. Decision fields are absent while `status` is `pending`.
 
 ### `FlueConversationMessage`
 

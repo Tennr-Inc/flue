@@ -20,7 +20,11 @@ import {
 } from '../errors.ts';
 import type { ToolApproval, ToolApprovalDecisionStatus } from '../tool-approval.ts';
 import { MAX_TOOL_APPROVAL_PROPOSAL_ID_LENGTH } from '../tool-approval.ts';
-import type { CloudflareRuntime, FlueRuntime } from './flue-app.ts';
+import {
+	assertToolEscalationRevocation,
+	type CloudflareRuntime,
+	type FlueRuntime,
+} from './flue-app.ts';
 import { handleAgentRequest } from './handle-agent.ts';
 import {
 	handleAgentAttachmentRead,
@@ -121,9 +125,21 @@ export async function executeAgentToolApprovalDecision(
 				'A tool approval decision status must be approved, rejected, expired, canceled, or aborted.',
 		});
 	}
-	const reason = (body as { reason?: unknown }).reason;
+	const { reason, escalate, actor } = body as {
+		reason?: unknown;
+		escalate?: unknown;
+		actor?: unknown;
+	};
 	if (reason !== undefined && typeof reason !== 'string') {
 		throw new InvalidRequestError({ reason: 'A tool approval decision reason must be a string.' });
+	}
+	if (escalate !== undefined && typeof escalate !== 'boolean') {
+		throw new InvalidRequestError({
+			reason: 'A tool approval decision escalate flag must be a boolean.',
+		});
+	}
+	if (actor !== undefined && typeof actor !== 'string') {
+		throw new InvalidRequestError({ reason: 'A tool approval decision actor must be a string.' });
 	}
 
 	const approval: ToolApproval = await rt.resolveToolApproval({
@@ -132,10 +148,51 @@ export async function executeAgentToolApprovalDecision(
 		proposalId,
 		status,
 		...(reason === undefined ? {} : { reason }),
+		...(escalate === undefined ? {} : { escalate }),
+		...(actor === undefined ? {} : { actor }),
 	});
 	return Response.json(publicToolApproval(approval), {
 		headers: { 'cache-control': 'no-store' },
 	});
+}
+
+/** List an agent instance's active escalation grants. */
+export async function executeAgentToolEscalationList(
+	rt: FlueRuntime,
+	target: AgentRequestTarget,
+): Promise<Response> {
+	if (rt.target !== 'cloudflare') throw new ToolApprovalUnavailableError();
+	const grants = await rt.listToolEscalations({
+		agent: target.agentName,
+		id: target.instanceId,
+	});
+	return Response.json({ grants }, { headers: { 'cache-control': 'no-store' } });
+}
+
+/** Revoke an agent instance's active grant for one escalation group. Idempotent. */
+export async function executeAgentToolEscalationRevoke(
+	rt: FlueRuntime,
+	target: AgentRequestTarget & { group: string },
+): Promise<Response> {
+	assertToolEscalationRevocation({ group: target.group });
+	if (rt.target !== 'cloudflare') throw new ToolApprovalUnavailableError();
+	// The body is optional: a bare DELETE revokes without an actor or reason.
+	const body = await parseJsonBody(target.request);
+	if (body !== undefined && (!body || typeof body !== 'object' || Array.isArray(body))) {
+		throw new InvalidRequestError({
+			reason: 'A tool escalation revocation body must be a JSON object.',
+		});
+	}
+	const { actor, reason } = (body ?? {}) as { actor?: unknown; reason?: unknown };
+	assertToolEscalationRevocation({ group: target.group, actor, reason });
+	const result = await rt.revokeToolEscalation({
+		agent: target.agentName,
+		id: target.instanceId,
+		group: target.group,
+		...(typeof actor === 'string' ? { actor } : {}),
+		...(typeof reason === 'string' ? { reason } : {}),
+	});
+	return Response.json(result, { headers: { 'cache-control': 'no-store' } });
 }
 
 /** Serve one attachment's bytes. */
@@ -253,7 +310,9 @@ function publicToolApproval(approval: ToolApproval): AgentConversationToolApprov
 		status: approval.status,
 		...(approval.expiresAt === undefined ? {} : { expiresAt: approval.expiresAt }),
 		...(approval.presentation === undefined ? {} : { presentation: approval.presentation }),
+		...(approval.escalation === undefined ? {} : { escalation: approval.escalation }),
 		...(approval.decidedAt === undefined ? {} : { decidedAt: approval.decidedAt }),
 		...(approval.reason === undefined ? {} : { reason: approval.reason }),
+		...(approval.decidedVia === undefined ? {} : { decidedVia: approval.decidedVia }),
 	};
 }

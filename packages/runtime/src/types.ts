@@ -18,17 +18,24 @@ declare module '@earendil-works/pi-agent-core' {
 
 import type * as v from 'valibot';
 import type { McpConnectionDefinition } from './mcp-types.ts';
+import type { ToolEscalationDeclaration } from './tool-escalation.ts';
 import type { ToolDefinition } from './tool-types.ts';
 
 export type {
 	ToolApproval,
+	ToolApprovalDecidedVia,
 	ToolApprovalDecision,
 	ToolApprovalDecisionStatus,
+	ToolApprovalEscalation,
 	ToolApprovalPolicy,
 	ToolApprovalPresentation,
 	ToolApprovalProposal,
 	ToolApprovalProvider,
 	ToolApprovalStatus,
+	ToolEscalationGrant,
+	ToolEscalationMode,
+	ToolEscalationOptions,
+	ToolEscalationState,
 } from './tool-approval.ts';
 export type {
 	ToolContext,
@@ -600,6 +607,8 @@ export interface AgentRuntimeConfig {
 	 * tools at submission initialization.
 	 */
 	mcpConnections?: McpConnectionDefinition[];
+	/** Escalation groups declared with `useToolEscalation()`, by group. */
+	toolEscalations?: ReadonlyMap<string, ToolEscalationDeclaration>;
 }
 
 // ─── Agent functions (Flue Hooks) ────────────────────────────────────────────
@@ -1326,6 +1335,28 @@ type FlueEventVariant =
 			toolName: string;
 			toolCallId: string;
 			status: 'approved' | 'rejected' | 'expired' | 'canceled' | 'aborted';
+			reason?: string;
+			/**
+			 * Who decided: the host, an active escalation grant, or the render's
+			 * escalation mode. Absent for decisions made on abort, expiry, or failure.
+			 */
+			via?: 'host' | 'escalation' | 'mode';
+	  }
+	| {
+			/** A host approval escalated its group: later calls in it are approved by Flue. */
+			type: 'tool_escalation_granted';
+			group: string;
+			/** The approval that created the grant. */
+			proposalId: string;
+			expiresAt?: number;
+			actor?: string;
+	  }
+	| {
+			type: 'tool_escalation_revoked';
+			group: string;
+			/** The approval that created the revoked grant. */
+			proposalId: string;
+			actor?: string;
 			reason?: string;
 	  }
 	| {
