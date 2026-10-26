@@ -168,7 +168,7 @@ Declare an escalation group for this render and read its state. Approval-gated t
 
 - `mode` is read from the render that produced each call: `granted` approves and `denied` rejects every call in the group without asking anyone; `ask` waits for a grant. A new mode applies to later calls only.
 - The returned state is a render-time snapshot, like `usePersistentState`; grants are re-read before every re-render.
-- Group names match `/^[a-z0-9][a-z0-9_-]{0,63}$/`. Declaring a group twice in one render throws, and so does mounting a tool (including an MCP-adapted tool) whose group the render did not declare. Subagent renders throw.
+- Group names match `/^[a-z0-9][a-z0-9_-]{0,63}$/`. Declaring a group twice in one render throws, and so does mounting a tool or declaring an MCP connection whose group the render did not declare. The MCP check runs on the connection definition, before any server is contacted. Subagent renders throw.
 
 ## `useMcpConnection()`
 

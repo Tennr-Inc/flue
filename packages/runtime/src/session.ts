@@ -5222,6 +5222,10 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		const decide = this.submissionStore?.decideToolApproval;
 		if (!decide) return undefined;
 		const { group, mode = 'ask' } = escalation;
+		// The store checks the grant inside the decision. A store without grant
+		// support would ignore `via` and approve unconditionally, so it never
+		// gets asked; the call parks for the host instead.
+		if (mode === 'ask' && !this.submissionStore?.listToolEscalationGrants) return undefined;
 		const result = await decide.call(
 			this.submissionStore,
 			mode === 'denied'
@@ -5272,6 +5276,9 @@ export class Session implements FlueSession, AgentSubmissionSession {
 			...(approval.reason ? { reason: approval.reason } : {}),
 			...(approval.decidedVia ? { via: approval.decidedVia.kind } : {}),
 		});
+		// A call past its own deadline expires instead; that is not a decision
+		// Flue made through a grant or mode, so `decided` doesn't hear about it.
+		if (approval.decidedVia?.kind !== 'escalation' && approval.decidedVia?.kind !== 'mode') return;
 		void notifyToolApprovalDecided(approval, (error) =>
 			this.internalLog('error', '[flue:tool-approval] Host decision notification failed', {
 				proposalId: approval.proposalId,
@@ -5546,7 +5553,15 @@ export class Session implements FlueSession, AgentSubmissionSession {
 					throw new Error('unreachable');
 				},
 			};
-			return this.wrapModelTool(tool, 'custom', (toolCallId, params, signal) => {
+			return this.wrapModelTool(tool, 'custom', (toolCallId, modelParams, signal) => {
+				// A call Flue approved through a grant or mode runs on the parsed
+				// arguments its approval recorded, exactly as recovery runs them: the
+				// schema's transforms and defaults already ran, so they never run twice.
+				const approved = this.autoApprovedToolCalls.get(toolCallId);
+				const approvedArguments = approved
+					? cloneJsonSerializable(approved.arguments, `Tool "${toolDef.name}" approved arguments`)
+					: undefined;
+				const params = approvedArguments ?? modelParams;
 				if (preparedToolAdapter) {
 					return {
 						args: params,
@@ -5567,13 +5582,19 @@ export class Session implements FlueSession, AgentSubmissionSession {
 					};
 				}
 				const toolLogger = this.createToolLogger(toolDef.name, toolCallId);
-				const parsed = parseToolInput(toolDef, params, signal, {
+				const facilities = {
 					log: toolLogger,
 					toolCallId,
 					...(toolDef.durable
 						? { step: this.createToolStep(toolDef.name, toolCallId, toolLogger) }
 						: {}),
-				});
+				};
+				const parsed = approvedArguments
+					? {
+							context: createParsedToolContext(toolDef, approvedArguments, signal, facilities),
+							data: approvedArguments,
+						}
+					: parseToolInput(toolDef, modelParams, signal, facilities);
 				return {
 					args: parsed.data,
 					run: async () =>

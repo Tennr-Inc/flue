@@ -22,7 +22,7 @@ import type { AgentSubmissionStore } from '../agent-execution-store.ts';
 import { PersistedFormatVersionError } from '../errors.ts';
 import type { AgentSubmissionInput } from '../runtime/agent-submissions.ts';
 import type { DispatchInput } from '../runtime/dispatch-queue.ts';
-import type { ToolApprovalProposal } from '../tool-approval.ts';
+import { type ToolApprovalProposal, toolEscalationDeniedReason } from '../tool-approval.ts';
 
 export { defineAttachmentStoreContractTests } from './define-attachment-store-contract-tests.ts';
 export { defineConversationStreamStoreContractTests } from './define-conversation-stream-store-contract-tests.ts';
@@ -819,6 +819,32 @@ export function defineStoreContractTests(label: string, backend: StoreContractTe
 					expect(result.grant).toBeDefined();
 					expect(result.escalated).toBeUndefined();
 					expect((await store.getToolApproval(denied.proposalId))?.status).toBe('pending');
+				});
+
+				it('applies the denied mode to a host approval instead of approving or granting', async () => {
+					const store = escalationStore(await create());
+					await admitDispatchReady(store, dispatchInput());
+					const denied = groupedProposal('dispatch-1', 'denied', 'deploys', {
+						escalation: { group: 'deploys', mode: 'denied' },
+					});
+					await store.createToolApproval(denied);
+
+					const result = await store.decideToolApproval({
+						proposalId: denied.proposalId,
+						status: 'approved',
+						via: 'host',
+						actor: 'U1',
+					});
+					expect(result).toMatchObject({
+						decisionApplied: true,
+						approval: {
+							status: 'rejected',
+							reason: toolEscalationDeniedReason('deploys'),
+							decidedVia: { kind: 'mode', mode: 'denied' },
+						},
+					});
+					expect(result.grant).toBeUndefined();
+					expect(await store.listToolEscalationGrants()).toEqual([]);
 				});
 
 				it('revokes an expired grant that still covers earlier requests', async () => {

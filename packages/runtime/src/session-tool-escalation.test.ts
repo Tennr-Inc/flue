@@ -9,6 +9,7 @@ import {
 	fauxToolCall,
 } from '@earendil-works/pi-ai/providers/faux';
 import type { CallToolResult, Tool, Transport } from '@modelcontextprotocol/client';
+import * as v from 'valibot';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { AgentSubmissionStore, ToolApprovalDecisionInput } from './agent-execution-store.ts';
 import { createFlueContext } from './client.ts';
@@ -257,7 +258,12 @@ type Fixture = Awaited<ReturnType<typeof createFixture>>;
 // Two Notion-style write tools in one escalation group, plus an ungrouped
 // approval-gated tool to show grouping does not leak.
 function notionAgent(
-	options: { mode?: ToolEscalationMode; expiresInMs?: number; declare?: boolean } = {},
+	options: {
+		mode?: ToolEscalationMode;
+		expiresInMs?: number;
+		declare?: boolean;
+		approvalExpiresInMs?: number;
+	} = {},
 ) {
 	const edit = vi.fn(async () => ({ output: 'edited' }));
 	const publish = vi.fn(async () => ({ output: 'published' }));
@@ -281,7 +287,13 @@ function notionAgent(
 				name,
 				description: `Notion ${name}.`,
 				version: '1',
-				approval: { required: true, escalation: 'notion-edit' },
+				approval: {
+					required: true,
+					escalation: 'notion-edit',
+					...(options.approvalExpiresInMs !== undefined
+						? { expiresInMs: options.approvalExpiresInMs }
+						: {}),
+				},
 				run,
 			});
 		}
@@ -690,6 +702,112 @@ describe('tool escalation lifecycle', () => {
 		expect(await outcomeFor(fixture, 'edit-2')).toMatchObject({ isError: true });
 	});
 
+	it('applies the denied mode when a host approves a call that a crash left pending', async () => {
+		const fixture = await createFixture();
+		const { agent, edit } = notionAgent({ mode: 'denied' });
+		fixture.model.setResponses([toolRequest(call('edit_page', 'edit-1'))]);
+		fixture.loseNextEscalationDecision();
+		await expect(fixture.attempt(agent)).rejects.toBe(fixture.crash);
+		const [pending] = await fixture.approvals();
+		if (!pending) throw new Error('Expected a pending approval.');
+		expect(pending).toMatchObject({ status: 'pending', escalation: { mode: 'denied' } });
+
+		const decision = await fixture.decide(pending.proposalId, {
+			status: 'approved',
+			actor: 'U123',
+		});
+		expect(decision.approval).toMatchObject({
+			status: 'rejected',
+			decidedVia: { kind: 'mode', mode: 'denied' },
+		});
+		expect(decision.grant).toBeUndefined();
+		await fixture.reopen();
+
+		fixture.model.setResponses([fauxAssistantMessage('Not allowed.')]);
+		expect(await fixture.attempt(agent)).toMatchObject({ status: 'settled' });
+		expect(edit).not.toHaveBeenCalled();
+		expect(await fixture.submissions.listToolEscalationGrants?.()).toEqual([]);
+		expect(await outcomeFor(fixture, 'edit-1')).toMatchObject({ isError: true });
+	});
+
+	it('expires a recovered call past its deadline without reporting it as a Flue decision', async () => {
+		const fixture = await createFixture();
+		const provider = installProvider();
+		const { agent, edit } = notionAgent({ approvalExpiresInMs: 1_000 });
+		await escalateOnce(fixture, agent);
+
+		fixture.model.setResponses([toolRequest(call('edit_page', 'edit-2'))]);
+		fixture.loseNextEscalationDecision();
+		await expect(fixture.attempt(agent, 'submission-2')).rejects.toBe(fixture.crash);
+		const later = Date.now() + 5_000;
+		vi.useFakeTimers({ toFake: ['Date'] });
+		vi.setSystemTime(later);
+		await fixture.reopen();
+
+		fixture.model.setResponses([fauxAssistantMessage('Too late.')]);
+		expect(await fixture.attempt(agent, 'submission-2')).toMatchObject({ status: 'settled' });
+		expect(edit).toHaveBeenCalledTimes(1);
+		const [expired] = await fixture.approvals('submission-2');
+		expect(expired).toMatchObject({ status: 'expired' });
+		expect(expired?.decidedVia).toBeUndefined();
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		expect(provider.decided).not.toHaveBeenCalled();
+	});
+
+	it('asks the host when the store cannot check grants', async () => {
+		const fixture = await createFixture();
+		const { agent, edit } = notionAgent();
+		await escalateOnce(fixture, agent);
+		// A store written before escalation would ignore the decision source and
+		// approve without a grant, so it is never asked to.
+		delete (fixture.submissions as Partial<AgentSubmissionStore>).listToolEscalationGrants;
+
+		fixture.model.setResponses([toolRequest(call('edit_page', 'edit-2'))]);
+		expect(await fixture.attempt(agent, 'submission-2')).toMatchObject({
+			status: 'waiting_for_approval',
+		});
+		expect(edit).toHaveBeenCalledTimes(1);
+		expect(await fixture.approvals('submission-2')).toMatchObject([{ status: 'pending' }]);
+	});
+
+	it('runs an automatically approved call on the parsed arguments its approval recorded', async () => {
+		const fixture = await createFixture();
+		let generated = 0;
+		const run = vi.fn(async ({ data }: { data: { requestId: string; title: string } }) => ({
+			output: data,
+		}));
+		function TestAgent() {
+			useModel('faux/faux-1', { compaction: false });
+			useToolEscalation('notion-edit', { mode: 'granted' });
+			useTool({
+				name: 'edit_page',
+				description: 'Edit a Notion page.',
+				version: '1',
+				input: v.object({
+					requestId: v.optional(v.string(), () => `request-${++generated}`),
+					title: v.pipe(
+						v.string(),
+						v.transform((title) => `${title}!`),
+					),
+				}),
+				approval: { required: true, escalation: 'notion-edit' },
+				run,
+			});
+			return 'Edit Notion pages.';
+		}
+		fixture.model.setResponses([
+			toolRequest(fauxToolCall('edit_page', { title: 'Plan' }, { id: 'edit-1' })),
+			fauxAssistantMessage('Done.'),
+		]);
+		expect(await fixture.attempt(TestAgent as Agent)).toMatchObject({ status: 'settled' });
+
+		const [approval] = await fixture.approvals();
+		expect(approval?.arguments).toEqual({ requestId: expect.any(String), title: 'Plan!' });
+		expect(run).toHaveBeenCalledTimes(1);
+		// Neither a fresh default nor a second transform.
+		expect(run.mock.calls[0]?.[0].data).toEqual(approval?.arguments);
+	});
+
 	it('does not start an escalated call once an abort is recorded', async () => {
 		const fixture = await createFixture();
 		const { agent, edit } = notionAgent();
@@ -759,9 +877,11 @@ describe('MCP tool escalation', () => {
 			async (request: { name: string }) =>
 				({ content: [{ type: 'text', text: `${request.name} ok` }] }) as CallToolResult,
 		);
+		const connect = vi.fn();
 		const mcpConnections: McpConnectionResolver = {
-			resolve: (definition) =>
-				createMcpConnectionWithClient(
+			resolve: (definition) => {
+				connect(definition.name);
+				return createMcpConnectionWithClient(
 					definition.name,
 					{
 						connect: async () => {},
@@ -772,9 +892,10 @@ describe('MCP tool escalation', () => {
 					{} as Transport,
 					{},
 					{ tools: definition.tools, approval: definition.approval },
-				),
+				);
+			},
 		};
-		return { callTool, mcpConnections };
+		return { callTool, connect, mcpConnections };
 	}
 
 	function notionMcpAgent(declare: boolean) {
@@ -817,13 +938,53 @@ describe('MCP tool escalation', () => {
 		]);
 	});
 
-	it('fails submission initialization when the render does not declare the MCP group', async () => {
-		const { callTool, mcpConnections } = createMcpServer();
+	it('fails the render before connecting when the MCP group is undeclared', async () => {
+		const { callTool, connect, mcpConnections } = createMcpServer();
 		const fixture = await createFixture({ mcpConnections });
 		fixture.model.setResponses([fauxAssistantMessage('Unreachable.')]);
 		await expect(fixture.attempt(notionMcpAgent(false))).rejects.toThrow(
-			/^\[flue\] Tool "mcp__notion__create_page" names escalation group "notion-edit", which this render did not declare\./,
+			/^\[flue\] MCP connection "notion" names escalation group "notion-edit", which this render did not declare\./,
 		);
+		// Checked on the definition, so a typo surfaces even when the server is down.
+		expect(connect).not.toHaveBeenCalled();
 		expect(callTool).not.toHaveBeenCalled();
+	});
+
+	it("keeps a dropped connection's group declaration for its still-mounted tools", async () => {
+		const { callTool, mcpConnections } = createMcpServer();
+		const fixture = await createFixture({ mcpConnections });
+		let enabled = true;
+		const NotionAgent = () => {
+			useModel('faux/faux-1', { compaction: false });
+			useTool({
+				name: 'disable_notion',
+				description: 'Turn Notion off.',
+				version: '1',
+				run: async () => {
+					enabled = false;
+					return { output: 'disabled' };
+				},
+			});
+			if (enabled) {
+				useToolEscalation('notion-edit', { mode: 'granted' });
+				useMcpConnection({
+					name: 'notion',
+					url: 'https://mcp.example.test/mcp',
+					approval: { required: true, escalation: 'notion-edit' },
+				});
+			}
+			return 'Edit Notion.';
+		};
+		fixture.model.setResponses([
+			toolRequest(fauxToolCall('disable_notion', {}, { id: 'off' })),
+			toolRequest(fauxToolCall('mcp__notion__create_page', { title: 'A' }, { id: 'a' })),
+			fauxAssistantMessage('Done.'),
+		]);
+		// MCP tools stay mounted until the next submission; so does their group.
+		expect(await fixture.attempt(NotionAgent as Agent)).toMatchObject({ status: 'settled' });
+		expect(callTool).toHaveBeenCalledTimes(1);
+		expect(await fixture.approvals()).toMatchObject([
+			{ status: 'approved', decidedVia: { kind: 'mode', mode: 'granted' } },
+		]);
 	});
 });

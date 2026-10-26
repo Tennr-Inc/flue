@@ -72,7 +72,7 @@ export interface RevokeToolEscalationOptions {
 
 /** Result of revoking an escalation grant. */
 export interface RevokeToolEscalationResult {
-	/** `false` when no grant for the group was active (revocation is idempotent). */
+	/** `false` when the group had no unrevoked grant, expired or not (revocation is idempotent). */
 	revoked: boolean;
 }
 

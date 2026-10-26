@@ -130,7 +130,7 @@ The response is the durable approval row, including the proposal, its status, an
 
 ### The SDK wraps this surface
 
-A [`createFlueClient(...)`](/docs/sdk/create-flue-client/) client addresses exactly one conversation URL and packages the whole surface — `send()`, `wait()`, `observe()`, `history()`, `abort()`, `resolveToolApproval()`, and `attachmentUrl()` — over the routes above:
+A [`createFlueClient(...)`](/docs/sdk/create-flue-client/) client addresses exactly one conversation URL and packages the whole surface — `send()`, `wait()`, `observe()`, `history()`, `abort()`, `resolveToolApproval()`, `toolEscalations()`, `revokeToolEscalation()`, and `attachmentUrl()` — over the routes above:
 
 ```ts
 import { createFlueClient } from '@flue/sdk';

@@ -555,44 +555,46 @@ class CloudflareAgentCoordinator {
 		});
 		const escalated = result.escalated ?? [];
 		const drainArm = this.armDrain();
-		// The approval table is authoritative, but public history/updates are
-		// projected from canonical conversation records. Persist the decision
-		// immediately even when other approvals keep this submission parked for
-		// days. Replays are idempotent and repair a crash between the table CAS and
-		// this append.
 		try {
+			// The approval table is authoritative, but public history/updates are
+			// projected from canonical conversation records. Persist the decision
+			// immediately even when other approvals keep this submission parked for
+			// days. Replays are idempotent and repair a crash between the table CAS
+			// and this append.
 			await this.repairToolApprovalRecords(result.approval);
 			if (result.grant) await this.repairToolEscalationRecords(result.grant);
 			for (const { approval } of escalated) await this.repairToolApprovalRecords(approval);
+			// Events and notifications go out before the wake settles: a retry of
+			// this decision is not applied again, so it could never replay them.
+			if (result.decisionApplied) {
+				this.emitApprovalDecided(result.approval);
+			}
+			if (result.grant) {
+				this.emitCoordinatorEvent({
+					type: 'tool_escalation_granted',
+					group: result.grant.group,
+					proposalId: result.grant.proposalId,
+					...(result.grant.expiresAt === undefined ? {} : { expiresAt: result.grant.expiresAt }),
+					...(result.grant.actor === undefined ? {} : { actor: result.grant.actor }),
+				});
+			}
+			if (result.decisionApplied && result.resumed) {
+				this.emitApprovalResumed(result.approval);
+			}
+			for (const { approval, resumed } of escalated) {
+				this.emitApprovalDecided(approval);
+				if (resumed) this.emitApprovalResumed(approval);
+				this.instance.ctx.waitUntil?.(
+					notifyToolApprovalDecided(approval, (error) =>
+						console.error('[flue:tool-approval] Host decision notification failed.', error),
+					),
+				);
+			}
 		} finally {
 			// Schedule the durable wake even if the public record append fails. A
 			// retry/reconcile pass can repair projection without leaving an approved
 			// submission stranded.
 			await drainArm;
-		}
-		if (result.decisionApplied) {
-			this.emitApprovalDecided(result.approval);
-		}
-		if (result.grant) {
-			this.emitCoordinatorEvent({
-				type: 'tool_escalation_granted',
-				group: result.grant.group,
-				proposalId: result.grant.proposalId,
-				...(result.grant.expiresAt === undefined ? {} : { expiresAt: result.grant.expiresAt }),
-				...(result.grant.actor === undefined ? {} : { actor: result.grant.actor }),
-			});
-		}
-		if (result.decisionApplied && result.resumed) {
-			this.emitApprovalResumed(result.approval);
-		}
-		for (const { approval, resumed } of escalated) {
-			this.emitApprovalDecided(approval);
-			if (resumed) this.emitApprovalResumed(approval);
-			this.instance.ctx.waitUntil?.(
-				notifyToolApprovalDecided(approval, (error) =>
-					console.error('[flue:tool-approval] Host decision notification failed.', error),
-				),
-			);
 		}
 		return result.approval;
 	}
@@ -621,19 +623,25 @@ class CloudflareAgentCoordinator {
 			...(input.actor === undefined ? {} : { actor: input.actor }),
 			...(input.reason === undefined ? {} : { reason: input.reason }),
 		});
-		// The wake retries any revocation record the append below defers.
-		if (revoked.length > 0) await this.armDrain();
-		for (const grant of revoked) {
-			await this.repairToolEscalationRecords(grant);
-			this.emitCoordinatorEvent({
-				type: 'tool_escalation_revoked',
-				group: grant.group,
-				proposalId: grant.proposalId,
-				...(grant.revokedBy === undefined ? {} : { actor: grant.revokedBy }),
-				...(grant.revokeReason === undefined ? {} : { reason: grant.revokeReason }),
-			});
+		if (revoked.length === 0) return { revoked: false };
+		// The wake retries any revocation record the append below defers. Events
+		// go out before it settles: a retried revoke finds nothing left to revoke.
+		const drainArm = this.armDrain();
+		try {
+			for (const grant of revoked) {
+				await this.repairToolEscalationRecords(grant);
+				this.emitCoordinatorEvent({
+					type: 'tool_escalation_revoked',
+					group: grant.group,
+					proposalId: grant.proposalId,
+					...(grant.revokedBy === undefined ? {} : { actor: grant.revokedBy }),
+					...(grant.revokeReason === undefined ? {} : { reason: grant.revokeReason }),
+				});
+			}
+		} finally {
+			await drainArm;
 		}
-		return { revoked: revoked.length > 0 };
+		return { revoked: true };
 	}
 
 	private emitApprovalDecided(approval: ToolApproval): void {

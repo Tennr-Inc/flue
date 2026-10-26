@@ -145,9 +145,10 @@ export async function getToolEscalations(
 }
 
 /**
- * Revoke an agent instance's active grant for one escalation group. The next
- * call in the group asks for approval again. Idempotent: resolves
- * `{ revoked: false }` when no grant was active.
+ * Revoke an agent instance's grant for one escalation group. The next call
+ * in the group asks for approval again. An expired grant is revoked too, since
+ * it still covers calls requested before it expired. Idempotent: resolves
+ * `{ revoked: false }` when the group had no unrevoked grant.
  */
 export async function revokeToolEscalation(
 	input: ToolEscalationRevocationInput,

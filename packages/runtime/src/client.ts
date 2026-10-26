@@ -30,7 +30,7 @@ import type {
 } from './session.ts';
 import { getPreparedToolAdapter } from './tool-adapter.ts';
 import {
-	assertToolEscalationsDeclared,
+	carryToolEscalations,
 	indexToolEscalationGrants,
 	type ToolEscalationDeclaration,
 } from './tool-escalation.ts';
@@ -377,10 +377,10 @@ async function initializeRootHarness(
 			resolveMcpTools(config, definition.mcpConnections),
 			resolveSandbox(config.id, definition.sandbox),
 		]);
-	// The render validated its own tools' groups; MCP tools join after it.
+	// The render validated its tools' and MCP connections' groups.
 	const initialToolEscalations: ReadonlyMap<string, ToolEscalationDeclaration> =
 		definition.toolEscalations ?? new Map();
-	assertToolEscalationsDeclared(mcpTools, initialToolEscalations);
+	let lastToolEscalations = initialToolEscalations;
 	for (const entry of mcpUnavailable) {
 		emitEvent({
 			type: 'log',
@@ -483,8 +483,12 @@ async function initializeRootHarness(
 		const next = renderAgentFunctionWithStructure(agent, renderState);
 		assertRenderStructureInvariance(lastStructure, next.structure);
 		lastStructure = next.structure;
-		const toolEscalations = next.config.toolEscalations ?? new Map();
-		assertToolEscalationsDeclared(mcpTools, toolEscalations);
+		const toolEscalations = carryToolEscalations(
+			next.config.toolEscalations ?? new Map(),
+			mcpTools,
+			lastToolEscalations,
+		);
+		lastToolEscalations = toolEscalations;
 		return {
 			// `promptContext` is read at call time: frozen across environment
 			// swaps, refreshed by the compaction rebaseline's rediscover.

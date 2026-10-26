@@ -451,6 +451,78 @@ describe('tool escalation through the coordinator', () => {
 		}
 	});
 
+	it('still announces a committed grant and revocation when arming the wake fails', async () => {
+		vi.spyOn(console, 'error').mockImplementation(() => {});
+		const decided = vi.fn();
+		setToolApprovalProvider({ requested: vi.fn(), decided });
+		const events: FlueEvent[] = [];
+		const stop = observe((event) => {
+			if (event.type.startsWith('tool_')) events.push(event);
+		});
+		try {
+			const { cell, runtime } = fixture();
+			const alice = cell('alice');
+			await alice.send();
+			await alice.drain();
+			const created = (await alice.records()).find(
+				(record): record is Extract<ConversationRecord, { type: 'conversation_created' }> =>
+					record.type === 'conversation_created',
+			);
+			if (!created) throw new Error('Expected the root conversation.');
+			for (const toolCallId of ['call-1', 'call-2']) {
+				await alice.store.createToolApproval?.({
+					proposalId: `approval_${toolCallId}`,
+					submissionId: 'parked',
+					agentName: 'Support',
+					instanceId: 'alice',
+					conversationId: created.conversationId,
+					harness: created.harness,
+					session: created.session,
+					assistantMessageId: 'assistant-1',
+					toolCallId,
+					toolName: 'edit_page',
+					toolVersion: '1',
+					arguments: {},
+					requestedAt: 1,
+					escalation: { group: 'notion-edit', mode: 'ask' },
+				});
+			}
+			const schedule = vi.mocked(alice.instance.schedule);
+			schedule.mockRejectedValueOnce(new Error('wake storage unavailable'));
+			await expect(
+				runtime.resolveToolApproval(alice.instance, {
+					agent: 'Support',
+					id: 'alice',
+					proposalId: 'approval_call-1',
+					status: 'approved',
+				}),
+			).rejects.toThrow('wake storage unavailable');
+			// A retried decision is no longer applied, so it could not replay these.
+			await vi.waitFor(() =>
+				expect(decided).toHaveBeenCalledWith(
+					expect.objectContaining({ proposalId: 'approval_call-2', status: 'approved' }),
+				),
+			);
+
+			schedule.mockRejectedValueOnce(new Error('wake storage unavailable'));
+			await expect(
+				runtime.revokeToolEscalation(alice.instance, {
+					agent: 'Support',
+					id: 'alice',
+					group: 'notion-edit',
+				}),
+			).rejects.toThrow('wake storage unavailable');
+			expect(events.map((event) => event.type)).toEqual([
+				'tool_approval_decided',
+				'tool_escalation_granted',
+				'tool_approval_decided',
+				'tool_escalation_revoked',
+			]);
+		} finally {
+			stop();
+		}
+	});
+
 	it('rejects a grant read or revocation addressed to another instance', async () => {
 		const { cell, runtime } = fixture();
 		const alice = cell('alice');

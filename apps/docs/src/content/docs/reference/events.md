@@ -479,7 +479,7 @@ For model-invoked calls the terminal `tool` event is published when the turn's t
 
 These events identify a durable approval lifecycle. `requested` is emitted after the immutable proposal is persisted, `waiting` marks the parked submission, `decided` reports the first durable decision (including expiration or abort), and `resumed` means the last pending proposal for the batch released the submission. Approval waiting has no `tool` event and no model-visible placeholder result; a later `tool` event appears only when an approved call's batch commits.
 
-`via` on `decided` says who decided: the host, an active [escalation grant](/docs/guide/tools/#approve-a-group-of-tools-once), or the render's escalation mode. It is absent for decisions made on abort, expiry, or failure. A call decided through a grant or mode emits `requested` and `decided` together and never `waiting`. `tool_escalation_granted` follows the host approval that created a grant (`proposalId` names that approval), and `tool_escalation_revoked` reports a revocation of that grant.
+`via` on `decided` says who decided: the host, an active [escalation grant](/docs/guide/tools/#approve-a-group-of-tools-once), or the render's escalation mode. It is absent for decisions made on abort, expiry, or failure. A call that a grant or mode decides when it is proposed emits `requested` and `decided` together and never `waiting`; a parked call that a host's escalating approval sweeps keeps its earlier `waiting` and then gets `decided` with `via: 'escalation'`. `tool_escalation_granted` follows the host approval that created a grant (`proposalId` names that approval), and `tool_escalation_revoked` reports a revocation of that grant.
 
 ### `task_start`, `task`
 

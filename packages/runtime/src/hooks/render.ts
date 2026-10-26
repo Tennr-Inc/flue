@@ -1,7 +1,7 @@
 import { ToolNameConflictError } from '../errors.ts';
 import type { ResourceSnapshot, ToolResourceEntry } from '../resources.ts';
 import { valibotToJsonSchema } from '../schema.ts';
-import { assertToolEscalationsDeclared } from '../tool-escalation.ts';
+import { assertMcpEscalationsDeclared, assertToolEscalationsDeclared } from '../tool-escalation.ts';
 import type { ToolDefinition } from '../tool-types.ts';
 import type {
 	AgentFunction,
@@ -88,6 +88,7 @@ export function renderAgentFunctionWithStructure(
 	assertAgentInstruction(result);
 	assertUniqueToolNames(frame);
 	assertToolEscalationsDeclared(frame.tools, frame.toolEscalations);
+	assertMcpEscalationsDeclared(frame.mcpConnections, frame.toolEscalations);
 	// Hand the render's lifecycle and boundary declarations to the session
 	// through the shared output channel — replaced wholesale each render, so
 	// per-turn re-renders refresh the closures the same way tools and

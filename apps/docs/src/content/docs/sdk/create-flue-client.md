@@ -58,7 +58,7 @@ interface HttpClientOptions {
 | `headers` | Headers merged into every request. Merged after the `token`-derived header, so a `headers` entry named `authorization` wins over `token`.                                                                                                                                                                                                                                                    |
 | `token`   | Bearer token, sent as `authorization: Bearer <token>` on every request.                                                                                                                                                                                                                                                                                                                      |
 
-The options deliberately carry no retry or timeout configuration. Each JSON request (`send()`, `abort()`, `history()`, `resolveToolApproval()`) is a single fetch cancelled per call via `AbortSignal`; the reconnecting stream reads take `backoffOptions` per call on [`wait()`](/docs/sdk/flue-client/#wait) and [`observe()`](/docs/sdk/flue-client/#observe).
+The options deliberately carry no retry or timeout configuration. Each JSON request (`send()`, `abort()`, `history()`, `resolveToolApproval()`, `toolEscalations()`, `revokeToolEscalation()`) is a single fetch cancelled per call via `AbortSignal`; the reconnecting stream reads take `backoffOptions` per call on [`wait()`](/docs/sdk/flue-client/#wait) and [`observe()`](/docs/sdk/flue-client/#observe).
 
 ### Service bindings and other custom transports
 

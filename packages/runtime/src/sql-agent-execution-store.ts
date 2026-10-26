@@ -62,7 +62,11 @@ import type {
 	ToolApprovalProposal,
 	ToolEscalationGrant,
 } from './tool-approval.ts';
-import { assertToolApprovalActor, assertToolEscalationGroup } from './tool-approval.ts';
+import {
+	assertToolApprovalActor,
+	assertToolEscalationGroup,
+	toolEscalationDeniedReason,
+} from './tool-approval.ts';
 import type { StoredToolEscalationGrant } from './tool-escalation.ts';
 
 export function ensureSqlAgentExecutionTables(
@@ -610,8 +614,18 @@ class AgentSubmissionStoreImpl implements AgentSubmissionStore {
 			}
 			const now = Date.now();
 			const group = existing.escalation?.group;
+			let status = input.status;
+			let reason = input.reason;
 			let decidedVia: ToolApprovalDecidedVia | undefined;
-			if (input.via === 'host') {
+			if (status === 'approved' && existing.escalation?.mode === 'denied') {
+				// A call made under `denied` is never approved. It is pending only
+				// because a crash beat its rejection, and the reconcile pass may
+				// already show it to a host as pending: any approval that reaches it
+				// applies the mode's rejection instead, as recovery would.
+				status = 'rejected';
+				reason = toolEscalationDeniedReason(existing.escalation.group);
+				decidedVia = { kind: 'mode', mode: 'denied' };
+			} else if (input.via === 'host') {
 				decidedVia = { kind: 'host', ...(input.actor !== undefined ? { actor: input.actor } : {}) };
 			} else if (input.via === 'mode') {
 				decidedVia = { kind: 'mode', mode: input.status === 'approved' ? 'granted' : 'denied' };
@@ -635,13 +649,7 @@ class AgentSubmissionStoreImpl implements AgentSubmissionStore {
 						'Approval expired before a decision was delivered.',
 						undefined,
 					)
-				: this.writeToolApprovalDecision(
-						input.proposalId,
-						input.status,
-						now,
-						input.reason,
-						decidedVia,
-					);
+				: this.writeToolApprovalDecision(input.proposalId, status, now, reason, decidedVia);
 			let grant: StoredToolEscalationGrant | undefined;
 			const escalated: ToolApproval[] = [];
 			if (
