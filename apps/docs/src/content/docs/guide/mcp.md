@@ -134,7 +134,8 @@ useMcpConnection({
 - Flue derives each gated tool's approval version from its input schema. If the server changes that schema while an approval is pending, the approved call fails with a tool error instead of running. Behavior the server changes behind an unchanged schema is not detected.
 - The proposal's `presentation.title` is the server's tool title. It is server-supplied text, so an approval UI should show the tool name and arguments, not only the title.
 - An approved call interrupted before its outcome is recorded is reported as unknown and not retried, like any approved tool without `durable: true`.
-- `approval.escalation` puts every gated tool in one [escalation group](/docs/guide/tools/#approve-a-group-of-tools-once), so one approval can cover the server's writes for the rest of the session. The render must declare the group with `useToolEscalation()`; a connection whose tools belong to two groups is two connection definitions.
+- `approval.escalation` puts every gated tool in one [escalation group](/docs/guide/tools/#approve-a-group-of-tools-once), so one approval can cover the server's writes for the rest of the session. The render must declare the group with `useToolEscalation()`.
+- `approval.escalations` assigns groups tool by tool, by the server's own names, for a connection whose gated tools belong to different groups. A tool it names takes that group instead of `approval.escalation`; every name must be a gated tool.
 - Approval-gated execution currently requires the Cloudflare target.
 - Connection definitions are read at first connect, so a changed `approval` takes effect when the instance next connects — after a deploy or an instance restart.
 
