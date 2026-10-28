@@ -262,6 +262,12 @@ async function createMcpTools(
 		return false;
 	});
 	const gated = selectGatedMcpTools(serverName, callableTools, approval);
+	const regrouped = Object.keys(approval?.escalations ?? {}).filter((name) => !gated.has(name));
+	if (regrouped.length > 0) {
+		throw new Error(
+			`[flue] MCP server "${serverName}" approval escalations names ${formatToolNames(regrouped)}, which ${regrouped.length === 1 ? 'is' : 'are'} not gated.`,
+		);
+	}
 	const approvalVersions = new Map<string, string>();
 	for (const tool of callableTools) {
 		if (gated.has(tool.name)) {
@@ -351,10 +357,11 @@ function selectGatedMcpTools(
 
 function createMcpToolApproval(tool: Tool, policy: McpApprovalPolicy): ToolApprovalPolicy {
 	const title = tool.title ?? tool.annotations?.title;
+	const escalation = policy.escalations?.[tool.name] ?? policy.escalation;
 	return Object.freeze({
 		required: true,
 		...(policy.expiresInMs !== undefined ? { expiresInMs: policy.expiresInMs } : {}),
-		...(policy.escalation !== undefined ? { escalation: policy.escalation } : {}),
+		...(escalation !== undefined ? { escalation } : {}),
 		// Server-supplied text: a label for the approval UI, never a substitute
 		// for showing the tool name and arguments.
 		...(title ? { presentation: Object.freeze({ title }) } : {}),

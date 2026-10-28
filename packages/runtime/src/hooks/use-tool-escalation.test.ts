@@ -3,6 +3,7 @@ import { defineTool } from '../tool.ts';
 import type { ToolEscalationGrant } from '../tool-approval.ts';
 import type { AgentFunction, AgentProps } from '../types.ts';
 import { renderAgentFunction, resolveSubagentDefinition } from './render.ts';
+import { useMcpConnection } from './use-mcp-connection.ts';
 import { useModel } from './use-model.ts';
 import { useTool } from './use-tool.ts';
 import { useToolEscalation } from './use-tool-escalation.ts';
@@ -79,6 +80,37 @@ describe('useToolEscalation', () => {
 		).toThrow(
 			`[flue] Tool "edit_page" names escalation group "notion-edit", which this render did not declare. Declare it with useToolEscalation('notion-edit').`,
 		);
+	});
+
+	it('rejects an MCP connection whose per-tool group the render did not declare', () => {
+		const notion = {
+			name: 'notion',
+			url: 'https://mcp.example.test/mcp',
+			approval: {
+				required: true as const,
+				tools: ['update-page', 'create-comment'],
+				escalation: 'notion-edit',
+				escalations: { 'create-comment': 'notion-comment' },
+			},
+		};
+
+		expect(() =>
+			render(() => {
+				useToolEscalation('notion-edit');
+				useMcpConnection(notion);
+				return undefined;
+			}),
+		).toThrow(
+			`[flue] MCP connection "notion" names escalation group "notion-comment", which this render did not declare. Declare it with useToolEscalation('notion-comment').`,
+		);
+		expect(() =>
+			render(() => {
+				useToolEscalation('notion-edit');
+				useToolEscalation('notion-comment');
+				useMcpConnection(notion);
+				return undefined;
+			}),
+		).not.toThrow();
 	});
 
 	it('rejects duplicate declarations, bad names, and bad options', () => {
