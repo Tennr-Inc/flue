@@ -4,6 +4,7 @@ import * as v from 'valibot';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createFlueContext } from '../client.ts';
 import type { ConversationRecord } from '../conversation-records.ts';
+import { useMcpConnection } from '../hooks/use-mcp-connection.ts';
 import { useModel } from '../hooks/use-model.ts';
 import { observe } from '../runtime/events.ts';
 import { resetModelsForTests, resolveModel, setProvider } from '../runtime/providers.ts';
@@ -14,6 +15,7 @@ import {
 	setToolApprovalProvider,
 } from '../runtime/tool-approval-provider.ts';
 import type { SqlStorage } from '../sql-storage.ts';
+import { createFakeMcpServer } from '../test-utils/fake-mcp-server.ts';
 import type { ToolApprovalProposal } from '../tool-approval.ts';
 import type { Agent, FlueEvent } from '../types.ts';
 import {
@@ -32,18 +34,19 @@ afterEach(() => {
 	vi.restoreAllMocks();
 });
 
-function definition() {
+function definition(mount?: () => void) {
 	const render = vi.fn();
 	const agent: Agent = () => {
 		render();
 		useModel('faux/faux-1', { compaction: false });
+		mount?.();
 	};
 	agent.agentName = 'Support';
 	return { agent, render };
 }
 
-function fixture(resolveAgentForInstance?: CloudflareAgentResolver) {
-	const current = definition();
+function fixture(resolveAgentForInstance?: CloudflareAgentResolver, mount?: () => void) {
+	const current = definition(mount);
 	current.agent.durability = { maxAttempts: 8 };
 	registerFlueAgents([{ identity: 'Support', agent: current.agent }]);
 	const model = fauxProvider();
@@ -536,5 +539,23 @@ describe('tool escalation through the coordinator', () => {
 				group: 'Not A Group',
 			}),
 		).rejects.toThrow('revocation group must be an escalation group name');
+	});
+});
+
+describe('MCP connections through the coordinator', () => {
+	it("closes the instance's MCP connections once its last attempt finishes", async () => {
+		const server = createFakeMcpServer([{ name: 'echo', inputSchema: { type: 'object' } }]);
+		const { cell } = fixture(undefined, () =>
+			useMcpConnection({ name: 'probe', url: 'https://mcp.test/mcp', fetch: server.fetch }),
+		);
+		const alice = cell('alice');
+
+		await alice.send();
+		await alice.drain();
+		expect([server.sessions, server.openStreams, server.deletes]).toEqual([1, 0, 1]);
+
+		await alice.send();
+		await alice.drain();
+		expect([server.sessions, server.openStreams, server.deletes]).toEqual([2, 0, 2]);
 	});
 });

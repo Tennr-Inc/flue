@@ -341,9 +341,12 @@ class CloudflareAgentCoordinator {
 	private readonly emitCoordinatorEvent: CoordinatorEventEmitter;
 	/**
 	 * Live MCP connections for this instance (one DO = one agent instance).
-	 * Submissions reuse them while the isolate stays warm; eviction is the
-	 * teardown — a DO has no disposal hook, and streamable HTTP holds no
-	 * server state worth a farewell.
+	 * Concurrent attempts share them; the last attempt to finish in this
+	 * isolate closes them (see watchAttempt). A DO has no disposal hook, and an
+	 * open client is not inert: its standalone GET stream is an in-flight
+	 * request that keeps the cell resident, reconnects whenever the host cuts
+	 * it (re-waking the cell), and pins the isolate's code generation on hosts
+	 * that free an old generation only once its requests finish.
 	 */
 	private readonly mcpConnections = createMcpConnectionCache();
 	private resolvedAgent?: Promise<Agent>;
@@ -504,6 +507,10 @@ class CloudflareAgentCoordinator {
 				// Wake arming is best-effort here: the heartbeat armed by the
 				// starting pass (and every pass since) covers the work.
 			}
+			// Checked and closed in one synchronous step: close() forgets the
+			// cache before its first await, so an attempt that starts after
+			// this point connects fresh instead of inheriting a closing client.
+			if (this.activeControllers.size === 0) await this.mcpConnections.close();
 			// The fiber's settlement events (submission_settled and any
 			// subscriber bridge work they trigger) ride this waitUntil too.
 			await drainGlobalEventDeliveries();
@@ -1459,6 +1466,10 @@ class CloudflareAgentCoordinator {
 		this.deleteControllerIfCurrent(submissionId, controller);
 		this.conversationWriter = undefined;
 		this.conversationWriterCreation = undefined;
+		// The zombie's own watchAttempt tail may never run to close these.
+		if (this.activeControllers.size === 0) {
+			this.instance.ctx.waitUntil?.(this.mcpConnections.close());
+		}
 	}
 
 	async abortInstance(): Promise<boolean> {
