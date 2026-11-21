@@ -1,7 +1,13 @@
 import type { Client, Tool, Transport } from '@modelcontextprotocol/client';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { defineMcpConnection } from './hooks/use-mcp-connection.ts';
-import { createMcpConnectionWithClient, type McpConnectionDefinition } from './mcp.ts';
+import {
+	createMcpConnection,
+	createMcpConnectionCache,
+	createMcpConnectionWithClient,
+	type McpConnectionDefinition,
+} from './mcp.ts';
+import { createFakeMcpServer } from './test-utils/fake-mcp-server.ts';
 import { assertToolDefinition, defineTool } from './tool.ts';
 
 /**
@@ -331,5 +337,41 @@ describe('MCP tool approval', () => {
 			presentation: { title: 'Create issue' },
 		});
 		expect(search?.approval).toBeUndefined();
+	});
+});
+
+describe('MCP connection lifecycle', () => {
+	const echo: Tool = { name: 'echo', inputSchema: { type: 'object' } };
+
+	it('ends the server session and releases the standalone GET stream on close', async () => {
+		const server = createFakeMcpServer([echo]);
+		const connection = await createMcpConnection({
+			name: 'probe',
+			url: 'https://mcp.test/mcp',
+			fetch: server.fetch,
+		});
+		await vi.waitFor(() => expect(server.openStreams).toBe(1));
+
+		await connection.close();
+
+		expect(server.openStreams).toBe(0);
+		expect(server.deletes).toBe(1);
+	});
+
+	it('connects fresh after the cache closes', async () => {
+		const server = createFakeMcpServer([echo]);
+		const cache = createMcpConnectionCache();
+		const definition = { name: 'probe', url: 'https://mcp.test/mcp', fetch: server.fetch };
+		const first = await cache.resolve(definition);
+		expect(await cache.resolve(definition)).toBe(first);
+		await vi.waitFor(() => expect(server.openStreams).toBe(1));
+
+		await cache.close();
+		expect(server.openStreams).toBe(0);
+		expect(await cache.resolve(definition)).not.toBe(first);
+
+		expect(server.sessions).toBe(2);
+		await cache.close();
+		expect(server.deletes).toBe(2);
 	});
 });
