@@ -13,6 +13,8 @@ const DEFINITION_KEYS = new Set<string>([
 	'timeoutMs',
 	'resetTimeoutOnProgress',
 	'tools',
+	'missingTools',
+	'onToolDiscovery',
 	'optional',
 	'approval',
 ]);
@@ -112,6 +114,16 @@ function assertMcpConnectionDefinition(
 				`[flue] ${source} "${name}" tools must be an array of tool names (the server's own names).`,
 			);
 		}
+	}
+	if (
+		candidate.missingTools !== undefined &&
+		candidate.missingTools !== 'error' &&
+		candidate.missingTools !== 'skip'
+	) {
+		throw new Error(`[flue] ${source} "${name}" missingTools must be 'error' or 'skip'.`);
+	}
+	if (candidate.onToolDiscovery !== undefined && typeof candidate.onToolDiscovery !== 'function') {
+		throw new Error(`[flue] ${source} "${name}" onToolDiscovery must be a function.`);
 	}
 	if (candidate.optional !== undefined && typeof candidate.optional !== 'boolean') {
 		throw new Error(`[flue] ${source} "${name}" optional must be a boolean.`);
@@ -277,7 +289,12 @@ export function defineMcpConnection(definition: McpConnectionDefinition): McpCon
  * - A server that fails to connect fails the submission before the model
  *   runs, and the failure is not cached — the next submission retries.
  * - `tools` allowlists what to mount, by the server's own tool names; names
- *   the server does not expose are an error.
+ *   the server does not expose are an error. With `missingTools: 'skip'` they
+ *   are left unmounted instead (with their `approval` entries), logged once
+ *   per connect, and announced to the model; the connection still fails when
+ *   none of them can mount.
+ * - `onToolDiscovery` receives every tool the server lists, once per actual
+ *   connect (not per submission that reuses the cached connection).
  * - `approval` parks gated calls on a durable host decision, like a
  *   `defineTool({ approval })` tool. Omit `approval.tools` to gate every
  *   mounted tool; names that are not mounted are an error. `approval.escalation`

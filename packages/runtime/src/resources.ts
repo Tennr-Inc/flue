@@ -212,6 +212,35 @@ export function renderMcpUnavailableSignalBody(
 	].join('\n');
 }
 
+/**
+ * Body of the `resources` signal announcing allowlisted MCP tools that
+ * `missingTools: 'skip'` left unmounted. One line per server and reason. The
+ * names come from the application's allowlist, not from the server.
+ */
+export function renderMcpSkippedToolsSignalBody(
+	skipped: readonly {
+		name: string;
+		missing: readonly string[];
+		unsupported: readonly string[];
+	}[],
+): string {
+	const list = (names: readonly string[]) => names.map((name) => JSON.stringify(name)).join(', ');
+	const lines: string[] = [];
+	for (const entry of skipped) {
+		if (entry.missing.length > 0) {
+			lines.push(
+				`MCP server "${entry.name}" does not offer these tools, so they are not mounted: ${list(entry.missing)}.`,
+			);
+		}
+		if (entry.unsupported.length > 0) {
+			lines.push(
+				`MCP server "${entry.name}" tools that require task-based execution are not mounted: ${list(entry.unsupported)}.`,
+			);
+		}
+	}
+	return lines.join('\n');
+}
+
 export function renderEnvironmentSignalBody(snapshot: EnvironmentSignalSnapshot): string {
 	const lines: string[] = [
 		"The agent's execution environment (sandbox) was replaced.",

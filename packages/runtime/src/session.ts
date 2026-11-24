@@ -1,4 +1,4 @@
-import type { McpUnavailableConnection } from './mcp-types.ts';
+import type { McpSkippedTools, McpUnavailableConnection } from './mcp-types.ts';
 import { modelContextCompactionFields } from './model-request-info.ts';
 /**
  * Internal session implementation. Not exported publicly — user code receives
@@ -162,6 +162,7 @@ import {
 	type ResourceKind,
 	type ResourceSnapshot,
 	renderEnvironmentSignalBody,
+	renderMcpSkippedToolsSignalBody,
 	renderMcpUnavailableSignalBody,
 	renderResourceSignalBody,
 } from './resources.ts';
@@ -453,6 +454,8 @@ interface SessionInitOptions {
 	activeHarnessTools?: HarnessToolLineage;
 	/** Optional MCP connections that failed to resolve at initialization. */
 	mcpUnavailable?: McpUnavailableConnection[];
+	/** Allowlisted MCP tools that `missingTools: 'skip'` left unmounted. */
+	mcpSkippedTools?: McpSkippedTools[];
 	delegationDepth?: number;
 	createTaskSession?: CreateTaskSession;
 	createActionHarness?: CreateActionHarness;
@@ -792,6 +795,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 	 * initialized, announced once per session before the model's first turn.
 	 */
 	private mcpUnavailable: McpUnavailableConnection[];
+	private mcpSkippedTools: McpSkippedTools[];
 	private mcpUnavailableNarrated = false;
 	private closed = false;
 	private activeOperation: OperationKind | undefined;
@@ -1403,19 +1407,28 @@ export class Session implements FlueSession, AgentSubmissionSession {
 
 	/**
 	 * Announce optional MCP connections that failed to resolve for this
-	 * submission: one `resources` signal naming the servers and reasons,
-	 * before the model's first turn. Once per session — a crashed attempt
-	 * re-initializes (and re-resolves the connections), so a re-attempt
-	 * re-narrates only when the servers are still down.
+	 * submission, and allowlisted MCP tools that skip mode left unmounted: one
+	 * `resources` signal, before the model's first turn. Once per session — a
+	 * crashed attempt re-initializes (and re-resolves the connections), so a
+	 * re-attempt re-narrates only when the gap remains.
 	 */
 	private async narrateMcpUnavailable(): Promise<void> {
-		if (this.mcpUnavailableNarrated || this.mcpUnavailable.length === 0) return;
+		if (this.mcpUnavailableNarrated) return;
+		if (this.mcpUnavailable.length === 0 && this.mcpSkippedTools.length === 0) return;
 		if (!this.activeSubmissionId) return;
 		const parentId = await this.conversationWriter.getConversationLeaf(this.conversationId);
+		const body = [
+			...(this.mcpUnavailable.length > 0
+				? [renderMcpUnavailableSignalBody(this.mcpUnavailable)]
+				: []),
+			...(this.mcpSkippedTools.length > 0
+				? [renderMcpSkippedToolsSignalBody(this.mcpSkippedTools)]
+				: []),
+		].join('\n\n');
 		this.enqueueSignalAppend(
 			{
 				type: 'resources',
-				body: renderMcpUnavailableSignalBody(this.mcpUnavailable),
+				body,
 				attributes: { resource: 'mcp' },
 			},
 			{ advance: false },
@@ -2491,6 +2504,7 @@ export class Session implements FlueSession, AgentSubmissionSession {
 		this.agentTools = options.agentTools ?? [];
 		this.activeHarnessTools = options.activeHarnessTools ?? EMPTY_HARNESS_TOOL_LINEAGE;
 		this.mcpUnavailable = options.mcpUnavailable ?? [];
+		this.mcpSkippedTools = options.mcpSkippedTools ?? [];
 		this.delegationDepth = options.delegationDepth ?? 0;
 		this.createTaskSession = options.createTaskSession;
 		this.createActionHarness = options.createActionHarness;

@@ -12,6 +12,9 @@ import type {
 	McpApprovalPolicy,
 	McpAuth,
 	McpConnectionDefinition,
+	McpDiscoveredTool,
+	McpSkippedTools,
+	McpToolDiscovery,
 	McpTransport,
 } from './mcp-types.ts';
 import { registerPreparedToolAdapter } from './tool-adapter.ts';
@@ -22,7 +25,9 @@ export type {
 	McpApprovalPolicy,
 	McpAuth,
 	McpConnectionDefinition,
+	McpDiscoveredTool,
 	McpToolAnnotations,
+	McpToolDiscovery,
 	McpTransport,
 } from './mcp-types.ts';
 
@@ -90,6 +95,26 @@ export function createMcpConnectionCache(): McpConnectionCache {
 	};
 }
 
+/** Allowlisted tools each connection's skip mode left unmounted, by connection. */
+const skippedToolsByConnection = new WeakMap<McpConnection, McpSkippedTools>();
+/** Connections whose skipped tools no submission has reported yet. */
+const unreportedSkips = new WeakSet<McpConnection>();
+
+/**
+ * The allowlisted tools `missingTools: 'skip'` left unmounted on a
+ * connection, or `undefined` when it skipped none. `fresh` is true for the
+ * first caller only, so a cached connection's skip is logged once per actual
+ * connect while every submission still tells its model.
+ */
+export function readMcpSkippedTools(
+	connection: McpConnection,
+): { skipped: McpSkippedTools; fresh: boolean } | undefined {
+	const skipped = skippedToolsByConnection.get(connection);
+	if (!skipped) return undefined;
+	const fresh = unreportedSkips.delete(connection);
+	return { skipped, fresh };
+}
+
 type McpClient = Pick<Client, 'callTool' | 'close' | 'connect' | 'listTools'>;
 
 /**
@@ -126,8 +151,21 @@ export async function createMcpConnection(
 			timeout: definition.timeoutMs,
 			resetTimeoutOnProgress: definition.resetTimeoutOnProgress,
 		},
-		{ tools: definition.tools, approval: definition.approval },
+		{
+			tools: definition.tools,
+			approval: definition.approval,
+			missingTools: definition.missingTools,
+			onToolDiscovery: definition.onToolDiscovery,
+		},
 	);
+}
+
+/** How a connection applies its allowlist and approval policy to the listing. */
+interface McpToolSelectionOptions {
+	tools?: readonly string[];
+	approval?: McpApprovalPolicy;
+	missingTools?: 'error' | 'skip';
+	onToolDiscovery?: (discovery: McpToolDiscovery) => void;
 }
 
 export async function createMcpConnectionWithClient(
@@ -135,7 +173,7 @@ export async function createMcpConnectionWithClient(
 	client: McpClient,
 	transport: Transport,
 	requestOptions: McpRequestOptions = {},
-	selection: { tools?: readonly string[]; approval?: McpApprovalPolicy } = {},
+	selection: McpToolSelectionOptions = {},
 ): Promise<McpConnection> {
 	try {
 		await client.connect(transport);
@@ -153,17 +191,35 @@ export async function createMcpConnectionWithClient(
 			tools.push(...page.tools);
 		}
 
-		return {
+		const discovery = discoverMcpTools(name, tools, selection.tools);
+		reportMcpToolDiscovery(selection.onToolDiscovery, discovery);
+		const skip = selection.missingTools === 'skip';
+		const selected = selectMcpTools(name, tools, selection.tools, discovery, skip);
+		const connection: McpConnection = {
 			name,
 			tools: await createMcpTools(
 				name,
 				client,
-				selectMcpTools(name, tools, selection.tools),
+				selected.tools,
 				requestOptions,
 				selection.approval,
+				new Set(selected.skipped),
 			),
 			close: () => closeMcpClient(client, transport),
 		};
+		if (selected.skipped.length > 0) {
+			const skipped = new Set(selected.skipped);
+			skippedToolsByConnection.set(
+				connection,
+				Object.freeze({
+					name,
+					missing: Object.freeze(discovery.missing.filter((tool) => skipped.has(tool))),
+					unsupported: Object.freeze(discovery.unsupported.filter((tool) => skipped.has(tool))),
+				}),
+			);
+			unreportedSkips.add(connection);
+		}
+		return connection;
 	} catch (error) {
 		await client.close().catch(() => undefined);
 		throw error;
@@ -211,16 +267,83 @@ function createAuthProvider(auth: McpAuth): AuthProvider {
 }
 
 /**
+ * What the listing offers against the allowlist, computed before selection so
+ * `onToolDiscovery` sees it whether or not selection then fails.
+ */
+function discoverMcpTools(
+	serverName: string,
+	discovered: Tool[],
+	allowlist: readonly string[] | undefined,
+): McpToolDiscovery {
+	const byName = new Map(discovered.map((tool) => [tool.name, tool]));
+	const named = allowlist === undefined ? undefined : [...new Set(allowlist)];
+	const unsupported = (named ?? discovered.map((tool) => tool.name)).filter(
+		(name) => byName.get(name)?.execution?.taskSupport === 'required',
+	);
+	return Object.freeze({
+		server: serverName,
+		offered: Object.freeze(discovered.map(discoveredTool)),
+		missing: Object.freeze((named ?? []).filter((name) => !byName.has(name))),
+		unsupported: Object.freeze(unsupported),
+	});
+}
+
+function discoveredTool(tool: Tool): McpDiscoveredTool {
+	return Object.freeze({
+		name: tool.name,
+		...(tool.description === undefined ? {} : { description: tool.description }),
+		...(tool.annotations?.readOnlyHint === undefined
+			? {}
+			: { readOnlyHint: tool.annotations.readOnlyHint }),
+		...(tool.annotations?.destructiveHint === undefined
+			? {}
+			: { destructiveHint: tool.annotations.destructiveHint }),
+	});
+}
+
+/** Call `onToolDiscovery`; a throw is logged and never reaches the connection. */
+function reportMcpToolDiscovery(
+	callback: ((discovery: McpToolDiscovery) => void) | undefined,
+	discovery: McpToolDiscovery,
+): void {
+	if (!callback) return;
+	try {
+		callback(discovery);
+	} catch (error) {
+		console.warn(
+			`[flue] MCP server "${discovery.server}" onToolDiscovery threw; the connection is unaffected.`,
+			error,
+		);
+	}
+}
+
+/**
  * Apply the `tools` allowlist to the discovered listing, in allowlist order.
- * Every allowlisted name must exist and be callable — a typo or an
- * unsupported tool must fail loud, not silently narrow the tool set.
+ * By default every allowlisted name must exist and be callable — a typo or an
+ * unsupported tool must fail loud, not silently narrow the tool set. In skip
+ * mode those names are dropped and returned as `skipped`, unless nothing
+ * would mount. Without an allowlist, every callable listed tool mounts.
  */
 function selectMcpTools(
 	serverName: string,
 	discovered: Tool[],
 	allowlist: readonly string[] | undefined,
-): Tool[] {
-	if (allowlist === undefined) return discovered;
+	discovery: McpToolDiscovery,
+	skip: boolean,
+): { tools: Tool[]; skipped: string[] } {
+	if (allowlist === undefined) {
+		return {
+			tools: discovered.filter((tool) => {
+				if (tool.execution?.taskSupport !== 'required') return true;
+				console.warn(
+					`[flue] Skipping MCP tool "${tool.name}" from server "${serverName}": it requires task-based execution, which is not supported.`,
+				);
+				return false;
+			}),
+			// Approval names for these tools still fail in 'error' mode, as before.
+			skipped: skip ? [...discovery.unsupported] : [],
+		};
+	}
 	const byName = new Map(discovered.map((tool) => [tool.name, tool]));
 	const duplicates = allowlist.filter((name, index) => allowlist.indexOf(name) !== index);
 	if (duplicates.length > 0) {
@@ -228,23 +351,33 @@ function selectMcpTools(
 			`[flue] MCP server "${serverName}" tools allowlist repeats ${formatToolNames(duplicates)}.`,
 		);
 	}
-	const unknown = allowlist.filter((name) => !byName.has(name));
-	if (unknown.length > 0) {
-		throw new Error(
-			`[flue] MCP server "${serverName}" does not expose ${formatToolNames(unknown)} named in the tools allowlist. Discovered tools: ${
+	const missingError = () =>
+		new Error(
+			`[flue] MCP server "${serverName}" does not expose ${formatToolNames(discovery.missing)} named in the tools allowlist. Discovered tools: ${
 				discovered.map((tool) => tool.name).join(', ') || '(none)'
 			}.`,
 		);
+	const unsupportedError = (name: string) =>
+		new Error(
+			`[flue] MCP tool "${name}" from server "${serverName}" requires task-based execution, which is not supported — remove it from the tools allowlist.`,
+		);
+	const skipped = new Set([...discovery.missing, ...discovery.unsupported]);
+	if (!skip) {
+		if (discovery.missing.length > 0) throw missingError();
+		const [unsupported] = allowlist.filter((name) => skipped.has(name));
+		if (unsupported !== undefined) throw unsupportedError(unsupported);
+		return { tools: allowlist.map((name) => byName.get(name) as Tool), skipped: [] };
 	}
-	return allowlist.map((name) => {
-		const tool = byName.get(name) as Tool;
-		if (tool.execution?.taskSupport === 'required') {
-			throw new Error(
-				`[flue] MCP tool "${name}" from server "${serverName}" requires task-based execution, which is not supported — remove it from the tools allowlist.`,
-			);
-		}
-		return tool;
-	});
+	const tools = allowlist
+		.filter((name) => !skipped.has(name))
+		.map((name) => byName.get(name) as Tool);
+	if (tools.length === 0 && skipped.size > 0) {
+		// Nothing allowlisted can mount: fail as 'error' mode would, so an
+		// optional connection is reported unavailable rather than empty.
+		if (discovery.missing.length > 0) throw missingError();
+		throw unsupportedError(discovery.unsupported[0] as string);
+	}
+	return { tools, skipped: allowlist.filter((name) => skipped.has(name)) };
 }
 
 function formatToolNames(names: readonly string[]): string {
@@ -278,31 +411,29 @@ async function createMcpTools(
 	tools: Tool[],
 	requestOptions: McpRequestOptions,
 	approval: McpApprovalPolicy | undefined,
+	skipped: ReadonlySet<string>,
 ): Promise<ToolDefinition[]> {
 	const names = new Set<string>();
 
-	const callableTools = tools.filter((tool) => {
-		if (tool.execution?.taskSupport !== 'required') return true;
-		console.warn(
-			`[flue] Skipping MCP tool "${tool.name}" from server "${serverName}": it requires task-based execution, which is not supported.`,
-		);
-		return false;
-	});
-	const gated = selectGatedMcpTools(serverName, callableTools, approval);
-	const regrouped = Object.keys(approval?.escalations ?? {}).filter((name) => !gated.has(name));
+	const gated = selectGatedMcpTools(serverName, tools, approval, skipped);
+	// A group for a tool skip mode dropped is dropped with it; any other
+	// ungated name is a policy error.
+	const regrouped = Object.keys(approval?.escalations ?? {}).filter(
+		(name) => !gated.has(name) && !skipped.has(name),
+	);
 	if (regrouped.length > 0) {
 		throw new Error(
 			`[flue] MCP server "${serverName}" approval escalations names ${formatToolNames(regrouped)}, which ${regrouped.length === 1 ? 'is' : 'are'} not gated.`,
 		);
 	}
 	const approvalVersions = new Map<string, string>();
-	for (const tool of callableTools) {
+	for (const tool of tools) {
 		if (gated.has(tool.name)) {
 			approvalVersions.set(tool.name, await mcpToolApprovalVersion(tool));
 		}
 	}
 
-	return callableTools.map((tool) => {
+	return tools.map((tool) => {
 		const toolName = createToolName(serverName, tool.name);
 		if (names.has(toolName)) {
 			throw new Error(
@@ -361,17 +492,21 @@ async function createMcpTools(
 /**
  * Resolve which callable tools the approval policy gates, by the server's own
  * names. Omitted `tools` gates everything mounted; a named tool that is not
- * mounted must fail loud — a typo would otherwise leave a tool ungated.
+ * mounted must fail loud — a typo would otherwise leave a tool ungated —
+ * unless skip mode dropped it. A policy whose named tools were all skipped
+ * gates nothing: it never falls back to gating every mounted tool.
  */
 function selectGatedMcpTools(
 	serverName: string,
 	callable: Tool[],
 	approval: McpApprovalPolicy | undefined,
+	skipped: ReadonlySet<string>,
 ): ReadonlySet<string> {
 	if (!approval) return new Set();
 	const mounted = callable.map((tool) => tool.name);
 	if (approval.tools === undefined) return new Set(mounted);
-	const unknown = approval.tools.filter((name) => !mounted.includes(name));
+	const named = approval.tools.filter((name) => !skipped.has(name));
+	const unknown = named.filter((name) => !mounted.includes(name));
 	if (unknown.length > 0) {
 		throw new Error(
 			`[flue] MCP server "${serverName}" approval names ${formatToolNames(unknown)}, which ${unknown.length === 1 ? 'is' : 'are'} not mounted. Mounted tools: ${
@@ -379,7 +514,7 @@ function selectGatedMcpTools(
 			}.`,
 		);
 	}
-	return new Set(approval.tools);
+	return new Set(named);
 }
 
 function createMcpToolApproval(tool: Tool, policy: McpApprovalPolicy): ToolApprovalPolicy {
