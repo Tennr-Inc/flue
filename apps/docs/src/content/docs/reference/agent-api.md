@@ -765,6 +765,7 @@ interface McpApprovalPolicy {
   tools?: string[]; // the server's own names; omit to gate every mounted tool
   expiresInMs?: number;
   escalation?: string; // escalation group for every gated tool
+  escalations?: Record<string, string>; // groups by gated tool name, overriding `escalation`
 }
 
 interface McpConnectionDefinition {

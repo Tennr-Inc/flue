@@ -17,7 +17,13 @@ const DEFINITION_KEYS = new Set<string>([
 	'approval',
 ]);
 
-const APPROVAL_KEYS = new Set<string>(['required', 'tools', 'expiresInMs', 'escalation']);
+const APPROVAL_KEYS = new Set<string>([
+	'required',
+	'tools',
+	'expiresInMs',
+	'escalation',
+	'escalations',
+]);
 
 const TRANSPORTS: readonly McpTransport[] = ['streamable-http', 'sse'];
 
@@ -118,7 +124,7 @@ function assertMcpConnectionDefinition(
 function assertMcpApprovalPolicy(approval: unknown, label: string): void {
 	if (!approval || typeof approval !== 'object' || Array.isArray(approval)) {
 		throw new Error(
-			`[flue] ${label} must be an object: { required: true, tools?, expiresInMs?, escalation? }.`,
+			`[flue] ${label} must be an object: { required: true, tools?, expiresInMs?, escalation?, escalations? }.`,
 		);
 	}
 	for (const key of Object.keys(approval)) {
@@ -133,6 +139,7 @@ function assertMcpApprovalPolicy(approval: unknown, label: string): void {
 		tools?: unknown;
 		expiresInMs?: unknown;
 		escalation?: unknown;
+		escalations?: unknown;
 	};
 	if (policy.required !== true) {
 		throw new Error(`[flue] ${label} must set required: true.`);
@@ -166,6 +173,33 @@ function assertMcpApprovalPolicy(approval: unknown, label: string): void {
 	if (policy.escalation !== undefined) {
 		assertToolEscalationGroup(policy.escalation, `${label} escalation`);
 	}
+	if (policy.escalations !== undefined) {
+		if (
+			!policy.escalations ||
+			typeof policy.escalations !== 'object' ||
+			Array.isArray(policy.escalations)
+		) {
+			throw new Error(
+				`[flue] ${label} escalations must map tool names (the server's own names) to escalation groups.`,
+			);
+		}
+		for (const [tool, group] of Object.entries(policy.escalations)) {
+			if (tool.length === 0) {
+				throw new Error(`[flue] ${label} escalations names an empty tool.`);
+			}
+			assertToolEscalationGroup(group, `${label} escalations["${tool}"]`);
+		}
+		const tools = policy.tools as string[] | undefined;
+		const ungated =
+			tools === undefined
+				? []
+				: Object.keys(policy.escalations).filter((tool) => !tools.includes(tool));
+		if (ungated.length > 0) {
+			throw new Error(
+				`[flue] ${label} escalations names ${ungated.map((tool) => JSON.stringify(tool)).join(', ')}, which approval tools does not gate.`,
+			);
+		}
+	}
 }
 
 /**
@@ -198,6 +232,9 @@ export function defineMcpConnection(definition: McpConnectionDefinition): McpCon
 						...definition.approval,
 						...(definition.approval.tools !== undefined
 							? { tools: Object.freeze([...definition.approval.tools]) }
+							: {}),
+						...(definition.approval.escalations !== undefined
+							? { escalations: Object.freeze({ ...definition.approval.escalations }) }
 							: {}),
 					}),
 				}
@@ -245,7 +282,8 @@ export function defineMcpConnection(definition: McpConnectionDefinition): McpCon
  *   `defineTool({ approval })` tool. Omit `approval.tools` to gate every
  *   mounted tool; names that are not mounted are an error. `approval.escalation`
  *   puts every gated tool in one escalation group, which the render declares
- *   with `useToolEscalation()`.
+ *   with `useToolEscalation()`; `approval.escalations` assigns groups tool by
+ *   tool instead.
  *
  * To share one definition across agents, export it with
  * {@link defineMcpConnection} and mount the exported object. To filter or

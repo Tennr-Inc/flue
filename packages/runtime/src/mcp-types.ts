@@ -47,10 +47,16 @@ export interface McpApprovalPolicy {
 	readonly expiresInMs?: number;
 	/**
 	 * Escalation group for every tool this policy gates. The render must
-	 * declare it with `useToolEscalation()`. A connection whose tools belong to
-	 * two groups is two connection definitions.
+	 * declare it with `useToolEscalation()`.
 	 */
 	readonly escalation?: string;
+	/**
+	 * Escalation groups by server tool name, for a connection whose gated tools
+	 * belong to different groups. A named tool takes its group from here
+	 * instead of `escalation`; a gated tool left out takes `escalation`, or no
+	 * group. Every name must be a gated tool, so a typo fails loud.
+	 */
+	readonly escalations?: Readonly<Record<string, string>>;
 }
 
 /**

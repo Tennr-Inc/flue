@@ -59,12 +59,13 @@ export interface McpConnectionCache extends McpConnectionResolver {
 
 /**
  * A per-instance MCP connection cache: the first declaration of a server
- * name connects; later submissions reuse the live connection for the
- * instance's in-memory lifetime, so definitions are read at first connect
- * (an `auth` resolver stays per-request). Concurrent resolves of one name
- * share a single in-flight connect. A failed connect is evicted immediately —
- * a transient outage must not brick the instance, so the next submission
- * retries with a freshly read definition.
+ * name connects; later resolves reuse the live connection until the owner
+ * calls `close()`, so definitions are read at first connect (an `auth`
+ * resolver stays per-request). Concurrent resolves of one name share a
+ * single in-flight connect. A failed connect is evicted immediately — a
+ * transient outage must not brick the instance, so the next submission
+ * retries with a freshly read definition. `close()` forgets every entry
+ * synchronously, so a resolve that races a close connects fresh.
  */
 export function createMcpConnectionCache(): McpConnectionCache {
 	const connections = new Map<string, Promise<McpConnection>>();
@@ -161,12 +162,38 @@ export async function createMcpConnectionWithClient(
 				requestOptions,
 				selection.approval,
 			),
-			close: () => client.close(),
+			close: () => closeMcpClient(client, transport),
 		};
 	} catch (error) {
 		await client.close().catch(() => undefined);
 		throw error;
 	}
+}
+
+/** How long a closing connection waits for the server to acknowledge its session `DELETE`. */
+const MCP_SESSION_TERMINATE_TIMEOUT_MS = 2_000;
+
+/**
+ * Ends the server session, then the client. The client's own `close()` only
+ * aborts in-flight requests and the standalone GET stream; it never sends the
+ * streamable-HTTP session `DELETE`, so the server would keep the session
+ * until its own idle timeout. The `DELETE` is best-effort and bounded:
+ * `client.close()` aborts it if the server is slow.
+ */
+async function closeMcpClient(client: McpClient, transport: Transport): Promise<void> {
+	const terminateSession = (transport as { terminateSession?: () => Promise<void> })
+		.terminateSession;
+	if (typeof terminateSession === 'function') {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		await Promise.race([
+			terminateSession.call(transport).catch(() => undefined),
+			new Promise<void>((resolve) => {
+				timer = setTimeout(resolve, MCP_SESSION_TERMINATE_TIMEOUT_MS);
+			}),
+		]);
+		clearTimeout(timer);
+	}
+	await client.close();
 }
 
 /**
@@ -262,6 +289,12 @@ async function createMcpTools(
 		return false;
 	});
 	const gated = selectGatedMcpTools(serverName, callableTools, approval);
+	const regrouped = Object.keys(approval?.escalations ?? {}).filter((name) => !gated.has(name));
+	if (regrouped.length > 0) {
+		throw new Error(
+			`[flue] MCP server "${serverName}" approval escalations names ${formatToolNames(regrouped)}, which ${regrouped.length === 1 ? 'is' : 'are'} not gated.`,
+		);
+	}
 	const approvalVersions = new Map<string, string>();
 	for (const tool of callableTools) {
 		if (gated.has(tool.name)) {
@@ -351,10 +384,11 @@ function selectGatedMcpTools(
 
 function createMcpToolApproval(tool: Tool, policy: McpApprovalPolicy): ToolApprovalPolicy {
 	const title = tool.title ?? tool.annotations?.title;
+	const escalation = policy.escalations?.[tool.name] ?? policy.escalation;
 	return Object.freeze({
 		required: true,
 		...(policy.expiresInMs !== undefined ? { expiresInMs: policy.expiresInMs } : {}),
-		...(policy.escalation !== undefined ? { escalation: policy.escalation } : {}),
+		...(escalation !== undefined ? { escalation } : {}),
 		// Server-supplied text: a label for the approval UI, never a substitute
 		// for showing the tool name and arguments.
 		...(title ? { presentation: Object.freeze({ title }) } : {}),

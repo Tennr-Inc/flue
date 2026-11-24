@@ -59,11 +59,16 @@ export function assertMcpEscalationsDeclared(
 	declarations: ReadonlyMap<string, ToolEscalationDeclaration>,
 ): void {
 	for (const connection of connections) {
-		const group = connection.approval?.escalation;
-		if (group === undefined || declarations.has(group)) continue;
-		throw new Error(
-			`[flue] MCP connection "${connection.name}" names escalation group "${group}", which this render did not declare. Declare it with useToolEscalation('${group}').`,
-		);
+		const groups = [
+			connection.approval?.escalation,
+			...Object.values(connection.approval?.escalations ?? {}),
+		];
+		for (const group of groups) {
+			if (group === undefined || declarations.has(group)) continue;
+			throw new Error(
+				`[flue] MCP connection "${connection.name}" names escalation group "${group}", which this render did not declare. Declare it with useToolEscalation('${group}').`,
+			);
+		}
 	}
 }
 

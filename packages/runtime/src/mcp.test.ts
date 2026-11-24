@@ -1,7 +1,13 @@
 import type { Client, Tool, Transport } from '@modelcontextprotocol/client';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { defineMcpConnection } from './hooks/use-mcp-connection.ts';
-import { createMcpConnectionWithClient, type McpConnectionDefinition } from './mcp.ts';
+import {
+	createMcpConnection,
+	createMcpConnectionCache,
+	createMcpConnectionWithClient,
+	type McpConnectionDefinition,
+} from './mcp.ts';
+import { createFakeMcpServer } from './test-utils/fake-mcp-server.ts';
 import { assertToolDefinition, defineTool } from './tool.ts';
 
 /**
@@ -266,6 +272,58 @@ describe('MCP tool approval', () => {
 		expect(() => invalid({ required: true, escalation: 'Notion Edit' })).toThrow(
 			/approval escalation must be an escalation group name/,
 		);
+		expect(() => invalid({ required: true, escalations: ['create_issue'] })).toThrow(
+			/approval escalations must map tool names/,
+		);
+		expect(() =>
+			invalid({ required: true, escalations: { create_issue: 'Linear Write' } }),
+		).toThrow(/approval escalations\["create_issue"\] must be an escalation group name/);
+		expect(() =>
+			invalid({
+				required: true,
+				tools: ['create_issue'],
+				escalations: { search_issues: 'linear-read' },
+			}),
+		).toThrow(/approval escalations names "search_issues", which approval tools does not gate/);
+
+		const grouped = defineMcpConnection({
+			...base,
+			approval: { required: true, escalations: { create_issue: 'linear-write' } },
+		});
+		expect(Object.isFrozen(grouped.approval?.escalations)).toBe(true);
+	});
+
+	it('puts each gated tool in its own escalation group, falling back to the policy group', async () => {
+		const updateIssue: Tool = { ...createIssue, name: 'update_issue', title: 'Update issue' };
+		const connection = await connect([createIssue, updateIssue, searchIssues], {
+			approval: {
+				required: true,
+				tools: ['create_issue', 'update_issue', 'search_issues'],
+				escalation: 'linear-write',
+				escalations: { update_issue: 'linear-update', search_issues: 'linear-read' },
+			},
+		});
+		const [create, update, search] = connection.tools;
+		expect(create?.approval?.escalation).toBe('linear-write');
+		expect(update?.approval?.escalation).toBe('linear-update');
+		expect(search?.approval?.escalation).toBe('linear-read');
+	});
+
+	it('leaves a gated tool out of any group when neither map nor policy names one', async () => {
+		const connection = await connect([createIssue, searchIssues], {
+			approval: { required: true, escalations: { create_issue: 'linear-write' } },
+		});
+		const [create, search] = connection.tools;
+		expect(create?.approval?.escalation).toBe('linear-write');
+		expect(search?.approval).toEqual({ required: true });
+	});
+
+	it('rejects per-tool groups for tools the server does not mount', async () => {
+		await expect(
+			connect([createIssue], {
+				approval: { required: true, escalations: { delete_issue: 'linear-write' } },
+			}),
+		).rejects.toThrow(/approval escalations names "delete_issue", which is not gated/);
 	});
 
 	it('puts every gated tool in the policy escalation group', async () => {
@@ -279,5 +337,41 @@ describe('MCP tool approval', () => {
 			presentation: { title: 'Create issue' },
 		});
 		expect(search?.approval).toBeUndefined();
+	});
+});
+
+describe('MCP connection lifecycle', () => {
+	const echo: Tool = { name: 'echo', inputSchema: { type: 'object' } };
+
+	it('ends the server session and releases the standalone GET stream on close', async () => {
+		const server = createFakeMcpServer([echo]);
+		const connection = await createMcpConnection({
+			name: 'probe',
+			url: 'https://mcp.test/mcp',
+			fetch: server.fetch,
+		});
+		await vi.waitFor(() => expect(server.openStreams).toBe(1));
+
+		await connection.close();
+
+		expect(server.openStreams).toBe(0);
+		expect(server.deletes).toBe(1);
+	});
+
+	it('connects fresh after the cache closes', async () => {
+		const server = createFakeMcpServer([echo]);
+		const cache = createMcpConnectionCache();
+		const definition = { name: 'probe', url: 'https://mcp.test/mcp', fetch: server.fetch };
+		const first = await cache.resolve(definition);
+		expect(await cache.resolve(definition)).toBe(first);
+		await vi.waitFor(() => expect(server.openStreams).toBe(1));
+
+		await cache.close();
+		expect(server.openStreams).toBe(0);
+		expect(await cache.resolve(definition)).not.toBe(first);
+
+		expect(server.sessions).toBe(2);
+		await cache.close();
+		expect(server.deletes).toBe(2);
 	});
 });
