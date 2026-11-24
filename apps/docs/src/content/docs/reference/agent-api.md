@@ -779,8 +779,24 @@ interface McpConnectionDefinition {
   timeoutMs?: number;
   resetTimeoutOnProgress?: boolean;
   tools?: string[];
+  missingTools?: 'error' | 'skip'; // default 'error'
+  onToolDiscovery?: (discovery: McpToolDiscovery) => void;
   optional?: boolean;
   approval?: McpApprovalPolicy;
+}
+
+interface McpDiscoveredTool {
+  name: string;
+  description?: string;
+  readOnlyHint?: boolean;
+  destructiveHint?: boolean;
+}
+
+interface McpToolDiscovery {
+  server: string; // the definition's `name`
+  offered: ReadonlyArray<McpDiscoveredTool>; // every listed tool, in listing order
+  missing: ReadonlyArray<string>; // allowlisted names the server did not list
+  unsupported: ReadonlyArray<string>; // listed names that require task-based execution
 }
 ```
 
@@ -795,7 +811,9 @@ One MCP server, as `defineMcpConnection(...)`, `useMcpConnection(...)`, and [`cr
 - `fetch` — custom fetch implementation for the transport.
 - `timeoutMs` — per-request timeout in milliseconds. Defaults to the MCP SDK default (60 seconds).
 - `resetTimeoutOnProgress` — reset the per-request timeout whenever the server sends a progress notification. Default `false`.
-- `tools` — allowlist of tools to adapt, by the server's own tool names, in this order. Unknown, repeated, and task-required names reject the connection.
+- `tools` — allowlist of tools to adapt, by the server's own tool names, in this order. By default, unknown, repeated, and task-required names reject the connection.
+- `missingTools` — what to do when `tools` names a tool the server does not list or that requires task-based execution. `'error'` (default) rejects the connection. `'skip'` mounts the allowlisted tools the server lists and Flue can call, in allowlist order, and drops the `approval.tools` and `approval.escalations` entries for the skipped tools: an `approval.tools` list that named only skipped tools gates nothing, and an omitted `approval.tools` still gates every mounted tool. Each connect that skips tools emits one `log`-level warning event with the server name and the skipped names, and the model is told which allowlisted tools are absent in the [`resources` signal](#dynamic-resources). If no allowlisted tool can mount, the connection still fails with the `'error'` mode's error (so `optional` reports it unavailable). A repeated name is an error in both modes. No effect without `tools`.
+- `onToolDiscovery` — called with an `McpToolDiscovery` after the server's full `tools/list` and before `tools` is applied, in both `missingTools` modes, including when the connection then fails. It runs once per actual connect: connections are reused for the instance's in-memory lifetime, so a submission that reuses a live connection does not call it (the skip warning follows the same rule). The snapshot is frozen. `missing` is empty without an allowlist; `unsupported` then lists every listed tool that requires task-based execution. Descriptions and hints are untrusted server text. A throw is caught and logged as a warning and never affects the connection.
 - `optional` — let the agent run without this server when it fails to resolve. Default `false`: a failed connection fails the submission before the model runs. With `optional: true`, any resolve failure mounts zero tools for the submission instead — announced to the model as a [`resources` signal](#dynamic-resources) and to observers as a `log`-level warning event — and the next submission retries.
 - `approval` — require a durable host decision before a gated tool calls the server, with the same parking, decision, and recovery semantics as a [`defineTool()`](#definetool) `approval`. `required` must be `true`. `tools` names the gated tools by the server's own names; omitted, every mounted tool is gated, including tools the server adds later. A name that is not mounted rejects the connection. `expiresInMs` sets each gated call's proposal deadline. `escalation` puts every gated tool in one escalation group, which the render declares with [`useToolEscalation()`](/docs/reference/agent-hooks-api/#usetoolescalation). Approval-gated execution currently requires the Cloudflare target. See [Require approval for MCP tools](/docs/guide/mcp/#require-approval-for-mcp-tools).
 - Unknown fields throw; so do malformed values, with the offending field named.

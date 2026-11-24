@@ -109,7 +109,18 @@ useMcpConnection({
 });
 ```
 
-If the allowlist names a tool the server doesn't expose, the connection fails with an error.
+If the allowlist names a tool the server doesn't expose, the connection fails with an error. When a server you don't control may remove or rename tools, set `missingTools: 'skip'` to mount the allowlisted tools it still offers instead. Skipped tools are logged as a warning once per connect and announced to the model, and their `approval` entries are dropped. The connection still fails if none of the allowlisted tools can mount. To see what a server offers, pass `onToolDiscovery`; it receives every listed tool once per connect:
+
+```ts
+useMcpConnection({
+  name: 'linear',
+  url: 'https://mcp.linear.app/mcp',
+  auth: process.env.LINEAR_API_KEY,
+  tools: ['create_issue', 'search_issues', 'get_issue'],
+  missingTools: 'skip',
+  onToolDiscovery: ({ offered, missing }) => reportLinearTools(offered, missing),
+});
+```
 
 ## Require approval for MCP tools
 

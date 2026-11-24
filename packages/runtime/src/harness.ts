@@ -8,7 +8,7 @@ import { SessionNotFoundError } from './errors.ts';
 import type { FlueExecutionContext } from './execution-interceptor.ts';
 import { EMPTY_HARNESS_TOOL_LINEAGE, type HarnessToolLineage } from './harness-tool-lineage.ts';
 import type { HookStateBuffer } from './hooks/use-persistent-state.ts';
-import type { McpUnavailableConnection } from './mcp-types.ts';
+import type { McpSkippedTools, McpUnavailableConnection } from './mcp-types.ts';
 import type { AgentOutputChannel } from './message-output.ts';
 import type { AttachmentStore } from './runtime/attachment-store.ts';
 import { createConversationIdentity } from './runtime/ids.ts';
@@ -58,6 +58,8 @@ export interface HarnessOptions {
 	activeHarnessTools?: HarnessToolLineage;
 	/** Optional MCP connections that failed to resolve at initialization. */
 	mcpUnavailable?: McpUnavailableConnection[];
+	/** Allowlisted MCP tools that `missingTools: 'skip'` left unmounted. */
+	mcpSkippedTools?: McpSkippedTools[];
 	toolFactory?: SandboxToolFactory;
 	conversationWriter: ConversationRecordWriter;
 	attachmentStore: AttachmentStore;
@@ -145,6 +147,7 @@ export class Harness implements FlueHarness {
 	private agentTools: ToolDefinition[];
 	private activeHarnessTools: HarnessToolLineage;
 	private mcpUnavailable: McpUnavailableConnection[];
+	private mcpSkippedTools: McpSkippedTools[];
 	private conversationWriter: ConversationRecordWriter;
 	private attachmentStore: AttachmentStore;
 	private submissionStore: AgentSubmissionStore | undefined;
@@ -168,6 +171,7 @@ export class Harness implements FlueHarness {
 		this.agentTools = options.agentTools;
 		this.activeHarnessTools = options.activeHarnessTools ?? EMPTY_HARNESS_TOOL_LINEAGE;
 		this.mcpUnavailable = options.mcpUnavailable ?? [];
+		this.mcpSkippedTools = options.mcpSkippedTools ?? [];
 		this.conversationWriter = options.conversationWriter;
 		this.attachmentStore = options.attachmentStore;
 		this.submissionStore = options.submissionStore;
@@ -316,6 +320,7 @@ export class Harness implements FlueHarness {
 			agentTools: this.agentTools,
 			activeHarnessTools: this.activeHarnessTools,
 			mcpUnavailable: this.mcpUnavailable,
+			mcpSkippedTools: this.mcpSkippedTools,
 			delegationDepth: this.scopeDepth,
 			createTaskSession: (taskOptions) => this.createTaskSession(taskOptions),
 			createActionHarness: (actionOptions) => this.createActionHarness(actionOptions),

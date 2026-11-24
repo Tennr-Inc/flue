@@ -83,7 +83,9 @@ export type {
 	McpAuth,
 	McpConnection,
 	McpConnectionDefinition,
+	McpDiscoveredTool,
 	McpToolAnnotations,
+	McpToolDiscovery,
 	McpTransport,
 } from './mcp.ts';
 export { createMcpConnection } from './mcp.ts';

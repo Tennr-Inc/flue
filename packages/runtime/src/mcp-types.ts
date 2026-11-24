@@ -96,10 +96,38 @@ export interface McpConnectionDefinition {
 	resetTimeoutOnProgress?: boolean;
 	/**
 	 * Allowlist of tools to adapt, by the server's own tool names, in this
-	 * order. Names the server does not expose are an error — a typo must fail
-	 * loud, not silently narrow the tool set. Omit to adapt every listed tool.
+	 * order. By default, names the server does not expose are an error — a
+	 * typo must fail loud, not silently narrow the tool set (see
+	 * `missingTools`). Omit to adapt every listed tool.
 	 */
 	tools?: string[];
+	/**
+	 * What to do when `tools` names a tool the server does not list, or one
+	 * that requires task-based execution (which Flue cannot call).
+	 *
+	 * - `'error'` (default): fail the connection.
+	 * - `'skip'`: mount the allowlisted tools the server does list and Flue
+	 *   can call, in allowlist order. `approval.tools` and
+	 *   `approval.escalations` entries for skipped tools are dropped, so an
+	 *   `approval.tools` list that names only skipped tools gates nothing — it
+	 *   never widens to "gate every mounted tool". Each connect that skips
+	 *   tools emits one warning log event, and the model is told which
+	 *   allowlisted tools are absent. If no allowlisted tool can mount, the
+	 *   connection still fails.
+	 *
+	 * A name repeated in `tools` is an error in both modes. Has no effect
+	 * without `tools`.
+	 */
+	missingTools?: 'error' | 'skip';
+	/**
+	 * Called once per actual connect, after the full paginated `tools/list`
+	 * and before `tools` is applied — in both `missingTools` modes, including
+	 * when selection then fails the connection. Connections are cached per
+	 * agent instance, so a submission that reuses a live connection does not
+	 * call it again. The snapshot is frozen. A throw is caught and logged as
+	 * a warning; it never affects the connection.
+	 */
+	onToolDiscovery?: (discovery: McpToolDiscovery) => void;
 	/**
 	 * Let the agent run without this server when it fails to resolve.
 	 * Default `false`: a failed connection fails the submission before the
@@ -115,6 +143,47 @@ export interface McpConnectionDefinition {
 	 * Cloudflare target today).
 	 */
 	approval?: McpApprovalPolicy;
+}
+
+/** One tool from an MCP server's `tools/list`, as {@link McpToolDiscovery} reports it. */
+export interface McpDiscoveredTool {
+	/** The server's own tool name. */
+	readonly name: string;
+	/** The server's description. Untrusted server text. */
+	readonly description?: string;
+	/** The server's `readOnlyHint` annotation. A hint, not a guarantee. */
+	readonly readOnlyHint?: boolean;
+	/** The server's `destructiveHint` annotation. A hint, not a guarantee. */
+	readonly destructiveHint?: boolean;
+}
+
+/** What one connect discovered, passed to `McpConnectionDefinition.onToolDiscovery`. */
+export interface McpToolDiscovery {
+	/** The definition's `name`. */
+	readonly server: string;
+	/** Every tool the server listed, in listing order. */
+	readonly offered: ReadonlyArray<McpDiscoveredTool>;
+	/** Allowlisted names the server did not list. Empty when there is no allowlist. */
+	readonly missing: ReadonlyArray<string>;
+	/**
+	 * Allowlisted names the server lists but Flue cannot call (task-based
+	 * execution required). Without an allowlist, every listed tool that
+	 * requires task-based execution.
+	 */
+	readonly unsupported: ReadonlyArray<string>;
+}
+
+/**
+ * Allowlisted tools that `missingTools: 'skip'` left unmounted on one
+ * connection. Internal: announced to the model and to observers.
+ */
+export interface McpSkippedTools {
+	/** Declared server name. */
+	name: string;
+	/** Allowlisted names the server did not list. */
+	missing: readonly string[];
+	/** Allowlisted names that require task-based execution. */
+	unsupported: readonly string[];
 }
 
 /**

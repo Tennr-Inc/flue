@@ -10,8 +10,12 @@ import {
 	renderAgentFunctionWithStructure,
 } from './hooks/render.ts';
 import { createHookStateBuffer } from './hooks/use-persistent-state.ts';
-import { createMcpConnection, type McpConnectionResolver } from './mcp.ts';
-import type { McpConnectionDefinition, McpUnavailableConnection } from './mcp-types.ts';
+import { createMcpConnection, type McpConnectionResolver, readMcpSkippedTools } from './mcp.ts';
+import type {
+	McpConnectionDefinition,
+	McpSkippedTools,
+	McpUnavailableConnection,
+} from './mcp-types.ts';
 import { createAgentOutputChannel } from './message-output.ts';
 import { digestInstructions, type ToolResourceEntry } from './resources.ts';
 import { ensureInstanceIdentity } from './runtime/agent-submissions.ts';
@@ -372,11 +376,13 @@ async function initializeRootHarness(
 	// model runs — unless the definition is optional, which mounts zero tools
 	// and narrates the gap instead. Rejections are never cached, so the next
 	// submission retries either way.
-	const [{ tools: mcpTools, unavailable: mcpUnavailable }, { env: baseEnv, toolFactory }] =
-		await Promise.all([
-			resolveMcpTools(config, definition.mcpConnections),
-			resolveSandbox(config.id, definition.sandbox),
-		]);
+	const [
+		{ tools: mcpTools, unavailable: mcpUnavailable, skipped: mcpSkipped },
+		{ env: baseEnv, toolFactory },
+	] = await Promise.all([
+		resolveMcpTools(config, definition.mcpConnections),
+		resolveSandbox(config.id, definition.sandbox),
+	]);
 	// The render validated its tools' and MCP connections' groups.
 	const initialToolEscalations: ReadonlyMap<string, ToolEscalationDeclaration> =
 		definition.toolEscalations ?? new Map();
@@ -387,6 +393,21 @@ async function initializeRootHarness(
 			level: 'warn',
 			message: `MCP server "${entry.name}" is unavailable; its tools are not mounted for this submission.`,
 			attributes: normalizeLogAttributes({ server: entry.name, reason: entry.reason }),
+		});
+	}
+	// Logged once per actual connect: a cached connection reused by a later
+	// submission is not `fresh`, though its model is still told (below).
+	for (const { skipped, fresh } of mcpSkipped) {
+		if (!fresh) continue;
+		emitEvent({
+			type: 'log',
+			level: 'warn',
+			message: `MCP server "${skipped.name}" does not offer some allowlisted tools; they are not mounted.`,
+			attributes: normalizeLogAttributes({
+				server: skipped.name,
+				missingTools: [...skipped.missing],
+				unsupportedTools: [...skipped.unsupported],
+			}),
 		});
 	}
 	const mcpResourceEntries = mcpTools.map((tool) => mcpToolResourceEntry(tool));
@@ -517,6 +538,7 @@ async function initializeRootHarness(
 		eventCallback: emitEvent,
 		agentTools: [...(definition.tools ?? []), ...mcpTools],
 		mcpUnavailable,
+		mcpSkippedTools: mcpSkipped.map(({ skipped }) => skipped),
 		toolFactory,
 		conversationWriter: config.conversationWriter,
 		attachmentStore: config.attachmentStore,
@@ -555,8 +577,12 @@ async function initializeRootHarness(
 async function resolveMcpTools(
 	config: FlueContextConfig,
 	definitions: readonly McpConnectionDefinition[] | undefined,
-): Promise<{ tools: ToolDefinition[]; unavailable: McpUnavailableConnection[] }> {
-	if (!definitions || definitions.length === 0) return { tools: [], unavailable: [] };
+): Promise<{
+	tools: ToolDefinition[];
+	unavailable: McpUnavailableConnection[];
+	skipped: Array<{ skipped: McpSkippedTools; fresh: boolean }>;
+}> {
+	if (!definitions || definitions.length === 0) return { tools: [], unavailable: [], skipped: [] };
 	const resolver = config.mcpConnections;
 	const settled = await Promise.allSettled(
 		definitions.map((definition) =>
@@ -565,10 +591,13 @@ async function resolveMcpTools(
 	);
 	const tools: ToolDefinition[] = [];
 	const unavailable: McpUnavailableConnection[] = [];
+	const skipped: Array<{ skipped: McpSkippedTools; fresh: boolean }> = [];
 	for (const [index, result] of settled.entries()) {
 		const declared = definitions[index] as McpConnectionDefinition;
 		if (result.status === 'fulfilled') {
 			tools.push(...result.value.tools);
+			const skip = readMcpSkippedTools(result.value);
+			if (skip) skipped.push(skip);
 		} else if (declared.optional) {
 			unavailable.push({
 				name: declared.name,
@@ -578,7 +607,7 @@ async function resolveMcpTools(
 			throw result.reason;
 		}
 	}
-	return { tools, unavailable };
+	return { tools, unavailable, skipped };
 }
 
 /**
