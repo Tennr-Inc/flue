@@ -10,6 +10,7 @@ import { fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from '@ear
 import { expect, it } from 'vitest';
 import { init, instrument, useModel, usePersistentState, useSandbox } from './index.ts';
 import { local, sqlite, start } from './node/index.ts';
+import { uncachedFauxProvider } from './test-utils/uncached-faux-provider.ts';
 import type { FlueEvent, FlueObservation } from './types.ts';
 
 type TurnRequestEvent = Extract<FlueEvent, { type: 'turn_request' }>;
@@ -247,7 +248,7 @@ it('keeps the configured prompt after an overflow compaction', async () => {
 	const runtime = await start({
 		agents: [CompactAgent],
 		db: sqlite(),
-		providers: [faux.provider],
+		providers: [uncachedFauxProvider(faux.provider)],
 		env: {},
 	});
 	const agent = init(CompactAgent, { id: 'sentinel-compaction' });

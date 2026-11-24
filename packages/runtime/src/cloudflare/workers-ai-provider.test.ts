@@ -394,7 +394,15 @@ describe('Cloudflare binding transcript adaptation', () => {
 		expect(JSON.stringify(recorded?.input)).toContain('System instructions.');
 	});
 
-	it('renders mid-conversation tool additions as additional_tools on the Responses branch', async () => {
+	// Tool `a` is declared in the leading system message; tool `b` is added
+	// mid-conversation by a later system message. `normalizeContext` cannot
+	// produce a mid-conversation `toolsAdded` message, so the transcript is
+	// built by hand.
+	async function streamMidConversationToolAddition(compat: {
+		supportsMidConvoSystemMessages: boolean;
+		supportsAdditionalTools: boolean;
+		supportsToolSearch: boolean;
+	}): Promise<Record<string, unknown> | undefined> {
 		let recorded: Record<string, unknown> | undefined;
 		const binding = {
 			async run(_modelId: string, params: Record<string, unknown>) {
@@ -414,18 +422,8 @@ describe('Cloudflare binding transcript adaptation', () => {
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 			contextWindow: 0,
 			maxTokens: 0,
-			compat: {
-				supportsMidConvoSystemMessages: true,
-				supportsAdditionalTools: true,
-				supportsToolSearch: false,
-			},
+			compat,
 		};
-		// Tool `a` is declared in the leading system message; tool `b` is added
-		// mid-conversation by a later system message — the deferred-loading
-		// channel (`additional_tools`) is the model's own, so `b` must not be
-		// in the request-level tools and must appear as an anchored item.
-		// `normalizeContext` cannot produce a mid-conversation `toolsAdded`
-		// message, so the transcript is built by hand.
 		const transcript = {
 			messages: [
 				{
@@ -444,10 +442,39 @@ describe('Cloudflare binding transcript adaptation', () => {
 			],
 		} as TranscriptContext;
 		await provider.stream(model, transcript).result();
+		return recorded;
+	}
+
+	it('declares every tool as additional_tools on the Responses branch when the model supports tool changes', async () => {
+		// Mid-conversation system messages plus `additional_tools` resolve to pi's
+		// "changes" tool support: no request-level tools, and each declaration —
+		// the leading one included — rides as an anchored `additional_tools` item.
+		const recorded = await streamMidConversationToolAddition({
+			supportsMidConvoSystemMessages: true,
+			supportsAdditionalTools: true,
+			supportsToolSearch: false,
+		});
+		expect(recorded?.tools).toBeUndefined();
+		const additionalTools = ((recorded?.input ?? []) as Array<Record<string, unknown>>).filter(
+			(item) => item.type === 'additional_tools',
+		);
+		expect(additionalTools).toHaveLength(2);
+		expect(JSON.stringify(additionalTools[0])).toContain('"a"');
+		expect(JSON.stringify(additionalTools[1])).toContain('"b"');
+	});
+
+	it('keeps mid-conversation tool additions in the request tools when the model cannot take tool changes', async () => {
+		// `additional_tools` alone, without mid-conversation system messages, is
+		// "none" tool support: every current tool belongs in the request-level
+		// `tools` field so `b` is never dropped from the request.
+		const recorded = await streamMidConversationToolAddition({
+			supportsMidConvoSystemMessages: false,
+			supportsAdditionalTools: true,
+			supportsToolSearch: false,
+		});
 		const tools = (recorded?.tools ?? []) as Array<{ name?: string }>;
-		expect(tools.map((tool) => tool.name)).toEqual(['a']);
-		expect(JSON.stringify(recorded?.input)).toContain('"type":"additional_tools"');
-		expect(JSON.stringify(recorded?.input)).toContain('"b"');
+		expect(tools.map((tool) => tool.name)).toEqual(['a', 'b']);
+		expect(JSON.stringify(recorded?.input)).not.toContain('"type":"additional_tools"');
 	});
 
 	it('maps the thinking level into the Responses reasoning field', async () => {
