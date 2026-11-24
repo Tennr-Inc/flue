@@ -2,6 +2,7 @@ import { fauxAssistantMessage, fauxProvider, fauxText } from '@earendil-works/pi
 import { expect, it } from 'vitest';
 import { init, instrument, useModel } from './index.ts';
 import { sqlite, start } from './node/index.ts';
+import { uncachedFauxProvider } from './test-utils/uncached-faux-provider.ts';
 import type { FlueObservation } from './types.ts';
 
 const longMessage = 'x'.repeat(70_000);
@@ -33,7 +34,7 @@ it('settles a completed response after silent-overflow compaction', async () => 
 	const runtime = await start({
 		agents: [OverflowAgent],
 		db: sqlite(),
-		providers: [faux.provider],
+		providers: [uncachedFauxProvider(faux.provider)],
 		env: {},
 	});
 	const agent = init(OverflowAgent, { id: 'completed-overflow' });
